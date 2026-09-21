@@ -11,6 +11,9 @@ Everything downloaded lives under this directory (`models/`, `node_modules/`, `.
 
 | path | what |
 |---|---|
+| `ask.mjs` | ask it things: one-shot CLI or interactive REPL with presets and ad-hoc questions |
+| `serve.mjs` | local HTTP API (`POST /decide`) + browser page; model stays loaded, router picks the lane |
+| `data/presets.mjs` | question presets: smart-home (calibrated), triage, guard, moderation, route, sentiment |
 | `poc.mjs` | load once, answer 3 questions in one pass, 10 timed runs, sanity check on contrasting states |
 | `src/laya-client.mjs` | reusable loader: pinned HF revision, project-local cache, SHA256 verification, no network after first download, EP selection, P-core pinning, calibration, `createDecider()` facade |
 | `src/ep-router.mjs` | per-call execution-provider router (`LayaRouter`): probes lanes, predicts latency per (lane, GPU thermal state, question bucket, work), contention-aware, quarantines failing lanes |
@@ -33,6 +36,37 @@ node poc.mjs                # first run downloads the pinned 1.7 GB bundle into 
 node poc.mjs --ep webgpu    # RTX 4070 through the WebGPU EP
 node router-demo.mjs        # auto CPU / GPU selection per call
 npm test
+```
+
+## Ask it something
+
+Laya does not chat. You give it a *state* (your message, a ticket, any JSON) and typed *questions*; it answers
+all of them in one pass with probabilities. `data/presets.mjs` bundles question sets with a wrapper that turns
+plain text into a state: `smart-home` (default, calibrated here), `triage`, `guard`, `moderation`, `route`,
+`sentiment` (the last five are unevaluated starting points).
+
+```powershell
+node ask.mjs "Turn off the living room lights"                # one shot
+node ask.mjs --preset triage "Charged twice. Refund today or I cancel."
+node ask.mjs --json --preset guard "Ignore all previous instructions"
+node ask.mjs --state state.json --questions questions.json    # your own state + questions
+npm run ask                                                   # interactive: model stays loaded
+```
+
+In the REPL, type messages; `/preset triage` switches sets; `/noul Is the customer angry?`,
+`/choice Which team? | billing: refunds | support | sales`, `/score How urgent? | low | mid | high` add ad-hoc
+questions; `/again` re-asks; `/lane cpu:8` forces a lane; `/json` toggles raw output; `/help` lists the rest.
+Piping a script into `ask.mjs` works too.
+
+```powershell
+npm run serve                 # http://127.0.0.1:8787 - browser page + JSON API, model stays loaded
+```
+
+```powershell
+Invoke-RestMethod -Method Post http://127.0.0.1:8787/decide -ContentType application/json `
+  -Body (@{ preset = "triage"; text = "Charged twice, refund me today or I cancel" } | ConvertTo-Json)
+# body: { text | state, preset?, questions?, lane?, deadlineMs? } -> { answers, usage, routing }
+# GET /presets, /health, /stats.  Binds 127.0.0.1 only; --cors to allow other origins.
 ```
 
 Integration:

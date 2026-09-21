@@ -1,6 +1,6 @@
 {
   "name": "laya-poc",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "PoC, benchmarks, calibration tooling and execution-provider router for Laya (ONNX port, @receptron/laya) on Windows",
   "type": "module",
@@ -8,6 +8,8 @@
     "node": ">=20"
   },
   "scripts": {
+    "ask": "node ask.mjs",
+    "serve": "node serve.mjs",
     "poc": "node poc.mjs",
     "poc:webgpu": "node poc.mjs --ep webgpu --fp16 --calibration calibration/smart-home-v3.json",
     "router": "node router-demo.mjs --lanes webgpu:fp16,cpu:8 --calibration calibration/smart-home-v3.json",
