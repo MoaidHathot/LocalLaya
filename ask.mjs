@@ -19,7 +19,11 @@
  *   --state <file|json>   JSON state, replaces the preset's text wrapper (text arguments are ignored)
  *   --lanes a,b           lanes to load (one-shot default: webgpu:fp16 ; REPL default: webgpu:fp16,cpu:8)
  *   --lane <lane>         force a lane for every call (default: router decides)
- *   --calibration <file>  temperature table; default calibration/smart-home-v3.json for the smart-home preset
+ *   --calibration <file>  temperature table for the active preset; default: calibration/<preset>.json if it exists
+ *
+ * Your own domain: put presets/<name>.json next to the built-ins (see data/presets.mjs for the format, or build
+ * the questions in the REPL and /save <name>), then `node ask.mjs --preset <name> "..."`. Calibrate with
+ * `node calibrate.mjs --preset <name> --eval presets/<name>.eval.json` once you have labelled examples.
  *   --json                machine-readable output
  *   --no-color
  */
@@ -29,7 +33,8 @@ import { stdin, stdout, stderr } from "node:process";
 import { parseArgs } from "node:util";
 import { LayaRouter } from "./src/ep-router.mjs";
 import { formatAnswers, formatHeader, colors as c } from "./src/format.mjs";
-import { PRESETS, DEFAULT_PRESET } from "./data/presets.mjs";
+import { loadPresets, presetToJson, savePreset, PRESETS_DIR, DEFAULT_PRESET } from "./data/presets.mjs";
+import { access } from "node:fs/promises";
 
 const { values: args, positionals } = parseArgs({
   allowPositionals: true,
@@ -54,9 +59,27 @@ const say = (s) => stderr.write(`${s}\n`);
 const text = positionals.join(" ").trim();
 const interactive = !text && !args.state;
 
-if (!PRESETS[args.preset]) {
-  say(`unknown preset "${args.preset}"; available: ${Object.keys(PRESETS).join(", ")}`);
+let PRESETS = await loadPresets();
+if (!PRESETS[args.preset] || PRESETS[args.preset].invalid) {
+  say(`unknown or invalid preset "${args.preset}"; available: ${Object.keys(PRESETS).join(", ")} (files in ${PRESETS_DIR})`);
+  if (PRESETS[args.preset]?.invalid) say(PRESETS[args.preset].description);
   process.exit(2);
+}
+
+// calibration table per preset: --calibration for the initial preset, else calibration/<preset>.json if present
+const calibrationCache = new Map();
+async function calibrationFor(name) {
+  if (calibrationCache.has(name)) return calibrationCache.get(name);
+  let file = name === args.preset && args.calibration ? args.calibration : `calibration/${name}.json`;
+  let table = null;
+  try {
+    await access(file);
+    table = { ...JSON.parse(await readFile(file, "utf8")), file };
+  } catch {
+    if (name === args.preset && args.calibration) throw new Error(`calibration file not found: ${file}`);
+  }
+  calibrationCache.set(name, table);
+  return table;
 }
 
 // ---- session state ------------------------------------------------------------------------------------
@@ -69,18 +92,18 @@ let lastState = null;
 let lastText = "";
 let jsonOut = args.json;
 let forcedLane = args.lane;
+let calibration = await calibrationFor(presetName);
 
-const calibration = args.calibration ?? (presetName === "smart-home" ? "calibration/smart-home-v3.json" : undefined);
 const lanes = (args.lanes ?? (interactive ? "webgpu:fp16,cpu:8" : "webgpu:fp16")).split(",");
 
 const t0 = performance.now();
-say(c.dim(`loading ${lanes.join(" + ")}${calibration ? ` with ${calibration}` : ""} ...`));
-const router = await LayaRouter.create({ lanes, calibration, log: (m) => say(c.dim(`  ${m}`)) });
-if (interactive) await router.warmup({ state: preset.state("Turn off the living room lights please"), sizes: [Object.keys(questions).length] });
-say(c.dim(`ready in ${((performance.now() - t0) / 1000).toFixed(1)} s; lanes: ${[...router.lanes.keys()].join(", ")}`));
+say(c.dim(`loading ${lanes.join(" + ")} ...`));
+const router = await LayaRouter.create({ lanes, log: (m) => say(c.dim(`  ${m}`)) });
+if (interactive) await router.warmup({ state: preset.state("Please turn off the lights in the living room now"), sizes: [Object.keys(questions).length] });
+say(c.dim(`ready in ${((performance.now() - t0) / 1000).toFixed(1)} s; lanes: ${[...router.lanes.keys()].join(", ")}; preset ${presetName}${calibration ? ` (calibration ${calibration.file})` : " (shipped temperatures)"}`));
 
 async function ask(state, shownText) {
-  const result = await router.decide(state, questions, forcedLane ? { lane: forcedLane } : {});
+  const result = await router.decide(state, questions, { ...(forcedLane ? { lane: forcedLane } : {}), calibration });
   lastState = state;
   lastText = shownText;
   if (jsonOut) {
@@ -103,7 +126,8 @@ const HELP = `
 Type a message and press Enter: it becomes the state, the current questions are answered.
 Commands:
   /preset <name>            switch question set + state wrapper (${Object.keys(PRESETS).join(", ")})
-  /presets                  list presets
+  /presets                  list presets (built-in and presets/*.json|*.mjs)
+  /save <name> [description]  save the current questions + state wrapper as presets/<name>.json
   /show                     print the current questions as JSON
   /noul <question>          add a yes/no question
   /choice <question> | a | b: description | c    add a pick-one question (options after '|')
@@ -132,16 +156,35 @@ async function command(line) {
       stdout.write(HELP + "\n");
       break;
     case "presets":
-      for (const [k, p] of Object.entries(PRESETS)) stdout.write(`  ${k.padEnd(12)} ${p.description}\n`);
+      PRESETS = await loadPresets();
+      for (const [k, p] of Object.entries(PRESETS)) {
+        const cal = await calibrationFor(k);
+        stdout.write(`  ${k.padEnd(14)} ${(p.source === "file" ? "file    " : "built-in")}  ${cal ? "calibrated" : "shipped T "}  ${p.description}\n`);
+      }
+      stdout.write(`  (add your own: ${PRESETS_DIR}\\<name>.json - see data/presets.mjs, or /save)\n`);
       break;
     case "preset":
-      if (!PRESETS[rest]) return stdout.write(`unknown preset; try: ${Object.keys(PRESETS).join(", ")}\n`);
+      PRESETS = await loadPresets();
+      if (!PRESETS[rest] || PRESETS[rest].invalid) return stdout.write(`${PRESETS[rest]?.description ?? "unknown preset"}; try: ${Object.keys(PRESETS).join(", ")}\n`);
       presetName = rest;
       preset = PRESETS[rest];
       questions = { ...preset.questions };
       extraFields = {};
-      stdout.write(`preset ${rest}: ${preset.description}\n  questions: ${Object.keys(questions).join(", ")}\n`);
+      calibration = await calibrationFor(rest);
+      stdout.write(`preset ${rest}: ${preset.description}\n  questions: ${Object.keys(questions).join(", ")}\n  state: ${JSON.stringify(preset.template ?? preset.state("$TEXT"))}\n  temperatures: ${calibration ? calibration.file : "shipped (no calibration/" + rest + ".json)"}\n`);
       break;
+    case "save": {
+      const [name, ...descArr] = rest.split(" ");
+      if (!name) return stdout.write("usage: /save <name> [description]\n");
+      try {
+        const file = await savePreset(name, presetToJson(preset, questions, extraFields, descArr.join(" ") || undefined));
+        stdout.write(`saved ${file}\n  use it with: node ask.mjs --preset ${name} "..."   or   /preset ${name}\n  calibrate with: node calibrate.mjs --preset ${name} --eval presets/${name}.eval.json\n`);
+        PRESETS = await loadPresets();
+      } catch (e) {
+        stdout.write(`could not save: ${e.message}\n`);
+      }
+      break;
+    }
     case "show":
       stdout.write(JSON.stringify(questions, null, 2) + "\n");
       break;

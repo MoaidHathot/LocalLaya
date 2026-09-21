@@ -1,0 +1,51 @@
+{
+  "_comment": "Hand-labelled examples for presets/dev-request.json. gold keys are question ids; choice -> option key, noul -> true/false. 'effort' has no gold (subjective) and is therefore reported but not fitted. Replace with your real requests.",
+  "items": [
+    { "text": "is this a balid json {bla: 1}", "gold": { "task": "validate", "language": "json", "needs_tool": true, "has_input": true } },
+    { "text": "Check if this YAML is well-formed:\nname: x\n  bad: indent", "gold": { "task": "validate", "language": "other", "needs_tool": true, "has_input": true } },
+    { "text": "Does this regex match email addresses correctly? ^[\\w.]+@\\w+\\.\\w+$", "gold": { "task": "validate", "language": "other", "needs_tool": true, "has_input": true } },
+    { "text": "Is `SELECT * FROM users WHERE id = '1' OR 1=1` valid SQL?", "gold": { "task": "validate", "language": "sql", "needs_tool": true, "has_input": true } },
+    { "text": "Validate my package.json for me", "gold": { "task": "validate", "language": "json", "needs_tool": true, "has_input": false } },
+    { "text": "Is this a proper C# property declaration? public int Age { get; set }", "gold": { "task": "validate", "language": "csharp", "needs_tool": true, "has_input": true } },
+
+    { "text": "Write a PowerShell script that deletes files older than 30 days in a folder", "gold": { "task": "write_code", "language": "powershell", "needs_tool": false, "has_input": false } },
+    { "text": "Implement a debounce function in TypeScript", "gold": { "task": "write_code", "language": "javascript", "needs_tool": false, "has_input": false } },
+    { "text": "Generate a Python function that parses ISO 8601 dates", "gold": { "task": "write_code", "language": "python", "needs_tool": false, "has_input": false } },
+    { "text": "Write a SQL query that returns the top 5 customers by revenue per month", "gold": { "task": "write_code", "language": "sql", "needs_tool": false, "has_input": false } },
+    { "text": "Create a C# record type for an address with validation attributes", "gold": { "task": "write_code", "language": "csharp", "needs_tool": false, "has_input": false } },
+    { "text": "I need a JSON schema for a user object with name, email and roles", "gold": { "task": "write_code", "language": "json", "needs_tool": false, "has_input": false } },
+
+    { "text": "My script throws TypeError: Cannot read properties of undefined (reading 'map') at line 12, here's the code: const x = data.items.map(i => i.id)", "gold": { "task": "fix_bug", "language": "javascript", "needs_tool": false, "has_input": true } },
+    { "text": "Why does my Python loop print the last value three times? for i in range(3): funcs.append(lambda: print(i))", "gold": { "task": "fix_bug", "language": "python", "needs_tool": false, "has_input": true } },
+    { "text": "npm install fails with ERESOLVE unable to resolve dependency tree", "gold": { "task": "fix_bug", "language": "javascript", "needs_tool": false, "has_input": true } },
+    { "text": "The Get-ChildItem -Recurse command hangs on my network drive", "gold": { "task": "fix_bug", "language": "powershell", "needs_tool": false, "has_input": true } },
+    { "text": "My C# async method deadlocks when I call .Result", "gold": { "task": "fix_bug", "language": "csharp", "needs_tool": false, "has_input": false } },
+    { "text": "This SQL query returns duplicates: SELECT o.id FROM orders o JOIN items i ON i.order_id = o.id", "gold": { "task": "fix_bug", "language": "sql", "needs_tool": false, "has_input": true } },
+
+    { "text": "What does the spread operator do in JavaScript?", "gold": { "task": "explain", "language": "javascript", "needs_tool": false, "has_input": false } },
+    { "text": "Explain the difference between a list and a tuple in Python", "gold": { "task": "explain", "language": "python", "needs_tool": false, "has_input": false } },
+    { "text": "What does the error 'ECONNREFUSED 127.0.0.1:5432' mean?", "gold": { "task": "explain", "language": "none", "needs_tool": false, "has_input": true } },
+    { "text": "How does garbage collection work in .NET?", "gold": { "task": "explain", "language": "csharp", "needs_tool": false, "has_input": false } },
+    { "text": "Explain what this does: Get-Process | Sort-Object CPU -Descending | Select-Object -First 5", "gold": { "task": "explain", "language": "powershell", "needs_tool": false, "has_input": true } },
+    { "text": "What's the difference between INNER JOIN and LEFT JOIN?", "gold": { "task": "explain", "language": "sql", "needs_tool": false, "has_input": false } },
+
+    { "text": "Convert this JSON to YAML: {\"a\": 1, \"b\": [1, 2]}", "gold": { "task": "convert", "language": "json", "needs_tool": true, "has_input": true } },
+    { "text": "Convert this CSV to JSON: name,age\nBob,3", "gold": { "task": "convert", "language": "json", "needs_tool": true, "has_input": true } },
+    { "text": "Turn this PowerShell into a bash script: Get-ChildItem *.log | Remove-Item", "gold": { "task": "convert", "language": "powershell", "needs_tool": false, "has_input": true } },
+    { "text": "Convert this XML file to JSON", "gold": { "task": "convert", "language": "json", "needs_tool": true, "has_input": false } },
+    { "text": "Rewrite this callback code to async/await: fs.readFile(p, (e, d) => { cb(d) })", "gold": { "task": "convert", "language": "javascript", "needs_tool": false, "has_input": true } },
+    { "text": "Change this C# LINQ query syntax to method syntax: from x in xs where x > 1 select x", "gold": { "task": "convert", "language": "csharp", "needs_tool": false, "has_input": true } },
+
+    { "text": "Run the unit tests", "gold": { "task": "run_command", "language": "none", "needs_tool": true, "has_input": false } },
+    { "text": "git commit everything with the message 'wip'", "gold": { "task": "run_command", "language": "none", "needs_tool": true, "has_input": false } },
+    { "text": "Install the latest version of numpy", "gold": { "task": "run_command", "language": "python", "needs_tool": true, "has_input": false } },
+    { "text": "Show me the 10 largest files in this directory", "gold": { "task": "run_command", "language": "none", "needs_tool": true, "has_input": false } },
+    { "text": "Kill the node process that's using port 3000", "gold": { "task": "run_command", "language": "none", "needs_tool": true, "has_input": false } },
+    { "text": "Format all the .cs files in the repo", "gold": { "task": "run_command", "language": "csharp", "needs_tool": true, "has_input": false } },
+
+    { "text": "thanks, that fixed it!", "gold": { "task": "chat", "language": "none", "needs_tool": false, "has_input": false } },
+    { "text": "good morning, ready for some coding?", "gold": { "task": "chat", "language": "none", "needs_tool": false, "has_input": false } },
+    { "text": "you're way better than the last assistant", "gold": { "task": "chat", "language": "none", "needs_tool": false, "has_input": false } },
+    { "text": "lol", "gold": { "task": "chat", "language": "none", "needs_tool": false, "has_input": false } }
+  ]
+}

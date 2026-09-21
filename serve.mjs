@@ -3,7 +3,10 @@
  * Local HTTP API for Laya (model stays loaded, router picks the lane per request) + a minimal browser page.
  *
  *   node serve.mjs                         # http://127.0.0.1:8787
- *   node serve.mjs --port 9000 --lanes webgpu:fp16,cpu:8 --calibration calibration/smart-home-v3.json
+ *   node serve.mjs --port 9000 --lanes webgpu:fp16,cpu:8
+ *   node serve.mjs --calibration calibration/smart-home-v3.json   # one table for every preset (default: per preset,
+ *                                                                 # calibration/<preset>.json when present)
+ * Presets: built-ins + presets/*.json|*.mjs (re-read on every request, so you can edit files while it runs).
  *   node serve.mjs --cors                  # allow browser pages from other origins to call the API (off by default)
  *
  * Endpoints (all JSON):
@@ -24,24 +27,42 @@
 import { createServer } from "node:http";
 import { parseArgs } from "node:util";
 import { LayaRouter } from "./src/ep-router.mjs";
-import { PRESETS, DEFAULT_PRESET, describePresets } from "./data/presets.mjs";
+import { loadPresets, DEFAULT_PRESET, describePresets, PRESETS_DIR } from "./data/presets.mjs";
+import { access, readFile } from "node:fs/promises";
 
 const { values: args } = parseArgs({
   options: {
     port: { type: "string", default: "8787" },
     host: { type: "string", default: "127.0.0.1" },
     lanes: { type: "string", default: "webgpu:fp16,cpu:8" },
-    calibration: { type: "string", default: "calibration/smart-home-v3.json" },
+    calibration: { type: "string" },
     cors: { type: "boolean", default: false },
   },
 });
 const log = (m) => console.log(`[serve] ${new Date().toISOString().slice(11, 19)} ${m}`);
 
 const started = Date.now();
-log(`loading lanes ${args.lanes} (calibration ${args.calibration || "none"}) ...`);
-const router = await LayaRouter.create({ lanes: args.lanes.split(","), calibration: args.calibration || undefined, log: (m) => log(`  ${m}`) });
-await router.warmup({ state: PRESETS[DEFAULT_PRESET].state("Turn off the living room lights please"), sizes: [3, 5] });
-log(`ready in ${((Date.now() - started) / 1000).toFixed(1)} s; lanes: ${[...router.lanes.keys()].join(", ")}`);
+log(`loading lanes ${args.lanes} ...`);
+const router = await LayaRouter.create({ lanes: args.lanes.split(","), log: (m) => log(`  ${m}`) });
+let PRESETS = await loadPresets();
+await router.warmup({ state: PRESETS[DEFAULT_PRESET].state("Please turn off the lights in the living room now"), sizes: [3, 5] });
+log(`ready in ${((Date.now() - started) / 1000).toFixed(1)} s; lanes: ${[...router.lanes.keys()].join(", ")}; presets: ${Object.keys(PRESETS).join(", ")} (${PRESETS_DIR})`);
+
+// calibration table per preset: --calibration (global) or calibration/<preset>.json; cached by mtime-less simplicity (restart to refresh)
+const calibrationCache = new Map();
+async function calibrationFor(name) {
+  if (calibrationCache.has(name)) return calibrationCache.get(name);
+  const file = args.calibration ?? `calibration/${name}.json`;
+  let table = null;
+  try {
+    await access(file);
+    table = { ...JSON.parse(await readFile(file, "utf8")), file };
+  } catch {
+    /* none */
+  }
+  calibrationCache.set(name, table);
+  return table;
+}
 
 const json = (res, status, body) => {
   const headers = { "content-type": "application/json; charset=utf-8" };
@@ -76,23 +97,24 @@ function validateQuestions(q) {
 }
 
 async function decide(body) {
+  PRESETS = await loadPresets();
   const presetName = body.preset ?? DEFAULT_PRESET;
   const preset = PRESETS[presetName];
-  if (!preset) throw Object.assign(new Error(`unknown preset ${presetName}; have ${Object.keys(PRESETS).join(", ")}`), { status: 400 });
+  if (!preset || preset.invalid) throw Object.assign(new Error(preset?.invalid ? `preset ${presetName} is invalid: ${preset.description}` : `unknown preset ${presetName}; have ${Object.keys(PRESETS).join(", ")}`), { status: 400 });
   const questions = body.questions ?? preset.questions;
   validateQuestions(questions);
   let state;
   if (body.state !== undefined) state = body.state;
   else if (typeof body.text === "string" && body.text.trim()) state = preset.state(body.text.trim());
   else throw Object.assign(new Error("provide text (string) or state (any JSON)"), { status: 400 });
-  const opts = {};
+  const opts = { calibration: await calibrationFor(presetName) };
   if (body.lane) {
     if (!router.lanes.has(body.lane)) throw Object.assign(new Error(`lane ${body.lane} not loaded; have ${[...router.lanes.keys()].join(", ")}`), { status: 400 });
     opts.lane = body.lane;
   }
   if (body.deadlineMs) opts.deadlineMs = Number(body.deadlineMs);
   const r = await router.decide(state, questions, opts);
-  return { answers: r.answers, usage: r.usage, routing: r.routing, state, questions, preset: body.questions ? null : presetName };
+  return { answers: r.answers, usage: r.usage, routing: r.routing, state, questions, preset: body.questions ? null : presetName, calibration: opts.calibration?.file ?? null };
 }
 
 const server = createServer(async (req, res) => {
@@ -107,7 +129,7 @@ const server = createServer(async (req, res) => {
       return res.end(PAGE);
     }
     if (req.method === "GET" && url.pathname === "/health") return json(res, 200, { ok: true, lanes: [...router.lanes.keys()], uptimeS: Math.round((Date.now() - started) / 1000) });
-    if (req.method === "GET" && url.pathname === "/presets") return json(res, 200, describePresets());
+    if (req.method === "GET" && url.pathname === "/presets") return json(res, 200, describePresets(await loadPresets()));
     if (req.method === "GET" && url.pathname === "/stats") return json(res, 200, router.stats());
     if (req.method === "POST" && url.pathname === "/decide") {
       const raw = await readBody(req);

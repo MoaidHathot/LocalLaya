@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { chooseLane, LatencyModel, nBucket, thermalState, DEFAULT_PRIORS, estimateWork } from "../src/ep-router.mjs";
 import { bucketKey, fitTemperature, metrics, optionCount, optionLabels, softmax } from "../src/calibration.mjs";
+import { presetFromJson, presetToJson, PRESETS } from "../data/presets.mjs";
 
 test("nBucket and thermalState boundaries", () => {
   assert.equal(nBucket(1), "1");
@@ -103,4 +104,27 @@ test("calibration helpers", () => {
   for (let i = 0; i < 40; i++) samples.push({ logits: [4, 0], gold: i % 2 });
   const { T } = fitTemperature(samples);
   assert.ok(T > 5, `expected a large temperature for uninformative logits, got ${T}`);
+});
+
+test("presets: JSON form <-> preset object", () => {
+  const q = { kind: { type: "choice", instructions: "?", criteria: { a: "x", b: "y" } } };
+  // default template
+  let p = presetFromJson({ questions: q });
+  assert.deepEqual(p.state("hello"), { text: "hello" });
+  // string = single key
+  p = presetFromJson({ state: "request", questions: q });
+  assert.deepEqual(p.state("hello"), { request: "hello" });
+  // object template with literal fields and nesting
+  p = presetFromJson({ state: { msg: "$TEXT", app: "x", meta: { src: "cli", body: "$TEXT" } }, questions: q });
+  assert.deepEqual(p.state("hi"), { msg: "hi", app: "x", meta: { src: "cli", body: "hi" } });
+  // validation
+  assert.throws(() => presetFromJson({ questions: {} }));
+  assert.throws(() => presetFromJson({ state: { a: "no marker" }, questions: q }));
+  // round trip of a built-in preset with extra fields
+  const json = presetToJson(PRESETS.triage, PRESETS.triage.questions, { product: "MyApp" }, "desc");
+  assert.deepEqual(json.state, { message: "$TEXT", product: "MyApp" });
+  assert.equal(json.description, "desc");
+  const back = presetFromJson(json);
+  assert.deepEqual(back.state("t"), { message: "t", product: "MyApp" });
+  assert.deepEqual(back.questions, PRESETS.triage.questions);
 });

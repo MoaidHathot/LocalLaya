@@ -205,7 +205,7 @@ export class LayaRouter {
       const p0 = performance.now();
       await laya.systemOne({ probe: "ok" }, { q: { type: "noul", instructions: "Is this a probe?" } });
       const probeMs = performance.now() - p0;
-      this.lanes.set(lane, { lane, laya, model: new LatencyModel(lane), healthy: true, failures: 0, quarantinedUntil: 0, calls: 0, loadMs: performance.now() - t0, probeMs });
+      this.lanes.set(lane, { lane, laya, model: new LatencyModel(lane), healthy: true, failures: 0, quarantinedUntil: 0, calls: 0, loadMs: performance.now() - t0, probeMs, shippedTemps: { ...laya.config.temperature_by_options }, queue: Promise.resolve() });
       this.log(`lane ${lane}: ready (load ${((performance.now() - t0) / 1000).toFixed(1)} s, probe ${probeMs.toFixed(0)} ms)`);
     } catch (e) {
       this.log(`lane ${lane}: unavailable - ${String(e?.message ?? e).split("\n")[0].slice(0, 140)}`);
@@ -272,7 +272,9 @@ export class LayaRouter {
 
   /**
    * Answer `questions` about `state`, choosing the lane automatically.
-   * @param {object} [o] { lane, policy, deadlineMs }
+   * @param {object} [o] { lane, policy, deadlineMs, calibration }
+   *   calibration: a table from calibrate.mjs ({ temperature_by_options }) applied for this call only; without
+   *   it the lane's temperatures are the ones it was created with (LayaRouter.create({ calibration }) or shipped).
    * @returns result with an extra `routing` field
    */
   async decide(state, questions, o = {}) {
@@ -297,7 +299,14 @@ export class LayaRouter {
       const t0 = performance.now();
       try {
         if (gpu) this.gpuBusy++;
-        const result = await L.laya.systemOne(state, questions);
+        // One call at a time per lane: the session serialises the work anyway (measured: no throughput gain
+        // from concurrency) and it lets us switch the per-call temperatures without racing another call.
+        const result = await (L.queue = L.queue.catch(() => {}).then(() => {
+          const temps = L.laya.config.temperature_by_options;
+          for (const k of Object.keys(temps)) delete temps[k];
+          Object.assign(temps, L.shippedTemps, o.calibration?.temperature_by_options ?? {});
+          return L.laya.systemOne(state, questions);
+        }));
         const ms = performance.now() - t0;
         if (gpu) this.lastGpuWorkEnd = performance.now();
         L.model.observe(n, stateAtStart, ms, work);

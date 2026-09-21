@@ -13,7 +13,7 @@ Everything downloaded lives under this directory (`models/`, `node_modules/`, `.
 |---|---|
 | `ask.mjs` | ask it things: one-shot CLI or interactive REPL with presets and ad-hoc questions |
 | `serve.mjs` | local HTTP API (`POST /decide`) + browser page; model stays loaded, router picks the lane |
-| `data/presets.mjs` | question presets: smart-home (calibrated), triage, guard, moderation, route, sentiment |
+| `data/presets.mjs`, `presets/` | built-in question presets (smart-home calibrated; triage, guard, moderation, route, sentiment unmeasured) + your own `presets/<name>.json`; `dev-request` worked example with labelled eval |
 | `poc.mjs` | load once, answer 3 questions in one pass, 10 timed runs, sanity check on contrasting states |
 | `src/laya-client.mjs` | reusable loader: pinned HF revision, project-local cache, SHA256 verification, no network after first download, EP selection, P-core pinning, calibration, `createDecider()` facade |
 | `src/ep-router.mjs` | per-call execution-provider router (`LayaRouter`): probes lanes, predicts latency per (lane, GPU thermal state, question bucket, work), contention-aware, quarantines failing lanes |
@@ -84,6 +84,64 @@ const r2 = await router.decide(state, questions);            // r2.routing.lane,
 const r3 = await router.decide(state, questions, { deadlineMs: 150 });
 ```
 
+## Your own domain (custom presets)
+
+The output you get is always *the preset's questions answered about your text*. Asking the smart-home preset
+"is this valid JSON {bla: 1}" yields "intent: ask_question 34 %, no device, not urgent" - correct, and useless,
+because those are the wrong questions. Laya never answers your question itself; it makes typed decisions that
+route or gate the step that does (a parser, a tool, an LLM, a human).
+
+1. **Write the questions** - `presets/<name>.json` (or build them in the REPL with `/choice`, `/noul`, `/score`
+   and `/save <name>`):
+
+   ```json
+   {
+     "description": "Developer-assistant request triage",
+     "state": { "request": "$TEXT" },
+     "questions": {
+       "task": { "type": "choice", "instructions": "What is the user asking the assistant to do?",
+                 "criteria": { "validate": "check whether a given input is valid", "write_code": "...", "explain": "..." } },
+       "effort": { "type": "score", "instructions": "How much work is this?", "criteria": ["trivial", "small", "medium", "large"] }
+     }
+   }
+   ```
+
+   `state` is a template (`"$TEXT"` = the message; other fields are literal context such as time, app, user
+   role); `"state": "request"` is shorthand for a single key. Option descriptions are model input: short,
+   concrete, mutually exclusive; < 20 options; the whole option block shares 192 tokens.
+
+2. **Try it**: `node ask.mjs --preset <name> "..."`, `/preset <name>` in the REPL, or `{"preset": "<name>"}`
+   against `serve.mjs` (files are re-read per request, so edit and retry without restarting).
+
+3. **Measure** with 30-60 labelled examples - `presets/<name>.eval.json`:
+
+   ```json
+   { "items": [ { "text": "is this valid json {bla: 1}", "gold": { "task": "validate", "language": "json" } } ] }
+   ```
+
+   `node calibrate.mjs --preset <name> --eval presets/<name>.eval.json` prints, per question, accuracy against
+   the majority/chance baselines with a verdict, calibration before/after, the confident mistakes, and writes
+   `calibration/<name>.json`, which `ask.mjs`/`serve.mjs` apply automatically for that preset.
+
+4. **Iterate**: reword or drop questions that fail; re-measure. Fine-tune (PyTorch, original repo) when wording
+   stops helping.
+
+Worked example, `presets/dev-request.json` (40 labelled items):
+
+| question | acc | baseline | verdict |
+|---|---|---|---|
+| task (7 options) | 0.75 | 0.15 | usable; answers given at >= 80 % were right 90 % of the time |
+| language (8) | 0.85 | 0.23 | usable; >= 80 % bin: 100 % right |
+| needs_tool (noul) | 0.55 | 0.63 | **not usable** - coin flip; calibration fitted T = 13.5, i.e. probabilities collapse to ~50 % ("don't know") |
+| has_input (noul) | 0.55 | 0.57 | **not usable** - and a regex answers it exactly |
+
+The last two were removed from the preset (v2). "is this a balid json {bla: 1}" now yields
+`task: validate 91 %, language: json 97 %, effort: trivial-small` - i.e. *route to the JSON parser*, which is
+the decision Laya is for.
+
+Limits: temperatures are per (type, option-count) bucket, so a broken `noul` question flattens the good `noul`
+questions in the same preset - remove it rather than keep it. Presets other than `smart-home` and
+`dev-request` are unmeasured starting points.
 ## Results (Node 25.3, onnxruntime-node 1.30.0, Laya English fp32 421M, `results/*-summary.md`)
 
 Latency of one `systemOne` call, p50 ms, 20 runs back-to-back after warm-up:

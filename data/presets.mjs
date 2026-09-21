@@ -118,5 +118,83 @@ export const PRESETS = {
 
 export const DEFAULT_PRESET = "smart-home";
 
-/** Public, JSON-safe view of the presets (functions stripped). */
-export const describePresets = () => Object.fromEntries(Object.entries(PRESETS).map(([k, p]) => [k, { description: p.description, questions: p.questions }]));
+// ---- user presets from files -------------------------------------------------------------------------------
+//
+// presets/<name>.json:
+//   {
+//     "description": "what this preset decides",
+//     "state": { "request": "$TEXT", "app": "my tool" },   // template; "$TEXT" is replaced by the message.
+//                                                           // A string means a single key: "state": "request".
+//                                                           // Omitted -> { "text": "$TEXT" }
+//     "questions": { "<id>": { "type": "choice|score|noul", "instructions": "...", "criteria": ... } }
+//   }
+// presets/<name>.mjs:   export default { description, state: (text) => ({ ... }), questions }
+//
+// A matching calibration/<name>.json (from calibrate.mjs) is picked up automatically by ask.mjs / serve.mjs.
+
+import { readdir, readFile, writeFile, mkdir } from "node:fs/promises";
+import path from "node:path";
+import { pathToFileURL, fileURLToPath } from "node:url";
+
+export const PRESETS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "presets");
+
+const fill = (tpl, text) => {
+  if (typeof tpl === "string") return tpl === "$TEXT" ? text : tpl;
+  if (Array.isArray(tpl)) return tpl.map((v) => fill(v, text));
+  if (tpl && typeof tpl === "object") return Object.fromEntries(Object.entries(tpl).map(([k, v]) => [k, fill(v, text)]));
+  return tpl;
+};
+
+/** Build a preset object from its JSON form. */
+export function presetFromJson(obj, name = "preset") {
+  if (!obj || typeof obj !== "object" || !obj.questions || !Object.keys(obj.questions).length) throw new Error(`preset ${name}: "questions" (non-empty object) required`);
+  const template = obj.state === undefined ? { text: "$TEXT" } : typeof obj.state === "string" ? { [obj.state]: "$TEXT" } : obj.state;
+  if (JSON.stringify(template).indexOf('"$TEXT"') < 0) throw new Error(`preset ${name}: state template must contain "$TEXT" somewhere`);
+  return { description: obj.description ?? "", state: (text) => fill(template, text), questions: obj.questions, template, source: obj.source ?? "file" };
+}
+
+/** JSON form of a (possibly built-in) preset with the given question set and extra state fields. */
+export function presetToJson(preset, questions, extraFields = {}, description) {
+  const template = preset.template ?? preset.state("$TEXT");
+  return { description: description ?? preset.description ?? "", state: { ...template, ...extraFields }, questions };
+}
+
+/** Built-in presets plus every presets/*.json and presets/*.mjs (files win on name clashes). */
+export async function loadPresets(dir = PRESETS_DIR) {
+  const all = Object.fromEntries(Object.entries(PRESETS).map(([k, p]) => [k, { ...p, source: "built-in" }]));
+  let entries = [];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return all;
+  }
+  for (const f of entries.sort()) {
+    const name = f.replace(/\.(json|mjs)$/i, "");
+    if (name === f || name.endsWith(".eval")) continue;
+    try {
+      if (f.endsWith(".json")) all[name] = presetFromJson(JSON.parse(await readFile(path.join(dir, f), "utf8")), name);
+      else {
+        const mod = (await import(pathToFileURL(path.join(dir, f)).href)).default;
+        if (typeof mod?.state !== "function" || !mod?.questions) throw new Error("default export needs state(text) and questions");
+        all[name] = { ...mod, source: "file" };
+      }
+      all[name].file = path.join(dir, f);
+    } catch (e) {
+      all[name] = { description: `INVALID: ${e.message}`, state: (t) => ({ text: t }), questions: {}, invalid: true, file: path.join(dir, f), source: "file" };
+    }
+  }
+  return all;
+}
+
+/** Write presets/<name>.json. */
+export async function savePreset(name, json, dir = PRESETS_DIR) {
+  if (!/^[a-z0-9][a-z0-9_-]*$/i.test(name)) throw new Error("preset name: letters, digits, - and _ only");
+  await mkdir(dir, { recursive: true });
+  const file = path.join(dir, `${name}.json`);
+  await writeFile(file, JSON.stringify(json, null, 2) + "\n");
+  return file;
+}
+
+/** Public, JSON-safe view of a preset map (functions stripped). */
+export const describePresets = (presets = PRESETS) =>
+  Object.fromEntries(Object.entries(presets).map(([k, p]) => [k, { description: p.description, source: p.source ?? "built-in", state: p.template ?? p.state("$TEXT"), questions: p.questions }]));
