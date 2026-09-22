@@ -38,7 +38,7 @@ Base URL `http://127.0.0.1:8787` (or `--port` / `LAYA_PORT`). JSON everywhere.
 |---|---|
 | `GET /health` | `{ service: "laya", version, status: loading\|ready\|failed\|stopping, pid, port, sidecar, lanes, uptimeS, idleS, idleRemainingS, inFlight, sampling }` |
 | `GET /presets` | `{ <name>: { description, source: built-in\|file, state (template with "$TEXT"), questions } }` |
-| `GET /stats` | router statistics: per-lane calls / pending / EMA latencies, external CPU/GPU load, GPU state |
+| `GET /stats` | router statistics: per-lane calls / pending / EMA latencies, queue depth + predicted wait, external CPU/GPU load, GPU state |
 | `POST /decide` | body below -> `{ answers, usage, routing, state, questions, preset, calibration }`; 503 `{ error: "loading" }` while the model loads (retry after `retryAfterMs`) |
 | `POST /touch` | reset the idle timer -> `{ ok, idleRemainingS }` |
 | `POST /shutdown` | graceful exit -> `{ ok, pid }` |
@@ -74,14 +74,17 @@ Errors: 400 with `{ error }` for bad input (unknown preset, invalid questions, m
   },
   "usage": { "input_tokens": 330, "output_tokens": 0 },
   "routing": { "lane": "webgpu:fp16", "ms": 154, "queueMs": 0, "n": 5, "gpuState": "hot", "predictedMs": 160,
-               "reason": "fastest predicted (...)", "alternatives": [ { "lane": "cpu:8", "predictedMs": 330 } ] }
+               "ownMs": 160, "waitMs": 0, "reason": "fastest predicted (...)", "alternatives": [ { "lane": "cpu:8", "predictedMs": 330 } ] }
 }
 ```
 
 - `choice.probabilities` sum to 1 over the options; `choice` is the arg-max.
 - `noul` is P(true). `score` is the expectation over levels (0-based); `legend` maps index -> level text.
 - `confidence` = 1 - normalised entropy of the distribution (0 = uniform, 1 = certain). Not P(correct).
-- `routing.ms` is inference time on the chosen lane; `queueMs` time spent waiting behind other callers.
+- `routing.ms` is inference time on the chosen lane; `queueMs` time spent waiting behind other callers. Calls
+  are served one at a time (one queue for all lanes): throughput is ~20 calls/s for 3 questions on the GPU
+  lane whatever the number of parallel callers; parallel callers only wait longer. Batch questions into one
+  call rather than calling in parallel.
 
 ## Lifecycle of the sidecar
 

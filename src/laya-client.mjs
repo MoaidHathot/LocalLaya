@@ -14,11 +14,16 @@
  *    has NO CUDA EP; the NVIDIA GPU is reached via DirectML ("dml") or the experimental WebGPU EP.
  */
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { access, readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { Laya } from "@receptron/laya";
+
+const execFileP = promisify(execFile);
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -122,6 +127,37 @@ export function pCoreAffinity(threads, pLogical = PCORE_LOGICAL) {
 }
 
 /**
+ * Restrict this process to the P-cores (Windows, hybrid CPUs). Node has no thread-affinity API, and the JS
+ * thread matters: it tokenises, drives the WebGPU dispatch and is one of ORT's intra-op workers (the pool has
+ * threads-1 pinned workers plus the caller). Windows parks it on an E-core for minutes at a time: measured
+ * whole sessions with webgpu:fp16 3 q at 78 ms instead of 49 (1.6x) and cpu:8 at ~1.3x, reproducible by
+ * forcing the process onto the E-cores (experiments/throughput.mjs runs of 2026-09-23). The affinity change
+ * runs in the background via PowerShell (~0.4 s, overlaps with the model load). No-op off Windows, on a
+ * non-hybrid CPU (LAYA_PCORE_LOGICAL >= logical CPUs) or when PowerShell is unavailable.
+ * @returns {Promise<{ applied: boolean, mask?: string, reason?: string }>}
+ */
+export async function pinProcessToPCores({ log = () => {}, pLogical = PCORE_LOGICAL } = {}) {
+  const total = os.cpus().length;
+  if (process.platform !== "win32") return { applied: false, reason: "not Windows" };
+  if (!(pLogical > 0) || pLogical >= total) return { applied: false, reason: `not a hybrid CPU (${pLogical} of ${total} logical CPUs are P-cores)` };
+  if (pLogical > 62) return { applied: false, reason: "affinity mask wider than 62 bits" };
+  const mask = (1n << BigInt(pLogical)) - 1n;
+  const cmd = `(Get-Process -Id ${process.pid}).ProcessorAffinity = ${mask}`;
+  for (const shell of ["powershell.exe", "pwsh"]) {
+    try {
+      await execFileP(shell, ["-NoProfile", "-NonInteractive", "-Command", cmd], { windowsHide: true, timeout: 10_000 });
+      log(`process pinned to logical CPUs 0-${pLogical - 1} (P-cores, mask 0x${mask.toString(16)})`);
+      return { applied: true, mask: `0x${mask.toString(16)}` };
+    } catch (e) {
+      if (e?.code === "ENOENT") continue;
+      log(`could not set the process affinity: ${String(e?.message ?? e).split("\n")[0].slice(0, 120)}`);
+      return { applied: false, reason: String(e?.message ?? e) };
+    }
+  }
+  return { applied: false, reason: "PowerShell not found" };
+}
+
+/**
  * Build the onnxruntime-node options for a given execution provider.
  * - dml: DirectML forbids memory-pattern optimisation and parallel execution; set both explicitly
  *        (the C API does this internally, but being explicit costs nothing and documents intent).
@@ -129,19 +165,25 @@ export function pCoreAffinity(threads, pLogical = PCORE_LOGICAL) {
  *        parallel op over P- and E-cores and waits for the slowest E-core thread: measured 213 ms p50 but
  *        1174 ms p95 for 3 questions. `pinToPCores` pins the pool to the P-cores (16 threads by default):
  *        235 ms p50 / 284 ms p95, stable.
+ * - webgpu / dml: `threads` sizes the session's CPU-side intra-op pool (the few nodes ORT keeps on the CPU
+ *        and the tensor plumbing). Left at ORT's default it spans all cores and, when a pinned CPU lane in
+ *        the same process is busy, waits for threads that share cores with it (see experiments/interference.mjs).
+ * - `affinity`: explicit ORT affinity string (threads-1 entries, 1-based logical processor ids), overrides
+ *        the P-core layout from `pinToPCores`.
  */
-export function buildSessionConfig(ep = "cpu", { threads, deviceId = 0, logSeverityLevel, optLevel, pinToPCores = false } = {}) {
+export function buildSessionConfig(ep = "cpu", { threads, deviceId = 0, logSeverityLevel, optLevel, pinToPCores = false, affinity } = {}) {
   if (!SUPPORTED_EPS.includes(ep)) throw new Error(`unsupported ep "${ep}" (Windows x64 options: ${SUPPORTED_EPS.join(", ")})`);
   const sessionOptions = {};
   if (logSeverityLevel !== undefined) sessionOptions.logSeverityLevel = logSeverityLevel;
   // "disabled" | "basic" | "extended" | "all" (Laya defaults to "all"; lower levels can work around EP-specific fusion bugs)
   if (optLevel) sessionOptions.graphOptimizationLevel = optLevel;
   let executionProviders;
+  const t = threads ?? (ep === "cpu" && pinToPCores ? PCORE_LOGICAL : undefined);
+  if (t) sessionOptions.intraOpNumThreads = t;
+  const aff = affinity ?? (pinToPCores && t > 1 ? pCoreAffinity(t) : undefined);
+  if (aff) sessionOptions.extra = { session: { intra_op_thread_affinities: aff } };
   if (ep === "cpu") {
     executionProviders = ["cpu"];
-    const t = threads ?? (pinToPCores ? PCORE_LOGICAL : undefined);
-    if (t) sessionOptions.intraOpNumThreads = t;
-    if (pinToPCores && t > 1) sessionOptions.extra = { session: { intra_op_thread_affinities: pCoreAffinity(t) } };
   } else if (ep === "dml") {
     executionProviders = [{ name: "dml", deviceId }];
     sessionOptions.enableMemPattern = false;
@@ -157,7 +199,8 @@ export function buildSessionConfig(ep = "cpu", { threads, deviceId = 0, logSever
  *
  * @param {object} opts
  * @param {"cpu"|"dml"|"webgpu"} [opts.ep="cpu"]
- * @param {number} [opts.threads]           intra-op threads (cpu only)
+ * @param {number} [opts.threads]           intra-op threads (cpu: the compute pool; webgpu/dml: the CPU-side pool)
+ * @param {string} [opts.affinity]          explicit ORT affinity string for the intra-op pool (see buildSessionConfig)
  * @param {number} [opts.deviceId=0]        GPU adapter index (dml only)
  * @param {number} [opts.logSeverityLevel]  0 verbose .. 4 fatal (ORT default 2 = warning)
  * @param {string} [opts.modelDir]           load this bundle directory instead of the pinned download (no verification)

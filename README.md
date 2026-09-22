@@ -16,14 +16,14 @@ Everything downloaded lives under this directory (`models/`, `node_modules/`, `.
 | `src/sidecar-client.mjs` | discover / spawn / wait / call / stop the sidecar; no ONNX import (used by `ask.mjs --sidecar`) |
 | `data/presets.mjs`, `presets/` | built-in question presets (smart-home calibrated; triage, guard, moderation, route, sentiment unmeasured) + your own `presets/<name>.json`; `dev-request` worked example with labelled eval |
 | `poc.mjs` | load once, answer 3 questions in one pass, 10 timed runs, sanity check on contrasting states |
-| `src/laya-client.mjs` | reusable loader: pinned HF revision, project-local cache, SHA256 verification, no network after first download, EP selection, P-core pinning, calibration, `createDecider()` facade |
-| `src/ep-router.mjs` | per-call execution-provider router (`LayaRouter`): probes lanes, predicts latency per (lane, GPU thermal state, question bucket, work), contention-aware, quarantines failing lanes |
+| `src/laya-client.mjs` | reusable loader: pinned HF revision, project-local cache, SHA256 verification, no network after first download, EP selection, P-core pinning (threads and, on Windows, the process), calibration, `createDecider()` facade |
+| `src/ep-router.mjs` | per-call execution-provider router (`LayaRouter`): probes lanes, predicts latency per (lane, GPU thermal state, question bucket, work), one FIFO queue for all lanes, contention-aware, quarantines failing lanes |
 | `router-demo.mjs` | the router under burst / sporadic / batch traffic, deadline and forced-lane calls |
 | `src/calibration.mjs`, `calibrate.mjs` | raw-logit capture, accuracy + NLL / Brier / ECE + reliability tables, per-bucket temperature refit with leave-one-out |
 | `data/smart-home-eval.mjs`, `data/question-variants.mjs` | 65 hand-labelled utterances; three question wordings (v1 original, v2 explicit, v3 best per question) |
 | `calibration/*.json` | fitted temperature tables (`loadLaya({ calibration })`) |
 | `bench.mjs`, `bench-all.mjs`, `src/metrics.mjs` | latency matrix (EP x 1/3/10 questions) with process CPU / RSS / GPU util / VRAM / power sampling |
-| `experiments/*.mjs` | shape sensitivity + concurrency, sporadic-vs-burst latency, length sweep, fp16 fidelity |
+| `experiments/*.mjs` | shape sensitivity + concurrency, sporadic-vs-burst latency, length sweep, fp16 fidelity, throughput matrix (lanes x concurrency x arrival rate), cross-lane interference, worker-thread lanes |
 | `tools/convert_fp16.py` | fp32 -> fp16 bundle conversion (ORT's transformer float16 pass; no PyTorch) |
 | `verify-model.mjs` | re-hash the cached bundle against the pinned SHA256 values |
 | `vendor/receptron-laya-0.1.2.tgz` | the exact published npm tarball (see Supply chain) |
@@ -106,17 +106,19 @@ node ask.mjs --status | --stop | --start [--idle 10m] [--lanes ...]
   launchers racing at the same instant produce exactly one instance (the loser exits with code 3 without
   loading); callers arriving during the load wait for `status: ready`. Anything else on the port is
   detected via `/health` (`service: "laya"`) and never touched; the CLI then falls back to in-process.
-- Load-aware: predictions include the calls already queued on a lane, so 8 parallel callers spread over GPU
-  and CPU instead of piling onto one (`routing.queueMs` tells you how long a call waited). Presets and
-  calibration tables are re-read when their files change. Background CPU/GPU sampling pauses after 10 s idle.
+- One queue: `onnxruntime-node` runs every inference synchronously on the JS thread, so calls never overlap
+  in one process whatever the lane. 8 parallel callers are served FIFO on the fastest lane (`routing.queueMs`
+  tells you how long a call waited); the router does not spill to the CPU lane under load because a CPU call
+  in the middle of a burst would stall every GPU call behind it (see Results). Presets and calibration tables
+  are re-read when their files change. Background CPU/GPU sampling pauses after 10 s idle.
 - Programs that would rather call HTTP directly: `node ask.mjs --start` prints `{ url, pid, lanes }`; then
   `POST /decide` (see Ask it something). `/health` shows `idleRemainingS`; `POST /touch` extends it.
 - The CLI client uses `node:http`, not `fetch`: on this Node (25.3, Windows) undici crashes the process at exit
   (`0xC0000409`) after a couple of requests - visible only as a wrong exit code.
 
-Measured here: first call 5.4 s (spawn + load + warm-up), second call 184 ms; 8 parallel calls in 3.4 s
-across both lanes, zero errors; VRAM 4351 -> 3403 MiB after the idle exit. `npm run test:sidecar` runs the
-11 lifecycle scenarios (~1 min; uses port 8797).
+Measured here: first call 5.4 s (spawn + load + warm-up), second call 184 ms; 8 parallel 5-question calls in
+1.4 s on one lane, zero errors (2.6 s when the router still spread them over GPU + CPU); VRAM 4351 -> 3403 MiB
+after the idle exit. `npm run test:sidecar` runs the 11 lifecycle scenarios (~1 min; uses port 8797).
 ## Using it from agents: the skill
 
 `skills/laya-decisions/` is an [Agent Skill](https://agentskills.io): `SKILL.md` tells an agent what Laya
@@ -202,6 +204,30 @@ Latency of one `systemOne` call, p50 ms, 20 runs back-to-back after warm-up:
 Model-card reference on a Tesla T4 (PyTorch): 39.5 ms (1 q), 158.6 ms (10 q). All lanes return identical
 answers to 4 decimals (fp16: max |delta p| 0.034, 195/195 arg-max agreement on the eval set).
 
+### Throughput (`experiments/throughput.mjs`, `results/throughput-*-summary.md`)
+
+Laya is not generative, so the unit is one call (state + N questions, one forward pass), not tokens.
+Throughput = 1 / latency: inferences never overlap in one process (see finding 4), so more callers only
+lengthen the queue. Sustained rates, 3 questions per call (~255 tokens), through `LayaRouter.decide()`:
+
+| lane | calls/s | questions/s | per minute | latency at that rate |
+|---|---|---|---|---|
+| `webgpu:fp16`, back-to-back | 19-21 | 57-63 | ~1200 | 48-54 ms |
+| `webgpu:fp16`, 10 calls/s offered | 10 | 30 | 600 | 53-60 ms |
+| `webgpu:fp16`, 5 calls/s offered | 5 | 15 | 300 | 61-85 ms (GPU clocks sag between calls) |
+| `webgpu:fp16`, 1 call/s offered | 1 | 3 | 60 | 112-143 ms |
+| `webgpu:fp16`, 1 call / 3 s | 0.33 | 1 | 20 | 172-257 ms (cold) |
+| `cpu:8`, back-to-back | 2.5-3.8 | 7-11 | 150-230 | 260-375 ms |
+| `cpu:8`, anything above ~3 calls/s | saturates | | | queue grows without bound |
+
+1 question per call runs ~1.6x more calls/s than 3 questions (30-34/s hot GPU), 10 questions ~0.4x (7-8/s),
+so batching questions into one call is the lever: 82 questions/s at 10 per call vs 34 at 1 per call. With 8
+callers in parallel the throughput is the same as with 1; each caller just sees `queueMs` grow (8 x 3 q:
+p50 ~410 ms end to end at 19 calls/s).
+
+Deployment overhead on top: HTTP `serve.mjs` +1-3 ms; `ask.mjs --sidecar` (new CLI process per call) ~165 ms
+per call, so ~6 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1-3 s load every time.
+
 ### Findings that change how you should run it
 
 1. **Hybrid CPU straggler mode (5x).** ORT's default pool (24 threads = all physical cores) splits every op over
@@ -211,18 +237,35 @@ answers to 4 decimals (fp16: max |delta p| 0.034, 195/195 arg-max agreement on t
    costs ~10 % in the good case and removes the slow mode: p95 284-350 ms across all sessions.
    `pinToPCores: true` is the default for the router's CPU lanes; override the P-core count with `LAYA_PCORE_LOGICAL`.
 2. **GPU idle clocks.** Between sporadic calls the RTX 4070 drops to ~225 MHz. Back-to-back a 3-question call
-   is 53 ms on WebGPU; after a 1 s pause 91 ms; after a 3 s pause ~200 ms. A single question after a 3 s pause:
-   WebGPU ~180 ms vs CPU ~105 ms. The CPU is insensitive to gaps. This is the case for the router.
-   A keep-alive (tiny GPU calls every 250 ms) was tried and does not help; left off.
+   is 48 ms on WebGPU; with 50 ms gaps 58-66 ms, 100 ms gaps 54-81, 200 ms gaps 75-96; after a 1 s pause 91-140;
+   after a 3 s pause ~170-235. A single question after a 3 s pause: WebGPU ~180 ms vs CPU ~105 ms. The CPU is
+   insensitive to gaps. This is the case for the router. A keep-alive (tiny GPU calls every 250 ms) was tried
+   and does not help; left off.
 3. **DirectML** loads the graph but every inference fails in a `Reshape` node (`node_view`, HRESULT 80070057) at
    all graph-optimisation levels; not fixable client-side. WebGPU is the NVIDIA path in `onnxruntime-node` on
    Windows (no CUDA EP is shipped for Windows).
-4. **No per-shape recompilation on WebGPU** beyond the first call (~180 ms); unseen sequence lengths run at
-   normal speed. Concurrency does not raise throughput (GPU work is serialised: 15.1 -> 15.8 calls/s at 1 -> 8).
+4. **Inferences never overlap in one process, and mixing lanes under load is a net loss.** `onnxruntime-node`
+   1.30 runs `session.run()` synchronously on the JS thread (`dist/backend.js`: `setImmediate` + blocking run),
+   so a CPU inference blocks the event loop - and every other lane - for its full duration: webgpu:fp16 3 q
+   went from 49 ms alone to 321-479 ms p50 while `cpu:8` ran in the same thread, and policy `auto` (which
+   spilled queued calls to the CPU) fell from 20 to 6.6 calls/s at 8 parallel callers
+   (`experiments/interference.mjs`, `experiments/throughput.mjs`). Putting each lane in a worker thread makes
+   them overlap (`experiments/worker-lanes.mjs`), but the 8 spinning P-core threads of the CPU lane still slow
+   the GPU lane 1.5x (49 -> 76 ms), so a burst with every 4th call on the CPU runs at 16 calls/s against 20.6
+   GPU-only. The router therefore keeps one FIFO for all lanes and never spills a burst to the CPU; the CPU lane
+   is for sporadic single questions on a cold GPU and for machines without a usable GPU. No per-shape
+   recompilation on WebGPU beyond the first call (~180 ms); unseen sequence lengths run at normal speed.
 5. **Latency scales with tokens**: CPU 3 q goes 236 -> 400 ms for 77 -> 136 tokens per question. Longer option
    descriptions (see v2 wording) cost latency on every call.
 6. **fp16 bundle**: half the VRAM and RSS, 0.8 s load, 5-13 % faster; fidelity fine on this domain
    (validate on yours: `node experiments/fp16-fidelity.mjs`). Build: `.venv/Scripts/python tools/convert_fp16.py <fp32 dir> models/laya-onnx-fp16`.
+7. **The JS thread's core matters (1.6x).** It tokenises, drives the WebGPU dispatch and is one of ORT's
+   intra-op workers (the pool is threads-1 pinned workers plus the caller). Windows parks it on an E-core for
+   minutes at a time: whole sessions ran webgpu:fp16 3 q at 78 ms instead of 49 and `cpu:8` ~1.3x slower, and
+   forcing the process onto the E-cores reproduces exactly that (71-80 ms). Node has no thread-affinity API, so
+   `LayaRouter.create()` restricts the whole process to the P-cores via PowerShell (`pinProcessToPCores`, ~0.4 s
+   in the background during the model load; `pinProcess: false` to opt out, `LAYA_PCORE_LOGICAL` for the
+   layout). This is the likely source of the 1.2-1.6x session-to-session swings noted earlier.
 
 ## The execution-provider router (`src/ep-router.mjs`)
 
@@ -234,10 +277,16 @@ Each lane is a separate `Laya` session (RAM: ~1.6 GiB per CPU lane, ~1.1 / 0.6 G
 - **Prediction**: EMA of ms-per-work-unit keyed by (lane, GPU state `hot` < 0.4 s / `warm` < 2 s / `cold`,
   question bucket 1 / 2-3 / 4-6 / 7-10 / 11+), seeded with priors from this machine; work = questions x
   estimated padded sequence length, so short and long states share estimates.
+- **Queue**: one FIFO for all lanes (inferences cannot overlap, finding 4). A call's prediction is
+  `wait + own`: the wait is the predicted remaining time of everything queued (the same for every lane), `own`
+  the lane's latency in the GPU state expected *when it starts* (`hot` if GPU work is queued ahead, never `cold`
+  while anything is queued). `routing.ms` is the inference alone; `routing.queueMs` the wait.
 - **Contention**: background sampling of other processes' CPU (os.cpus deltas minus own usage) and GPU load
-  (nvidia-smi utilisation weighted by SM clock, sampled while we are idle) inflates the affected lane.
-- **Decision**: `auto` = fastest predicted with 5 % exploration among lanes within 2x; `prefer-gpu`,
-  `prefer-cpu`, `min-cpu`; per call `{ lane }` or `{ deadlineMs }` (meet the deadline with the least CPU share).
+  (nvidia-smi utilisation weighted by SM clock, sampled while we are idle) inflates the affected lane's `own`.
+- **Decision**: `auto` = fastest predicted, with 5 % exploration among lanes within 2x while idle (never under
+  load); `prefer-gpu`, `prefer-cpu`, `min-cpu`; per call `{ lane }` or `{ deadlineMs }` (meet the deadline,
+  queue included, with the least CPU share).
+- **Process affinity**: on Windows hybrid CPUs the process is restricted to the P-cores (finding 7; `pinProcess: false` to opt out).
 
 Measured behaviour (`router-demo.mjs`): bursts -> WebGPU (47-90 ms / 3 q); one question every 3 s -> CPU
 (100-130 ms, WebGPU predicted ~200 cold); 10 questions after a pause -> WebGPU (505 ms vs CPU 1180 predicted).

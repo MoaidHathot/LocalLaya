@@ -50,7 +50,7 @@ test("estimateWork grows with questions and state length, capped by max_len", ()
   assert.ok(estimateWork(long, q3) <= 3 * 512);
 });
 
-test("chooseLane: auto picks fastest; exploration stays within 2x", () => {
+test("chooseLane: auto picks fastest; exploration stays within 2x of the best lane's own latency", () => {
   const cands = [
     { lane: "cpu", predictedMs: 105, share: 0.65 },
     { lane: "webgpu", predictedMs: 180, share: 0.02 },
@@ -67,6 +67,12 @@ test("chooseLane: auto picks fastest; exploration stays within 2x", () => {
     { lane: "webgpu", predictedMs: 500, share: 0.02 },
   ];
   assert.equal(chooseLane(far, { policy: "auto", explore: 1, rng: () => 0 }).lane, "cpu");
+  // with a shared queue wait the 2x test uses the lanes' own latencies, not wait + own
+  const queued = [
+    { lane: "webgpu", predictedMs: 600, ownMs: 100, share: 0.02 },
+    { lane: "cpu", predictedMs: 800, ownMs: 300, share: 0.65 },
+  ];
+  assert.equal(chooseLane(queued, { policy: "auto", explore: 1, rng: () => 0 }).lane, "webgpu");
 });
 
 test("chooseLane: policies and deadline", () => {
@@ -141,30 +147,58 @@ test("parseDuration", () => {
   assert.throws(() => parseDuration(""), SidecarError);
 });
 
-test("router predictions account for calls already queued on a lane", () => {
+test("router predictions: one queue for all lanes - shared wait, choice by own latency, GPU state at start", () => {
   // a router with two fake lanes and no model loaded
   const r = Object.create(LayaRouter.prototype);
   r.lanes = new Map();
+  r.inflight = [];
   r.load = { cpuOthers: 0, gpuOthersUtil: 0 };
   r.lastGpuWorkEnd = performance.now(); // GPU hot
-  const mk = (lane, pending) => ({ lane, model: new LatencyModel(lane), healthy: true, quarantinedUntil: 0, pending });
-  r.lanes.set("webgpu", mk("webgpu", 0));
-  r.lanes.set("cpu", mk("cpu", 0));
-  const idle = Object.fromEntries(r.predictions(3).map((p) => [p.lane, p.predictedMs]));
-  assert.ok(idle.webgpu < idle.cpu, "idle: GPU is the faster lane");
-  // three callers queued on the GPU lane -> its prediction is 4x (4 x 55 = 220 ms), still below one CPU call (260)
-  r.lanes.get("webgpu").pending = 3;
+  const mk = (lane) => ({ lane, model: new LatencyModel(lane), healthy: true, quarantinedUntil: 0, pending: 0 });
+  r.lanes.set("webgpu", mk("webgpu"));
+  r.lanes.set("cpu", mk("cpu"));
+  const by = (preds) => Object.fromEntries(preds.map((p) => [p.lane, p]));
+  const idle = by(r.predictions(3));
+  assert.ok(idle.webgpu.predictedMs < idle.cpu.predictedMs, "idle: GPU is the faster lane");
+  assert.equal(idle.webgpu.waitMs, 0);
+  assert.equal(idle.webgpu.predictedMs, idle.webgpu.ownMs);
+  // three GPU calls queued: every lane waits for all of them (one queue); the GPU stays the choice - spilling
+  // to the CPU would only insert a 260 ms stall in front of the GPU calls behind it
+  r.inflight = [1, 2, 3].map(() => ({ lane: "webgpu", ownMs: 55, startedAt: null }));
   let busy = r.predictions(3);
-  const g = busy.find((p) => p.lane === "webgpu");
-  assert.ok(Math.abs(g.predictedMs - idle.webgpu * 4) < 1e-9);
-  assert.equal(g.pending, 3);
-  assert.equal(chooseLane(busy, { explore: 0 }).lane, "webgpu", "spilling to CPU is not worth it yet");
-  // five queued (6 x 55 = 330 ms) -> the idle CPU lane wins the next call
-  r.lanes.get("webgpu").pending = 5;
-  busy = r.predictions(3);
-  assert.equal(chooseLane(busy, { explore: 0 }).lane, "cpu");
-  // contention inflation still applies on top
+  const b = by(busy);
+  assert.ok(Math.abs(b.webgpu.waitMs - 165) < 1e-9);
+  assert.ok(Math.abs(b.cpu.waitMs - 165) < 1e-9);
+  assert.ok(Math.abs(b.webgpu.predictedMs - (165 + idle.webgpu.ownMs)) < 1e-9);
+  assert.ok(Math.abs(b.cpu.predictedMs - (165 + idle.cpu.ownMs)) < 1e-9);
+  assert.equal(b.webgpu.pending, 3);
+  assert.equal(chooseLane(busy, { explore: 0 }).lane, "webgpu");
+  r.inflight = Array.from({ length: 20 }, () => ({ lane: "webgpu", ownMs: 55, startedAt: null }));
+  assert.equal(chooseLane(r.predictions(3), { explore: 0 }).lane, "webgpu", "a deep queue never spills to the CPU");
+  // the running call counts only its remaining time
+  r.inflight = [{ lane: "webgpu", ownMs: 100, startedAt: performance.now() - 40 }];
+  const remaining = r.waitMs();
+  assert.ok(remaining > 50 && remaining <= 60, `remaining ${remaining}`);
+  r.inflight = [{ lane: "webgpu", ownMs: 100, startedAt: performance.now() - 500 }];
+  assert.equal(r.waitMs(), 0, "an overrunning call does not go negative");
+  // GPU state when the call will start: GPU work queued ahead -> hot even if the GPU is cold now
+  r.lastGpuWorkEnd = -Infinity;
+  r.inflight = [{ lane: "webgpu", ownMs: 180, startedAt: null }];
+  assert.equal(by(r.predictions(1)).webgpu.state, "hot");
+  // only CPU work queued ahead of a cold GPU -> priced "warm" (traffic warms the clocks), not cold
+  r.inflight = [{ lane: "cpu", ownMs: 260, startedAt: null }];
+  const w = by(r.predictions(1));
+  assert.equal(w.webgpu.state, "warm");
+  assert.ok(Math.abs(w.webgpu.predictedMs - (260 + DEFAULT_PRIORS.webgpu.ms.warm["1"])) < 1e-9);
+  // idle and cold: the cold prior applies and the CPU wins a single question (sporadic traffic)
+  r.inflight = [];
+  const cold = r.predictions(1);
+  assert.equal(by(cold).webgpu.state, "cold");
+  assert.equal(chooseLane(cold, { explore: 0 }).lane, "cpu");
+  // contention inflation applies to the lane's own latency, not to the shared wait
+  r.lastGpuWorkEnd = performance.now();
+  r.inflight = [{ lane: "webgpu", ownMs: 55, startedAt: null }];
   r.load.cpuOthers = 0.5;
-  const c = r.predictions(3).find((p) => p.lane === "cpu");
-  assert.ok(Math.abs(c.predictedMs - idle.cpu * 2) < 1e-9);
+  const c = by(r.predictions(3)).cpu;
+  assert.ok(Math.abs(c.predictedMs - (55 + idle.cpu.ownMs * 2)) < 1e-9);
 });

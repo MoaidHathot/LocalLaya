@@ -121,7 +121,7 @@ test("two launchers racing produce exactly one sidecar (port = mutex, loser exit
   assert.equal(loser.exitCode, 3);
 });
 
-test("8 parallel callers: zero errors, both lanes used, queueing visible", async () => {
+test("8 parallel callers: zero errors, one queue, no spill to the CPU lane", async () => {
   const bodies = Array.from({ length: 8 }, (_, i) => ({ preset: "smart-home", text: `Set the ${["kitchen", "bedroom", "office", "porch", "garage", "hall", "living room", "bathroom"][i]} lights to ${20 + i * 10} percent` }));
   const t0 = Date.now();
   const results = await Promise.all(bodies.map((b) => decide(b, { port: PORT })));
@@ -131,7 +131,12 @@ test("8 parallel callers: zero errors, both lanes used, queueing visible", async
   console.log(`      8 parallel calls in ${wall} ms; lanes used: ${[...lanes].join(", ")}; ${queued} waited in a queue`);
   assert.equal(results.length, 8);
   assert.ok(results.every((r) => r.answers.intent), "every call answered");
-  assert.ok(lanes.size >= 2, `expected both lanes to be used under load, got ${[...lanes].join(", ")}`);
+  assert.ok(queued >= 4, `expected most callers to wait in the queue, got ${queued}`);
+  // inferences never overlap in one process (onnxruntime-node runs synchronously on the JS thread), so a burst
+  // stays on the fastest lane: a CPU call in the middle would stall every GPU call behind it
+  assert.equal(lanes.size, 1, `expected a burst to stay on one lane, got ${[...lanes].join(", ")}`);
+  const gpu = results.filter((r) => r.routing.lane.startsWith("webgpu"));
+  if (gpu.length) assert.ok(gpu.every((r) => r.routing.ms < 600), `GPU inferences should not be stalled by other lanes: ${gpu.map((r) => r.routing.ms.toFixed(0)).join(", ")} ms`);
 });
 
 test("preset and calibration edits are picked up without a restart", async () => {
