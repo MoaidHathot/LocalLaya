@@ -1,12 +1,12 @@
 ---
 name: laya-decisions
-description: Fast local typed decisions with calibrated probabilities - classify, route, gate, triage or score a text or JSON state (intent, department, urgency, risk, task type, yes/no checks) in ~0.3 s using the Laya model through the TestLayaONNX CLI / sidecar, without an LLM call. Use when an agent needs a quick pick-one, yes/no or ordinal judgement to decide what to do next. Not for generating text, answering factual questions, or anything a parser/regex can compute exactly.
-license: MIT (project); model weights Apache-2.0 (Convai Innovations)
-compatibility: Requires Node.js 20+ and a checkout of the TestLayaONNX project with the model downloaded (first run fetches 1.7 GB). Tested on Windows 11 with an NVIDIA GPU; works CPU-only. Binds 127.0.0.1 only.
+description: Fast local typed decisions with calibrated probabilities - classify, route, gate, triage or score a text or JSON state (intent, department, urgency, risk, task type, yes/no checks) in ~0.3 s using the Laya model through the LocalLaya CLI / sidecar, without an LLM call. Use when an agent needs a quick pick-one, yes/no or ordinal judgement to decide what to do next. Not for generating text, answering factual questions, or anything a parser/regex can compute exactly.
+license: Unlicense (this project). Vendored @receptron/laya is MIT; Laya model weights are Apache-2.0 (Convai Innovations).
+compatibility: Requires Node.js 20+ and a checkout of the LocalLaya project (github.com/MoaidHathot/LocalLaya) with the model downloaded (first run fetches 1.7 GB). Tested on Windows 11 with an NVIDIA GPU; works CPU-only. Binds 127.0.0.1 only.
 metadata:
   author: moaid
   version: "1.0"
-  project: TestLayaONNX (set LAYA_DIR to its path when this skill lives elsewhere)
+  project: LocalLaya (set LAYA_DIR to its checkout path when this skill lives elsewhere)
 ---
 
 # Laya decisions

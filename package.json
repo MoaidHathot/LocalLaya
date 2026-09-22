@@ -1,5 +1,5 @@
 {
-  "name": "laya-poc",
+  "name": "local-laya",
   "version": "0.4.0",
   "private": true,
   "description": "PoC, benchmarks, calibration tooling and execution-provider router for Laya (ONNX port, @receptron/laya) on Windows",

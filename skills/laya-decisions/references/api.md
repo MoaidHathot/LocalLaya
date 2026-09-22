@@ -1,6 +1,6 @@
 # Laya decisions - API and CLI reference
 
-All commands run in the TestLayaONNX project directory (or through `scripts/laya.mjs`, which resolves it via
+All commands run in the LocalLaya project directory (or through `scripts/laya.mjs`, which resolves it via
 `LAYA_DIR` or its own location).
 
 ## CLI: `ask.mjs`

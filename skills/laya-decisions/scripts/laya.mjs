@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * laya.mjs - call Laya from anywhere. Thin wrapper around the project's ask.mjs that
- *   1. finds the TestLayaONNX project ($LAYA_DIR, or three levels up from this script when the skill lives in
+ *   1. finds the LocalLaya project ($LAYA_DIR, or three levels up from this script when the skill lives in
  *      <project>/skills/laya-decisions/), and
  *   2. defaults to --sidecar --json (shared background instance, machine-readable stdout).
  *
@@ -22,7 +22,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const candidates = [process.env.LAYA_DIR, path.resolve(here, "..", "..", "..")].filter(Boolean);
 const projectDir = candidates.find((d) => existsSync(path.join(d, "ask.mjs")) && existsSync(path.join(d, "serve.mjs")));
 if (!projectDir) {
-  console.error(`laya.mjs: cannot find the TestLayaONNX project (looked at ${candidates.join(", ")}). Set LAYA_DIR to the directory that contains ask.mjs.`);
+  console.error(`laya.mjs: cannot find the LocalLaya project (looked at ${candidates.join(", ")}). Set LAYA_DIR to the directory that contains ask.mjs.`);
   process.exit(2);
 }
 

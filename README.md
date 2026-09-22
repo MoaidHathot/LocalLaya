@@ -1,4 +1,4 @@
-# Laya on Windows via ONNX Runtime - PoC, benchmarks, calibration, EP router
+# LocalLaya - Laya on Windows via ONNX Runtime: CLI, sidecar, router, calibration, benchmarks
 
 Runs [Laya](https://huggingface.co/convaiinnovations/laya) (Convai Innovations' non-autoregressive "System 1"
 decision model: typed `choice` / `score` / `noul` answers with probabilities, one forward pass) from Node.js on
@@ -126,7 +126,7 @@ this project (via `LAYA_DIR`, or its own location inside the repo) and runs `ask
 
 ```powershell
 node skills/laya-decisions/scripts/laya.mjs --preset dev-request "is this valid json {bla: 1}"
-# from anywhere: $env:LAYA_DIR = "W:\Playground\TestLayaONNX"; node <skills-dir>\laya-decisions\scripts\laya.mjs ...
+# from anywhere: $env:LAYA_DIR = "W:\Github\LocalLaya"; node <skills-dir>\laya-decisions\scripts\laya.mjs ...
 ```
 ## Your own domain (custom presets)
 
@@ -282,6 +282,12 @@ PyTorch path (original repo), after which `export/export_onnx.py` produces a bun
 
 Caveats: 65 examples give noisy estimates (LOO fits ranged 1.28-1.66 for `choice:3-5`); the labels are mine;
 `score` questions have no gold labels here. Replace the eval set with your traffic before trusting the tables.
+
+## License
+
+This project: [Unlicense](LICENSE) (public domain). Third-party components keep their own licenses: the
+vendored `@receptron/laya` 0.1.2 is MIT (Receptron), the Laya model weights are Apache-2.0
+(Convai Innovations), `onnxruntime-node` is MIT (Microsoft).
 
 ## Supply chain / safety
 
