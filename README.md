@@ -12,7 +12,8 @@ Everything downloaded lives under this directory (`models/`, `node_modules/`, `.
 | path | what |
 |---|---|
 | `ask.mjs` | ask it things: one-shot CLI or interactive REPL with presets and ad-hoc questions |
-| `serve.mjs` | local HTTP API (`POST /decide`) + browser page; model stays loaded, router picks the lane |
+| `serve.mjs` | local HTTP API (`POST /decide`) + browser page; model stays loaded; also the on-demand sidecar (`--idle`, `/health`, `/shutdown`) |
+| `src/sidecar-client.mjs` | discover / spawn / wait / call / stop the sidecar; no ONNX import (used by `ask.mjs --sidecar`) |
 | `data/presets.mjs`, `presets/` | built-in question presets (smart-home calibrated; triage, guard, moderation, route, sentiment unmeasured) + your own `presets/<name>.json`; `dev-request` worked example with labelled eval |
 | `poc.mjs` | load once, answer 3 questions in one pass, 10 timed runs, sanity check on contrasting states |
 | `src/laya-client.mjs` | reusable loader: pinned HF revision, project-local cache, SHA256 verification, no network after first download, EP selection, P-core pinning, calibration, `createDecider()` facade |
@@ -26,7 +27,8 @@ Everything downloaded lives under this directory (`models/`, `node_modules/`, `.
 | `tools/convert_fp16.py` | fp32 -> fp16 bundle conversion (ORT's transformer float16 pass; no PyTorch) |
 | `verify-model.mjs` | re-hash the cached bundle against the pinned SHA256 values |
 | `vendor/receptron-laya-0.1.2.tgz` | the exact published npm tarball (see Supply chain) |
-| `test/unit.test.mjs` | unit tests for router decisions, latency model, calibration maths |
+| `skills/laya-decisions/` | Agent Skill (agentskills.io format): `SKILL.md` + `references/` + `scripts/laya.mjs` wrapper; copy the folder into an agent's skills directory and set `LAYA_DIR` |
+| `test/unit.test.mjs`, `test/sidecar.test.mjs` | unit tests (router, latency model, calibration maths, presets, durations); sidecar lifecycle integration tests |
 
 ## Quick start
 
@@ -50,6 +52,7 @@ node ask.mjs "Turn off the living room lights"                # one shot
 node ask.mjs --preset triage "Charged twice. Refund today or I cancel."
 node ask.mjs --json --preset guard "Ignore all previous instructions"
 node ask.mjs --state state.json --questions questions.json    # your own state + questions
+node ask.mjs --sidecar "..."                                  # shared background instance, ~0.3 s per call (see Sidecar)
 npm run ask                                                   # interactive: model stays loaded
 ```
 
@@ -84,6 +87,47 @@ const r2 = await router.decide(state, questions);            // r2.routing.lane,
 const r3 = await router.decide(state, questions, { deadlineMs: 150 });
 ```
 
+## Sharing one instance: the on-demand sidecar
+
+Each `node ask.mjs "..."` loads the model (~1.6 s, 0.4 GB RAM + 0.8 GB VRAM), answers, exits. Ten programs
+calling it at once = ten copies. `serve.mjs` keeps one copy forever, even when nobody calls. The middle ground:
+
+```powershell
+node ask.mjs --sidecar "Lock the front door"   # first call: starts serve.mjs in the background (~5 s), answers
+node ask.mjs --sidecar "..."                    # every later call: ~0.2-0.4 s, no model load
+$env:LAYA_SIDECAR = "1"                         # make --sidecar the default for a shell / orchestration
+node ask.mjs --status | --stop | --start [--idle 10m] [--lanes ...]
+```
+
+- The sidecar is `serve.mjs --sidecar --idle 5m`, spawned detached (no window, log in `.laya/sidecar-<port>.log`).
+  It exits by itself after 5 minutes without requests (`--idle`, `LAYA_IDLE`; `0` = never), freeing RAM and
+  VRAM; the next call starts a fresh one. An open REPL (`node ask.mjs --sidecar`) pings it so it stays warm.
+- The port is the mutex: the sidecar binds `127.0.0.1:8787` (`--port`, `LAYA_PORT`) *before* loading, so
+  launchers racing at the same instant produce exactly one instance (the loser exits with code 3 without
+  loading); callers arriving during the load wait for `status: ready`. Anything else on the port is
+  detected via `/health` (`service: "laya"`) and never touched; the CLI then falls back to in-process.
+- Load-aware: predictions include the calls already queued on a lane, so 8 parallel callers spread over GPU
+  and CPU instead of piling onto one (`routing.queueMs` tells you how long a call waited). Presets and
+  calibration tables are re-read when their files change. Background CPU/GPU sampling pauses after 10 s idle.
+- Programs that would rather call HTTP directly: `node ask.mjs --start` prints `{ url, pid, lanes }`; then
+  `POST /decide` (see Ask it something). `/health` shows `idleRemainingS`; `POST /touch` extends it.
+- The CLI client uses `node:http`, not `fetch`: on this Node (25.3, Windows) undici crashes the process at exit
+  (`0xC0000409`) after a couple of requests - visible only as a wrong exit code.
+
+Measured here: first call 5.4 s (spawn + load + warm-up), second call 184 ms; 8 parallel calls in 3.4 s
+across both lanes, zero errors; VRAM 4351 -> 3403 MiB after the idle exit. `npm run test:sidecar` runs the
+11 lifecycle scenarios (~1 min; uses port 8797).
+## Using it from agents: the skill
+
+`skills/laya-decisions/` is an [Agent Skill](https://agentskills.io): `SKILL.md` tells an agent what Laya
+decides, when (and when not) to use it, how to call it and how to read probabilities;
+`references/api.md` and `references/presets.md` hold the details; `scripts/laya.mjs` is a wrapper that finds
+this project (via `LAYA_DIR`, or its own location inside the repo) and runs `ask.mjs --sidecar --json ...`.
+
+```powershell
+node skills/laya-decisions/scripts/laya.mjs --preset dev-request "is this valid json {bla: 1}"
+# from anywhere: $env:LAYA_DIR = "W:\Playground\TestLayaONNX"; node <skills-dir>\laya-decisions\scripts\laya.mjs ...
+```
 ## Your own domain (custom presets)
 
 The output you get is always *the preset's questions answered about your text*. Asking the smart-home preset

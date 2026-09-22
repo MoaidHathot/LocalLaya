@@ -1,73 +1,161 @@
 #!/usr/bin/env node
 /**
  * Local HTTP API for Laya (model stays loaded, router picks the lane per request) + a minimal browser page.
+ * Doubles as the on-demand sidecar that ask.mjs --sidecar spawns and talks to.
  *
- *   node serve.mjs                         # http://127.0.0.1:8787
+ *   node serve.mjs                         # foreground server on http://127.0.0.1:8787, never exits on its own
+ *   node serve.mjs --idle 5m               # exit after 5 minutes without requests (frees RAM + VRAM); 30s, 10m, 0 = never
+ *   node serve.mjs --sidecar               # spawned by ask.mjs: --idle defaults to $LAYA_IDLE or 5m
  *   node serve.mjs --port 9000 --lanes webgpu:fp16,cpu:8
  *   node serve.mjs --calibration calibration/smart-home-v3.json   # one table for every preset (default: per preset,
  *                                                                 # calibration/<preset>.json when present)
- * Presets: built-ins + presets/*.json|*.mjs (re-read on every request, so you can edit files while it runs).
  *   node serve.mjs --cors                  # allow browser pages from other origins to call the API (off by default)
+ *
+ * Lifecycle: the port is bound BEFORE the model loads, so the port doubles as the mutex between racing
+ * launchers (a second instance gets EADDRINUSE and exits with code 3 without loading anything). While
+ * loading, /health reports status "loading" and /decide answers 503. Idle exit only happens with no request
+ * in flight. Background load sampling (nvidia-smi / CPU) pauses after 10 s idle.
  *
  * Endpoints (all JSON):
  *   GET  /                 browser UI
- *   GET  /health           { ok, lanes, uptimeS }
- *   GET  /presets          { name: { description, questions } }
- *   GET  /stats            router statistics (latency estimates, load, per-lane calls)
- *   POST /decide           body: { text?: string, state?: any, preset?: string, questions?: {...}, lane?: string, deadlineMs?: number }
- *                          -> { answers, usage, routing, state, questions }
+ *   GET  /health           { service: "laya", status: loading|ready|failed|stopping, pid, port, lanes, uptimeS,
+ *                            idleS, idleRemainingS, inFlight, sidecar }
+ *   GET  /presets          { name: { description, source, state, questions } }
+ *   GET  /stats            router statistics (latency estimates, load, per-lane calls / pending)
+ *   POST /decide           body: { text?: string, state?: any, preset?: string, questions?: {...}, lane?: string, deadlineMs?: number,
+ *                                  calibration?: { temperature_by_options } }
+ *                          -> { answers, usage, routing, state, questions, preset, calibration }
  *                          `text` is wrapped by the preset's state builder; `state` is used verbatim;
- *                          `questions` replaces the preset's question set.
+ *                          `questions` replaces the preset's question set; `calibration` overrides the per-preset
+ *                          table for this call. Resets the idle timer.
+ *   POST /touch            resets the idle timer without doing work (REPL keep-alive) -> { ok, idleRemainingS }
+ *   POST /shutdown         graceful stop -> { ok: true }, then the process exits
  *
- * Examples:
- *   curl -s -X POST http://127.0.0.1:8787/decide -H "content-type: application/json" -d "{\"text\":\"Turn off the kitchen lights\"}"
- *   curl -s -X POST http://127.0.0.1:8787/decide -d "{\"preset\":\"triage\",\"text\":\"Charged twice, refund me today\"}"
- *   Invoke-RestMethod -Method Post http://127.0.0.1:8787/decide -ContentType application/json -Body (@{ text = "Lock the front door" } | ConvertTo-Json)
+ * Presets (built-in + presets/*.json|*.mjs) and calibration tables (calibration/<preset>.json) are re-read
+ * when their files change, so a long-running instance picks up edits without a restart.
  */
 import { createServer } from "node:http";
+import { access, readFile, stat } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { LayaRouter } from "./src/ep-router.mjs";
 import { loadPresets, DEFAULT_PRESET, describePresets, PRESETS_DIR } from "./data/presets.mjs";
-import { access, readFile } from "node:fs/promises";
+import { parseDuration } from "./src/sidecar-client.mjs";
+
+const PROJECT_ROOT = path.dirname(fileURLToPath(import.meta.url));
+const VERSION = JSON.parse(await readFile(path.join(PROJECT_ROOT, "package.json"), "utf8")).version;
 
 const { values: args } = parseArgs({
   options: {
-    port: { type: "string", default: "8787" },
+    port: { type: "string", default: process.env.LAYA_PORT ?? "8787" },
     host: { type: "string", default: "127.0.0.1" },
-    lanes: { type: "string", default: "webgpu:fp16,cpu:8" },
+    lanes: { type: "string", default: process.env.LAYA_LANES ?? "webgpu:fp16,cpu:8" },
     calibration: { type: "string" },
     cors: { type: "boolean", default: false },
+    idle: { type: "string" },
+    sidecar: { type: "boolean", default: false },
   },
 });
-const log = (m) => console.log(`[serve] ${new Date().toISOString().slice(11, 19)} ${m}`);
+const idleMs = parseDuration(args.idle ?? (args.sidecar ? process.env.LAYA_IDLE ?? "5m" : "0"));
+const SAMPLING_PAUSE_MS = 10_000;
+const log = (m) => console.log(`[serve${args.sidecar ? ":sidecar" : ""} ${process.pid}] ${new Date().toISOString().slice(11, 19)} ${m}`);
+process.title = args.sidecar ? "laya-sidecar" : "laya-serve";
 
+// ---- state ------------------------------------------------------------------------------------------------------
 const started = Date.now();
-log(`loading lanes ${args.lanes} ...`);
-const router = await LayaRouter.create({ lanes: args.lanes.split(","), log: (m) => log(`  ${m}`) });
-let PRESETS = await loadPresets();
-await router.warmup({ state: PRESETS[DEFAULT_PRESET].state("Please turn off the lights in the living room now"), sizes: [3, 5] });
-log(`ready in ${((Date.now() - started) / 1000).toFixed(1)} s; lanes: ${[...router.lanes.keys()].join(", ")}; presets: ${Object.keys(PRESETS).join(", ")} (${PRESETS_DIR})`);
+let status = "loading"; // loading | ready | failed | stopping
+let loadError = null;
+let router = null;
+let PRESETS = {};
+let inFlight = 0;
+let lastRequestAt = Date.now();
+let idleTimer = null;
+let samplingPauseTimer = null;
+let shuttingDown = false;
+const idleRemainingS = () => (idleMs > 0 ? Math.max(0, Math.round((lastRequestAt + idleMs - Date.now()) / 1000)) : null);
 
-// calibration table per preset: --calibration (global) or calibration/<preset>.json; cached by mtime-less simplicity (restart to refresh)
-const calibrationCache = new Map();
-async function calibrationFor(name) {
-  if (calibrationCache.has(name)) return calibrationCache.get(name);
-  const file = args.calibration ?? `calibration/${name}.json`;
-  let table = null;
-  try {
-    await access(file);
-    table = { ...JSON.parse(await readFile(file, "utf8")), file };
-  } catch {
-    /* none */
+function touch() {
+  lastRequestAt = Date.now();
+  if (router && !router.sampling) router.resumeSampling();
+  armTimers();
+}
+
+function armTimers() {
+  if (idleTimer) clearTimeout(idleTimer);
+  if (samplingPauseTimer) clearTimeout(samplingPauseTimer);
+  samplingPauseTimer = setTimeout(() => {
+    if (router && inFlight === 0) router.pauseSampling();
+  }, SAMPLING_PAUSE_MS);
+  samplingPauseTimer.unref();
+  if (idleMs > 0) {
+    idleTimer = setTimeout(onIdle, Math.max(250, lastRequestAt + idleMs - Date.now()));
+    // deliberately NOT unref'd: the timer is what keeps the parked process alive
   }
-  calibrationCache.set(name, table);
+}
+
+function onIdle() {
+  idleTimer = null;
+  if (shuttingDown) return;
+  if (inFlight > 0 || Date.now() < lastRequestAt + idleMs) return armTimers();
+  log(`idle for ${Math.round(idleMs / 1000)} s with nothing in flight; exiting`);
+  shutdown("idle", 0);
+}
+
+async function shutdown(reason, code = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  status = "stopping";
+  log(`shutting down (${reason}) ...`);
+  if (idleTimer) clearTimeout(idleTimer);
+  if (samplingPauseTimer) clearTimeout(samplingPauseTimer);
+  server.close();
+  // let in-flight decides finish (bounded), then drop keep-alive sockets so close() completes
+  const deadline = Date.now() + 10_000;
+  while (inFlight > 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+  server.closeAllConnections?.();
+  try {
+    await router?.close();
+  } catch (e) {
+    log(`router close: ${e?.message ?? e}`);
+  }
+  log("bye");
+  process.exit(code);
+}
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("uncaughtException", (e) => {
+  log(`uncaught exception: ${e?.stack ?? e}`);
+  shutdown("crash", 1);
+});
+process.on("unhandledRejection", (e) => {
+  log(`unhandled rejection: ${e?.stack ?? e}`);
+  shutdown("crash", 1);
+});
+
+// ---- per-preset calibration tables, re-read when the file changes ----------------------------------------------
+const calibrationCache = new Map(); // preset -> { file, mtimeMs, table }
+async function calibrationFor(name) {
+  const file = path.resolve(PROJECT_ROOT, args.calibration ?? `calibration/${name}.json`);
+  let mtimeMs;
+  try {
+    mtimeMs = (await stat(file)).mtimeMs;
+  } catch {
+    calibrationCache.delete(name);
+    return null;
+  }
+  const cached = calibrationCache.get(name);
+  if (cached && cached.file === file && cached.mtimeMs === mtimeMs) return cached.table;
+  const table = { ...JSON.parse(await readFile(file, "utf8")), file: path.relative(PROJECT_ROOT, file).replace(/\\/g, "/") };
+  calibrationCache.set(name, { file, mtimeMs, table });
   return table;
 }
 
-const json = (res, status, body) => {
+// ---- http helpers --------------------------------------------------------------------------------------------------
+const json = (res, statusCode, body) => {
   const headers = { "content-type": "application/json; charset=utf-8" };
   if (args.cors) headers["access-control-allow-origin"] = "*";
-  res.writeHead(status, headers);
+  res.writeHead(statusCode, headers);
   res.end(JSON.stringify(body));
 };
 
@@ -107,7 +195,7 @@ async function decide(body) {
   if (body.state !== undefined) state = body.state;
   else if (typeof body.text === "string" && body.text.trim()) state = preset.state(body.text.trim());
   else throw Object.assign(new Error("provide text (string) or state (any JSON)"), { status: 400 });
-  const opts = { calibration: await calibrationFor(presetName) };
+  const opts = { calibration: body.calibration?.temperature_by_options ? { temperature_by_options: body.calibration.temperature_by_options, file: body.calibration.file ?? "request" } : await calibrationFor(presetName) };
   if (body.lane) {
     if (!router.lanes.has(body.lane)) throw Object.assign(new Error(`lane ${body.lane} not loaded; have ${[...router.lanes.keys()].join(", ")}`), { status: 400 });
     opts.lane = body.lane;
@@ -117,6 +205,23 @@ async function decide(body) {
   return { answers: r.answers, usage: r.usage, routing: r.routing, state, questions, preset: body.questions ? null : presetName, calibration: opts.calibration?.file ?? null };
 }
 
+const health = () => ({
+  service: "laya",
+  version: VERSION,
+  status,
+  error: loadError,
+  pid: process.pid,
+  port: Number(args.port),
+  sidecar: args.sidecar,
+  lanes: router ? [...router.lanes.keys()] : [],
+  uptimeS: Math.round((Date.now() - started) / 1000),
+  idleS: idleMs ? Math.round(idleMs / 1000) : 0,
+  idleRemainingS: idleRemainingS(),
+  inFlight,
+  sampling: !!router?.sampling,
+});
+
+// ---- server ----------------------------------------------------------------------------------------------------------
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   try {
@@ -128,8 +233,18 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       return res.end(PAGE);
     }
-    if (req.method === "GET" && url.pathname === "/health") return json(res, 200, { ok: true, lanes: [...router.lanes.keys()], uptimeS: Math.round((Date.now() - started) / 1000) });
+    if (req.method === "GET" && url.pathname === "/health") return json(res, 200, health());
     if (req.method === "GET" && url.pathname === "/presets") return json(res, 200, describePresets(await loadPresets()));
+    if (req.method === "POST" && url.pathname === "/shutdown") {
+      json(res, 200, { ok: true, pid: process.pid });
+      setTimeout(() => shutdown("requested"), 20);
+      return;
+    }
+    if (status !== "ready") return json(res, 503, { error: status === "loading" ? "loading" : `not available: ${status}${loadError ? ` (${loadError})` : ""}`, status, retryAfterMs: 500 });
+    if (req.method === "POST" && url.pathname === "/touch") {
+      touch();
+      return json(res, 200, { ok: true, idleRemainingS: idleRemainingS() });
+    }
     if (req.method === "GET" && url.pathname === "/stats") return json(res, 200, router.stats());
     if (req.method === "POST" && url.pathname === "/decide") {
       const raw = await readBody(req);
@@ -139,29 +254,53 @@ const server = createServer(async (req, res) => {
       } catch {
         return json(res, 400, { error: "invalid JSON body" });
       }
+      inFlight++;
+      touch();
       const t0 = performance.now();
-      const out = await decide(body);
-      log(`decide ${out.preset ?? "custom"} ${Object.keys(out.questions).length} q -> ${out.routing.lane} ${out.routing.ms.toFixed(0)} ms (total ${(performance.now() - t0).toFixed(0)} ms)`);
-      return json(res, 200, out);
+      try {
+        const out = await decide(body);
+        log(`decide ${out.preset ?? "custom"} ${Object.keys(out.questions).length} q -> ${out.routing.lane} ${out.routing.ms.toFixed(0)} ms${out.routing.queueMs > 5 ? ` (+${out.routing.queueMs.toFixed(0)} queued)` : ""} (total ${(performance.now() - t0).toFixed(0)} ms)`);
+        return json(res, 200, out);
+      } finally {
+        inFlight--;
+        touch();
+      }
     }
     return json(res, 404, { error: "not found" });
   } catch (e) {
-    const status = e.status ?? 500;
-    if (status === 500) log(`error: ${e.stack ?? e}`);
-    return json(res, status, { error: e.message ?? String(e) });
+    const statusCode = e.status ?? 500;
+    if (statusCode === 500) log(`error: ${e.stack ?? e}`);
+    return json(res, statusCode, { error: e.message ?? String(e) });
   }
 });
+server.keepAliveTimeout = 5_000;
 
-server.listen(Number(args.port), args.host, () => log(`listening on http://${args.host}:${args.port}  (POST /decide, GET /presets /health /stats)`));
+server.on("error", (e) => {
+  if (e.code === "EADDRINUSE") {
+    log(`port ${args.port} is already in use (another instance is probably running); exiting with code 3`);
+    process.exit(3);
+  }
+  log(`server error: ${e.stack ?? e}`);
+  process.exit(1);
+});
 
-const shutdown = async () => {
-  log("shutting down ...");
-  server.close();
-  await router.close();
-  process.exit(0);
-};
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+server.listen(Number(args.port), args.host, async () => {
+  log(`listening on http://${args.host}:${args.port} (v${VERSION}${idleMs ? `, idle exit after ${Math.round(idleMs / 1000)} s` : ", no idle exit"}); loading lanes ${args.lanes} ...`);
+  armTimers();
+  try {
+    router = await LayaRouter.create({ lanes: args.lanes.split(","), log: (m) => log(`  ${m}`) });
+    PRESETS = await loadPresets();
+    await router.warmup({ state: PRESETS[DEFAULT_PRESET].state("Please turn off the lights in the living room now"), sizes: [3, 5] });
+    status = "ready";
+    touch();
+    log(`ready in ${((Date.now() - started) / 1000).toFixed(1)} s; lanes: ${[...router.lanes.keys()].join(", ")}; presets: ${Object.keys(PRESETS).join(", ")} (${PRESETS_DIR})`);
+  } catch (e) {
+    status = "failed";
+    loadError = String(e?.message ?? e).split("\n")[0];
+    log(`load failed: ${e?.stack ?? e}`);
+    setTimeout(() => shutdown("load failed", 4), 1500); // leave /health readable for a moment
+  }
+});
 
 // ---- browser page --------------------------------------------------------------------------------------------
 const PAGE = `<!doctype html>
@@ -203,6 +342,7 @@ async function init() {
   for (const l of h.lanes) { const o = document.createElement('option'); o.value = l; o.textContent = l; $('lane').append(o); }
   $('preset').onchange = () => { $('desc').textContent = presets[$('preset').value].description; };
   $('preset').onchange();
+  if (h.status !== 'ready') { $('status').textContent = 'model ' + h.status + ' ...'; setTimeout(init, 1000); }
 }
 const pct = (p) => Math.round(p * 100) + '%';
 const bar = (p) => '<span class="bar" style="width:' + Math.round(p * 120) + 'px"></span>';

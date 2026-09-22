@@ -47,10 +47,10 @@ export function formatAnswers(answers, questions, { color = true } = {}) {
 }
 
 /** Header line: state summary + routing. */
-export function formatHeader(stateText, result, { color = true } = {}) {
+export function formatHeader(stateText, result, { color = true, via = "" } = {}) {
   const paint = (fn, s) => (color ? fn(s) : s);
   const r = result.routing;
-  const where = r ? `${r.lane} ${r.ms.toFixed(0)} ms` : "";
+  const where = r ? `${r.lane} ${r.ms.toFixed(0)} ms${r.queueMs > 5 ? ` (+${r.queueMs.toFixed(0)} queued)` : ""}${via ? ` via ${via}` : ""}` : "";
   const shown = stateText.length > 90 ? `${stateText.slice(0, 87)}...` : stateText;
   return `${paint(c.bold, JSON.stringify(shown))}  ${paint(c.dim, `${where}  ${result.usage.input_tokens} tokens${r?.explored ? "  (exploration)" : ""}`)}`;
 }

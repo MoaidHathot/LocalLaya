@@ -205,7 +205,7 @@ export class LayaRouter {
       const p0 = performance.now();
       await laya.systemOne({ probe: "ok" }, { q: { type: "noul", instructions: "Is this a probe?" } });
       const probeMs = performance.now() - p0;
-      this.lanes.set(lane, { lane, laya, model: new LatencyModel(lane), healthy: true, failures: 0, quarantinedUntil: 0, calls: 0, loadMs: performance.now() - t0, probeMs, shippedTemps: { ...laya.config.temperature_by_options }, queue: Promise.resolve() });
+      this.lanes.set(lane, { lane, laya, model: new LatencyModel(lane), healthy: true, failures: 0, quarantinedUntil: 0, calls: 0, pending: 0, loadMs: performance.now() - t0, probeMs, shippedTemps: { ...laya.config.temperature_by_options }, queue: Promise.resolve() });
       this.log(`lane ${lane}: ready (load ${((performance.now() - t0) / 1000).toFixed(1)} s, probe ${probeMs.toFixed(0)} ms)`);
     } catch (e) {
       this.log(`lane ${lane}: unavailable - ${String(e?.message ?? e).split("\n")[0].slice(0, 140)}`);
@@ -226,6 +226,8 @@ export class LayaRouter {
   }
 
   _startSampling(hasGpu) {
+    this._hasGpu = hasGpu;
+    this.sampling = true;
     const meter = createCpuLoadMeter();
     meter.tick();
     const cpuTimer = setInterval(() => {
@@ -251,6 +253,19 @@ export class LayaRouter {
     }
   }
 
+  /** Stop the background CPU / nvidia-smi sampling (e.g. while a sidecar is parked idle). Idempotent. */
+  pauseSampling() {
+    for (const t of this._timers) clearInterval(t);
+    this._timers = [];
+    this.sampling = false;
+  }
+
+  /** Restart sampling after pauseSampling(). Idempotent; no-op when sampling was disabled at creation. */
+  resumeSampling() {
+    if (this.sampling || !this.opts.sampleLoad) return;
+    this._startSampling(!!this._hasGpu);
+  }
+
   /** Contention multiplier for a lane's predicted latency. */
   _inflation(lane) {
     if (isGpuLane(lane)) return 1 / Math.max(0.2, 1 - this.load.gpuOthersUtil);
@@ -265,7 +280,8 @@ export class LayaRouter {
     for (const L of this.lanes.values()) {
       if (!L.healthy && now < L.quarantinedUntil) continue;
       const p = L.model.predict(n, state, work);
-      out.push({ lane: L.lane, rawMs: p.ms, predictedMs: p.ms * this._inflation(L.lane), source: p.source, share: L.model.share, state: isGpuLane(L.lane) ? state : "any" });
+      // calls already queued on this lane run first: a caller would wait for them (per-lane serialisation)
+      out.push({ lane: L.lane, rawMs: p.ms, predictedMs: p.ms * this._inflation(L.lane) * (1 + L.pending), pending: L.pending, source: p.source, share: L.model.share, state: isGpuLane(L.lane) ? state : "any" });
     }
     return out;
   }
@@ -295,25 +311,37 @@ export class LayaRouter {
       const choice = chooseLane(candidates, { policy: o.policy ?? this.opts.policy, deadlineMs: o.deadlineMs, explore: o.lane ? 0 : this.opts.explore });
       const L = this.lanes.get(choice.lane);
       const gpu = isGpuLane(choice.lane);
-      const stateAtStart = gpu ? thermalState(performance.now() - this.lastGpuWorkEnd) : "any";
       const t0 = performance.now();
+      let stateAtStart = gpu ? thermalState(t0 - this.lastGpuWorkEnd) : "any";
+      let tStart = t0;
+      L.pending++;
       try {
-        if (gpu) this.gpuBusy++;
         // One call at a time per lane: the session serialises the work anyway (measured: no throughput gain
         // from concurrency) and it lets us switch the per-call temperatures without racing another call.
+        // Timing and the GPU thermal state are taken when the call actually starts, not when it was queued.
         const result = await (L.queue = L.queue.catch(() => {}).then(() => {
+          tStart = performance.now();
+          if (gpu) {
+            stateAtStart = thermalState(tStart - this.lastGpuWorkEnd);
+            this.gpuBusy++;
+          }
           const temps = L.laya.config.temperature_by_options;
           for (const k of Object.keys(temps)) delete temps[k];
           Object.assign(temps, L.shippedTemps, o.calibration?.temperature_by_options ?? {});
-          return L.laya.systemOne(state, questions);
+          return L.laya.systemOne(state, questions).finally(() => {
+            if (gpu) {
+              this.gpuBusy--;
+              this.lastGpuWorkEnd = performance.now();
+            }
+          });
         }));
-        const ms = performance.now() - t0;
-        if (gpu) this.lastGpuWorkEnd = performance.now();
+        const ms = performance.now() - tStart;
+        const queueMs = tStart - t0;
         L.model.observe(n, stateAtStart, ms, work);
         L.calls++;
         L.healthy = true;
         L.failures = 0;
-        const routing = { lane: choice.lane, ms, n, work, gpuState: stateAtStart, predictedMs: choice.predictedMs, reason: choice.reason, explored: !!choice.explored, alternatives: candidates.filter((c) => c.lane !== choice.lane).map((c) => ({ lane: c.lane, predictedMs: c.predictedMs })), load: { cpuOthers: this.load.cpuOthers, gpuOthersUtil: this.load.gpuOthersUtil } };
+        const routing = { lane: choice.lane, ms, queueMs, n, work, gpuState: stateAtStart, predictedMs: choice.predictedMs, pendingAtChoice: choice.pending ?? 0, reason: choice.reason, explored: !!choice.explored, alternatives: candidates.filter((c) => c.lane !== choice.lane).map((c) => ({ lane: c.lane, predictedMs: c.predictedMs })), load: { cpuOthers: this.load.cpuOthers, gpuOthersUtil: this.load.gpuOthersUtil } };
         this.history.push(routing);
         if (this.history.length > 1000) this.history.shift();
         if (gpu && this.opts.gpuKeepAliveMs > 0) this._scheduleKeepAlive();
@@ -325,7 +353,7 @@ export class LayaRouter {
         tried.push(choice.lane);
         this.log(`lane ${choice.lane} failed (${String(e?.message ?? e).split("\n")[0].slice(0, 120)}); quarantined 60 s, retrying on another lane`);
       } finally {
-        if (gpu) this.gpuBusy--;
+        L.pending--;
       }
     }
     throw new Error(`all lanes failed for this call (tried ${tried.join(", ")})`);
@@ -383,12 +411,12 @@ export class LayaRouter {
 
   stats() {
     const lanes = {};
-    for (const L of this.lanes.values()) lanes[L.lane] = { healthy: L.healthy, calls: L.calls, failures: L.failures, loadMs: L.loadMs, share: L.model.share, ema: L.model.ema };
-    return { lanes, load: this.load, keepAliveCalls: this.keepAliveCalls ?? 0, gpuState: thermalState(performance.now() - this.lastGpuWorkEnd) };
+    for (const L of this.lanes.values()) lanes[L.lane] = { healthy: L.healthy, calls: L.calls, pending: L.pending, failures: L.failures, loadMs: L.loadMs, share: L.model.share, ema: L.model.ema };
+    return { lanes, load: this.load, sampling: !!this.sampling, keepAliveCalls: this.keepAliveCalls ?? 0, gpuState: thermalState(performance.now() - this.lastGpuWorkEnd) };
   }
 
   async close() {
-    for (const t of this._timers) clearInterval(t);
+    this.pauseSampling();
     if (this._keepAliveTimer) clearTimeout(this._keepAliveTimer);
     this._keepAliveUntil = 0;
     await Promise.all([...this.lanes.values()].map((L) => L.laya.close().catch(() => {})));

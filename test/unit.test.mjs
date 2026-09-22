@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chooseLane, LatencyModel, nBucket, thermalState, DEFAULT_PRIORS, estimateWork } from "../src/ep-router.mjs";
+import { chooseLane, LatencyModel, LayaRouter, nBucket, thermalState, DEFAULT_PRIORS, estimateWork } from "../src/ep-router.mjs";
+import { parseDuration, SidecarError } from "../src/sidecar-client.mjs";
 import { bucketKey, fitTemperature, metrics, optionCount, optionLabels, softmax } from "../src/calibration.mjs";
 import { presetFromJson, presetToJson, PRESETS } from "../data/presets.mjs";
 
@@ -127,4 +128,43 @@ test("presets: JSON form <-> preset object", () => {
   const back = presetFromJson(json);
   assert.deepEqual(back.state("t"), { message: "t", product: "MyApp" });
   assert.deepEqual(back.questions, PRESETS.triage.questions);
+});
+test("parseDuration", () => {
+  assert.equal(parseDuration("0"), 0);
+  assert.equal(parseDuration("30s"), 30_000);
+  assert.equal(parseDuration("5m"), 300_000);
+  assert.equal(parseDuration("1.5h"), 5_400_000);
+  assert.equal(parseDuration("250ms"), 250);
+  assert.equal(parseDuration("300"), 300_000); // bare number = seconds
+  assert.equal(parseDuration(1234), 1234);
+  assert.throws(() => parseDuration("soon"), (e) => e instanceof SidecarError && e.code === "BAD_DURATION");
+  assert.throws(() => parseDuration(""), SidecarError);
+});
+
+test("router predictions account for calls already queued on a lane", () => {
+  // a router with two fake lanes and no model loaded
+  const r = Object.create(LayaRouter.prototype);
+  r.lanes = new Map();
+  r.load = { cpuOthers: 0, gpuOthersUtil: 0 };
+  r.lastGpuWorkEnd = performance.now(); // GPU hot
+  const mk = (lane, pending) => ({ lane, model: new LatencyModel(lane), healthy: true, quarantinedUntil: 0, pending });
+  r.lanes.set("webgpu", mk("webgpu", 0));
+  r.lanes.set("cpu", mk("cpu", 0));
+  const idle = Object.fromEntries(r.predictions(3).map((p) => [p.lane, p.predictedMs]));
+  assert.ok(idle.webgpu < idle.cpu, "idle: GPU is the faster lane");
+  // three callers queued on the GPU lane -> its prediction is 4x (4 x 55 = 220 ms), still below one CPU call (260)
+  r.lanes.get("webgpu").pending = 3;
+  let busy = r.predictions(3);
+  const g = busy.find((p) => p.lane === "webgpu");
+  assert.ok(Math.abs(g.predictedMs - idle.webgpu * 4) < 1e-9);
+  assert.equal(g.pending, 3);
+  assert.equal(chooseLane(busy, { explore: 0 }).lane, "webgpu", "spilling to CPU is not worth it yet");
+  // five queued (6 x 55 = 330 ms) -> the idle CPU lane wins the next call
+  r.lanes.get("webgpu").pending = 5;
+  busy = r.predictions(3);
+  assert.equal(chooseLane(busy, { explore: 0 }).lane, "cpu");
+  // contention inflation still applies on top
+  r.load.cpuOthers = 0.5;
+  const c = r.predictions(3).find((p) => p.lane === "cpu");
+  assert.ok(Math.abs(c.predictedMs - idle.cpu * 2) < 1e-9);
 });
