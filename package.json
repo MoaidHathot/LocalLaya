@@ -1,0 +1,32 @@
+{
+  "name": "laya-poc",
+  "version": "0.4.0",
+  "private": true,
+  "description": "PoC, benchmarks, calibration tooling and execution-provider router for Laya (ONNX port, @receptron/laya) on Windows",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "ask": "node ask.mjs",
+    "ask:sidecar": "node ask.mjs --sidecar",
+    "sidecar:start": "node ask.mjs --start",
+    "sidecar:status": "node ask.mjs --status",
+    "sidecar:stop": "node ask.mjs --stop",
+    "serve": "node serve.mjs",
+    "poc": "node poc.mjs",
+    "poc:webgpu": "node poc.mjs --ep webgpu --fp16 --calibration calibration/smart-home-v3.json",
+    "router": "node router-demo.mjs --lanes webgpu:fp16,cpu:8 --calibration calibration/smart-home-v3.json",
+    "verify-model": "node verify-model.mjs",
+    "bench": "node bench.mjs",
+    "bench:all": "node bench-all.mjs",
+    "calibrate": "node calibrate.mjs --ep webgpu --variant v3",
+    "fp16:convert": ".venv/Scripts/python.exe tools/convert_fp16.py models/receptron--laya-onnx/68f27dfe5a27a54fb2b1fefc432f43f972e90868 models/laya-onnx-fp16",
+    "fp16:check": "node experiments/fp16-fidelity.mjs --ep webgpu",
+    "test": "node --test test/unit.test.mjs",
+    "test:sidecar": "node --test --test-concurrency=1 test/sidecar.test.mjs"
+  },
+  "dependencies": {
+    "@receptron/laya": "file:vendor/receptron-laya-0.1.2.tgz"
+  }
+}

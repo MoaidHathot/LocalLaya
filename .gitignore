@@ -427,3 +427,18 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+## ---------------------------------------------------------------------------
+## LocalLaya (Laya on Windows via ONNX Runtime) - project-specific entries
+## ---------------------------------------------------------------------------
+# model bundles (1.7 GB fp32 pinned download + 0.85 GB fp16 conversion) - re-created by the first run
+models/
+# benchmark / test outputs: keep the human-readable summaries, ignore the raw JSON
+results/*
+!results/*-summary.md
+# python toolchain for tools/convert_fp16.py (uv venv + cache)
+.venv/
+.uv-cache/
+__pycache__/
+# sidecar logs
+.laya/

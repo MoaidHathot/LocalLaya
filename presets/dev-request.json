@@ -1,0 +1,45 @@
+{
+  "description": "Developer-assistant request triage: what the user wants done, which language/format, how big the job is. (v2: has_input and needs_tool removed - measured at chance level (55%); has_input is a regex job, needs_tool follows from task.)",
+  "state": {
+    "request": "$TEXT"
+  },
+  "questions": {
+    "task": {
+      "type": "choice",
+      "instructions": "What is the user asking the assistant to do?",
+      "criteria": {
+        "validate": "check whether a given input (JSON, YAML, code, config, regex, SQL) is valid or correct",
+        "write_code": "write, generate or implement new code, a script, a query or a schema",
+        "fix_bug": "find or fix an error, exception, crash or wrong behaviour in existing code",
+        "explain": "explain a concept, API, error message or piece of code",
+        "convert": "convert or transform data or code from one format, syntax or language to another",
+        "run_command": "run a command, tool, test or script, or operate on files, packages or processes",
+        "chat": "small talk, thanks, or anything that is not a development task"
+      }
+    },
+    "language": {
+      "type": "choice",
+      "instructions": "Which programming language or data format does the request concern?",
+      "criteria": {
+        "json": "JSON data or JSON schema",
+        "javascript": "JavaScript, TypeScript or Node.js",
+        "python": "Python",
+        "csharp": "C# or .NET",
+        "powershell": "PowerShell, bash or shell commands",
+        "sql": "SQL or databases",
+        "other": "another language or format (YAML, XML, regex, CSV, ...)",
+        "none": "no specific language or format"
+      }
+    },
+    "effort": {
+      "type": "score",
+      "instructions": "How much work is this request?",
+      "criteria": [
+        "trivial: seconds",
+        "small: minutes",
+        "medium: about an hour",
+        "large: a day or more"
+      ]
+    }
+  }
+}
