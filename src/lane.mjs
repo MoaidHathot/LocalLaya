@@ -208,6 +208,8 @@ class WorkerLane {
 class RemoteSession {
   constructor(lane) {
     this.lane = lane; // the ProcessLane (child, pending map, death handling)
+    this.pendingExec = undefined; // per-call execution options for the next run() (set by ProcessLane.systemOne; calls are serialised)
+    this.lastExec = null; // { mode: "graph"|"dynamic", bucket: [n, L, K]|null, remoteMs } of the last run()
   }
   async run(feeds) {
     const wire = {};
@@ -215,7 +217,10 @@ class RemoteSession {
       const buf = t.data instanceof BigInt64Array ? Buffer.from(t.data.buffer, t.data.byteOffset, t.data.byteLength) : Buffer.from(t.data.buffer ?? t.data, t.data.byteOffset ?? 0, t.data.byteLength ?? t.data.length);
       wire[name] = { dtype: t.type, dims: t.dims, data: buf.toString("base64") };
     }
-    const res = await this.lane._request({ feeds: wire });
+    const exec = this.pendingExec;
+    this.pendingExec = undefined;
+    const res = await this.lane._request(exec ? { feeds: wire, exec } : { feeds: wire });
+    this.lastExec = { mode: res.mode ?? "dynamic", bucket: res.bucket ?? null, remoteMs: res.ms };
     const out = {};
     for (const [name, t] of Object.entries(res.outputs)) {
       const buf = Buffer.from(t.data, "base64");
@@ -266,7 +271,9 @@ class ProcessLane {
   }
 
   /**
-   * @param {object} loadOpts { ep: "cuda", modelDir, deviceId, threads, calibration, python }
+   * @param {object} loadOpts { ep: "cuda", modelDir, deviceId, threads, calibration, python,
+   *   cudaGraph (default true: CUDA Graph replay on static bucket graphs, see tools/cuda_lane.py),
+   *   graphBuckets ("1x96x8,3x96x8,..." built eagerly), graphMaxSessions, graphMaxVramMiB, graphMaxWork }
    */
   static async open(lane, loadOpts, { log = () => {} } = {}) {
     const L = new ProcessLane(lane);
@@ -274,7 +281,11 @@ class ProcessLane {
     const modelDir = resolveModelDir(loadOpts.modelDir);
     const argv = [path.join(PROJECT_ROOT, "tools", "cuda_lane.py"), "--model-dir", modelDir, "--device", String(loadOpts.deviceId ?? 0), "--threads", String(loadOpts.threads ?? 2)];
     if (process.platform === "win32" && PCORE_LOGICAL > 0) argv.push("--affinity", `0-${PCORE_LOGICAL - 1}`);
-    if (loadOpts.cudaGraph) argv.push("--cuda-graph");
+    if (loadOpts.cudaGraph === false) argv.push("--graph", "off");
+    if (loadOpts.graphBuckets !== undefined) argv.push("--graph-buckets", String(loadOpts.graphBuckets));
+    if (loadOpts.graphMaxSessions !== undefined) argv.push("--graph-max-sessions", String(loadOpts.graphMaxSessions));
+    if (loadOpts.graphMaxVramMiB !== undefined) argv.push("--graph-max-vram-mib", String(loadOpts.graphMaxVramMiB));
+    if (loadOpts.graphMaxWork !== undefined) argv.push("--graph-max-work", String(loadOpts.graphMaxWork));
     const t0 = performance.now();
     const child = spawn(python, argv, { cwd: PROJECT_ROOT, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8", PYTHONUNBUFFERED: "1" } });
     L.child = child;
@@ -313,7 +324,23 @@ class ProcessLane {
     L.loadMs = performance.now() - t0;
     L.providers = ready.providers;
     L.remoteLoadMs = ready.loadMs;
+    L.graph = ready.graph ?? { enabled: false };
+    L.remote = L.laya.session; // the RemoteSession (lastExec, pendingExec)
     return L;
+  }
+
+  /** Bucket / hit statistics from the process ({"op":"stats"}); null when the process is gone. */
+  async stats() {
+    if (this.dead || this.closed) return null;
+    const res = await this._request({ op: "stats" });
+    return res.stats ?? null;
+  }
+
+  /** The graph bucket [n, L, K] a call of `n` rows x `L` tokens x `K` options would use, or null (dynamic). */
+  async bucketFor(n, L, K) {
+    if (this.dead || this.closed) return null;
+    const res = await this._request({ op: "bucket", n, L, K });
+    return res.bucket ?? null;
   }
 
   _onLine(line) {
@@ -351,10 +378,16 @@ class ProcessLane {
     if (!this.closed) for (const cb of this._onDeath) cb(cause);
   }
 
-  async systemOne(state, questions, temps) {
+  /**
+   * @param {object} [exec] per-call execution options for the process: { graph: false } skips CUDA Graph replay
+   * The result carries `exec: { mode, bucket, remoteMs }` (what the process did); the router moves it into routing.exec.
+   */
+  async systemOne(state, questions, temps, exec) {
     if (this.dead || this.closed) throw new LaneDeadError(this.lane, this.closed ? "closed" : "process gone");
     applyTemps(this.laya, this.baseTemps, temps);
-    return this.laya.systemOne(state, questions);
+    this.remote.pendingExec = exec && Object.keys(exec).length ? exec : undefined;
+    const result = await this.laya.systemOne(state, questions);
+    return { ...result, exec: this.remote.lastExec };
   }
 
   /** Ask the process to release the session and exit; kill it after `timeoutMs`. Killing a separate process is safe. */

@@ -13,6 +13,8 @@
  *   node serve.mjs --cors                  # allow browser pages from other origins to call the API (off by default)
  *   node serve.mjs --gpu-keepalive 0       # no GPU keep-alive (default 30s: after each call a tiny GPU call every 500 ms keeps the
  *                                          # CUDA lane at ~50 ms instead of ~200 ms for the next sporadic call; costs 1-4 W meanwhile)
+ *   node serve.mjs --cuda-graph off        # cuda lane without CUDA Graph replay (default on: static bucket graphs captured on
+ *                                          # demand, ~4 ms less per call; LAYA_CUDA_GRAPH=off); per call: exec: { graph: false }
  *   node serve.mjs --in-process            # lanes in this thread instead of worker threads (blocks the server during inference)
  *
  * Lifecycle: the port is bound BEFORE the model loads, so the port doubles as the mutex between racing
@@ -65,6 +67,7 @@ const { values: args } = parseArgs({
     idle: { type: "string" },
     "max-age": { type: "string", default: process.env.LAYA_MAX_AGE ?? "0" },
     "gpu-keepalive": { type: "string", default: process.env.LAYA_GPU_KEEPALIVE ?? "30s" },
+    "cuda-graph": { type: "string", default: process.env.LAYA_CUDA_GRAPH ?? "on" },
     sidecar: { type: "boolean", default: false },
     "in-process": { type: "boolean", default: false },
   },
@@ -72,6 +75,7 @@ const { values: args } = parseArgs({
 const idleMs = parseDuration(args.idle ?? (args.sidecar ? process.env.LAYA_IDLE ?? "5m" : "0"));
 const maxAgeMs = parseDuration(args["max-age"]);
 const gpuKeepAliveMs = parseDuration(args["gpu-keepalive"]);
+const cudaGraph = !/^(off|0|false|no)$/i.test(args["cuda-graph"]);
 const SAMPLING_PAUSE_MS = 10_000;
 const log = (m) => console.log(`[serve${args.sidecar ? ":sidecar" : ""} ${process.pid}] ${new Date().toISOString().slice(11, 19)} ${m}`);
 process.title = args.sidecar ? "laya-sidecar" : "laya-serve";
@@ -209,6 +213,7 @@ const health = () => ({
   idleRemainingS: idleRemainingS(),
   maxAgeS: maxAgeMs ? Math.round(maxAgeMs / 1000) : 0,
   gpuKeepAliveS: gpuKeepAliveMs ? Math.round(gpuKeepAliveMs / 1000) : 0,
+  cudaGraph,
   inFlight,
   sampling: !!router?.sampling,
 });
@@ -237,7 +242,7 @@ const server = createServer(async (req, res) => {
       touch();
       return json(res, 200, { ok: true, idleRemainingS: idleRemainingS() });
     }
-    if (req.method === "GET" && url.pathname === "/stats") return json(res, 200, router.stats());
+    if (req.method === "GET" && url.pathname === "/stats") return json(res, 200, await router.detailedStats());
     if (req.method === "POST" && url.pathname === "/decide") {
       const raw = await readBody(req);
       let body;
@@ -251,7 +256,7 @@ const server = createServer(async (req, res) => {
       const t0 = performance.now();
       try {
         const out = await decide(body);
-        log(`decide ${out.preset ?? "custom"} ${Object.keys(out.questions).length} q -> ${out.routing.lane} ${out.routing.ms.toFixed(0)} ms${out.routing.queueMs > 5 ? ` (+${out.routing.queueMs.toFixed(0)} queued)` : ""} (total ${(performance.now() - t0).toFixed(0)} ms)`);
+        log(`decide ${out.preset ?? "custom"} ${Object.keys(out.questions).length} q -> ${out.routing.lane} ${out.routing.ms.toFixed(0)} ms${out.routing.exec ? ` [${out.routing.exec.mode}${out.routing.exec.bucket ? ` ${out.routing.exec.bucket.join("x")}` : ""}]` : ""}${out.routing.queueMs > 5 ? ` (+${out.routing.queueMs.toFixed(0)} queued)` : ""} (total ${(performance.now() - t0).toFixed(0)} ms)`);
         return json(res, 200, out);
       } finally {
         inFlight--;
@@ -287,6 +292,7 @@ server.listen(Number(args.port), args.host, async () => {
       lanes: CONFIGURED_LANES,
       workers: !args["in-process"],
       gpuKeepAliveMs,
+      cudaGraph,
       warmup: { state: warmupState, sizes: [3, 5] },
       waitFor: "first",
       onLaneReady: (lane, info) => {

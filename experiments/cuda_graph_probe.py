@@ -14,9 +14,10 @@ Result 2026-09-23 (onnxruntime-gpu 1.30.0, RTX 4070, results/cuda-lane-2026-09-2
      -> the floor is paid on every call and is ~80 % of a 1-question call
   2. ~1550 kernel entries per run (1391 CUDA, 163 CPU shape plumbing / memcpy) -> ~4 us per launch = the floor
   3. capture FAILS on this graph: "CUDA failure 700: an illegal memory access" in cuda_graph.cc during the capture
-     run, and the CUDA context is dead afterwards (this part therefore runs last). Likely cause: the dynamic-shape
-     plumbing (Shape -> Slice -> Concat on the CPU, host<->device copies) inside the captured stream. Capture
-     needs a graph with static shapes per bucket first (see docs/STATUS.md, CUDA lane next steps).
+     run, and the CUDA context is dead afterwards (this part therefore runs last). The cause turned out to be one
+     kernel, not the shape plumbing: ORT 1.30's CUDA GatherND copies a host vector during Compute
+     (experiments/cuda_capture_bisect.py). Static bucket graphs with that node rewritten capture fine and are what
+     tools/cuda_lane.py replays now (tools/static_graph.py, results/cuda-graph-2026-09-23-summary.md).
 """
 import argparse
 import collections

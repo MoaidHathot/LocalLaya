@@ -80,8 +80,20 @@ const gpuLanes = loaded.filter(isGpuLane);
 const cpuLanes = loaded.filter((l) => !isGpuLane(l));
 const call = (i, o) => router.decide(stateFor(i), questions, o);
 
+// the cuda lane builds a CUDA-graph bucket for a shape it has seen twice, in idle gaps (tools/cuda_lane.py): a
+// throughput cell measures the steady state, so wait until nothing is being prepared or captured
+const settle = async (timeoutMs = 30_000) => {
+  const t0 = performance.now();
+  for (;;) {
+    const st = await router.detailedStats();
+    const pending = Object.values(st.lanes).some((l) => l.process && (Object.values(l.process.buckets).some((b) => b.state === "building" || b.state === "prepared") || l.process.queued.length));
+    if (!pending || performance.now() - t0 > timeoutMs) return;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+};
 const warm = async (o, n = 3) => {
   for (let i = 0; i < n; i++) await call(1000 + i, o);
+  await settle();
 };
 
 // ---- measurement helpers -----------------------------------------------------------------------------

@@ -43,6 +43,8 @@ node ask.mjs [flags]                      interactive REPL (/help)
 | `--port <n>` | sidecar port (default `LAYA_PORT` or 8787) |
 | `--lanes a,b` | lanes to load: `cuda:fp16` (Python process, `npm run cuda:setup`), `webgpu:fp16`, `webgpu`, `cpu` (16 threads pinned), `cpu:8`, `cpu:auto`, `dml`; default `cuda:fp16,webgpu:fp16,cpu:8`, a lane that cannot load is dropped |
 | `--lane <lane>` | force a lane for this call |
+| `--policy <p>` | `auto` (default) / `prefer-gpu` / `prefer-cpu` / `min-cpu` for this call |
+| `--no-graph` | CUDA lane: run this call on the dynamic graph instead of a CUDA Graph replay (`exec: { graph: false }`) |
 | `--calibration <file>` | temperature table; default `calibration/<preset>.json` if present |
 | `--start` | ensure the sidecar is running; prints `{ url, pid, lanes, idleS, spawned }` |
 | `--status` / `--stop` | show / stop the sidecar |
@@ -59,7 +61,7 @@ Base URL `http://127.0.0.1:8787` (or `--port` / `LAYA_PORT`). JSON everywhere.
 |---|---|
 | `GET /health` | `{ service: "laya", version, status: loading\|ready\|failed\|stopping, pid, port, sidecar, lanes, lanesLoading, workers, uptimeS, idleS, idleRemainingS, maxAgeS, gpuKeepAliveS, inFlight, sampling }` |
 | `GET /presets` | `{ <name>: { description, source: built-in\|file, state (template with "$TEXT"), questions } }` |
-| `GET /stats` | router statistics: per-lane calls / pending / EMA latencies, queue depth + predicted wait, external CPU/GPU load, GPU state |
+| `GET /stats` | router statistics: per-lane calls / pending / EMA latencies, queue depth + predicted wait, external CPU/GPU load, GPU state; `lanes["cuda:fp16"].process` = the CUDA process's graph buckets (state, hits, VRAM), `graph_calls` / `dynamic_calls` |
 | `POST /decide` | body below -> `{ answers, usage, routing, state, questions, preset, calibration }`; 503 `{ error: "loading" }` while the model loads (retry after `retryAfterMs`) |
 | `POST /touch` | reset the idle timer -> `{ ok, idleRemainingS }` |
 | `POST /shutdown` | graceful exit -> `{ ok, pid }` |
@@ -73,7 +75,9 @@ Base URL `http://127.0.0.1:8787` (or `--port` / `LAYA_PORT`). JSON everywhere.
   "preset": "triage",                              // default smart-home; also selects calibration/<preset>.json
   "questions": { "...": {} },                      // optional: replaces the preset's questions
   "lane": "cpu:8",                                 // optional: force a lane
+  "policy": "prefer-gpu",                          // optional: auto | prefer-gpu | prefer-cpu | min-cpu for this call
   "deadlineMs": 150,                               // optional: meet the deadline with the least CPU share
+  "exec": { "graph": false },                      // optional: cuda lane on its dynamic graph, no CUDA Graph replay
   "calibration": { "temperature_by_options": { "noul:2": 1.9 } }   // optional: override the table for this call
 }
 ```
@@ -94,8 +98,9 @@ Errors: 400 with `{ error }` for bad input (unknown preset, invalid questions, m
                     "probabilities": { "0": 0.02, "1": 0.14, "2": 0.80, "3": 0.04 }, "confidence": 0.6, "rl_agent": { "act_probability": 1 } }
   },
   "usage": { "input_tokens": 330, "output_tokens": 0 },
-  "routing": { "lane": "webgpu:fp16", "ms": 154, "queueMs": 0, "n": 5, "gpuState": "hot", "predictedMs": 160,
-               "ownMs": 160, "waitMs": 0, "reason": "fastest predicted (...)", "alternatives": [ { "lane": "cpu:8", "predictedMs": 330 } ] }
+  "routing": { "lane": "cuda:fp16", "ms": 9, "queueMs": 0, "n": 5, "gpuState": "hot", "predictedMs": 12,
+               "ownMs": 12, "waitMs": 0, "reason": "fastest predicted (...)", "alternatives": [ { "lane": "webgpu:fp16", "predictedMs": 40 } ],
+               "exec": { "mode": "graph", "bucket": [5, 128, 8], "remoteMs": 7.9 } }
 }
 ```
 
@@ -103,11 +108,17 @@ Errors: 400 with `{ error }` for bad input (unknown preset, invalid questions, m
 - `noul` is P(true). `score` is the expectation over levels (0-based); `legend` maps index -> level text.
 - `confidence` = 1 - normalised entropy of the distribution (0 = uniform, 1 = certain). Not P(correct).
 - `routing.ms` is inference time on the chosen lane; `queueMs` time spent waiting behind other callers. Calls
-  are served one at a time (one queue for all lanes): ~66 calls/s for 3 questions on the CUDA lane (83-86 with
-  a queue), ~30 on WebGPU, ~3.5 on the CPU; parallel callers only wait longer. Batch questions into one call
-  rather than calling in parallel. The lane is chosen when the call reaches the front of the queue;
-  `routing.provisionalLane` appears when that differed from the lane expected at enqueue time (e.g. a faster
-  lane joined during start-up). `routing.gpuState` (`hot` / `warm` / `cold`) explains slower sporadic calls.
+  are served one at a time (one queue for all lanes): ~115 calls/s for 3 questions on the CUDA lane (~195 for
+  1 question, ~45 for 10), ~30 on WebGPU, ~3.5 on the CPU; parallel callers only wait longer. Batch questions
+  into one call rather than calling in parallel. The lane is chosen when the call reaches the front of the
+  queue; `routing.provisionalLane` appears when that differed from the lane expected at enqueue time (e.g. a
+  faster lane joined during start-up). `routing.gpuState` (`hot` / `warm` / `cold`) explains slower sporadic calls.
+- `routing.exec` (CUDA lane only): `mode: "graph"` = the call replayed a captured CUDA Graph for its shape
+  bucket `[rows, tokens, options]` (1 question ~5 ms, 3 ~9, 10 ~23); `mode: "dynamic"` = the generic graph
+  (~10 / 12 / 25 ms) - the first two calls of a never-seen shape, calls above 16 rows / 512 tokens / 32 options
+  / rows x tokens > 1536, or `exec: { graph: false }`. Buckets are built from the traffic (a shape seen twice
+  gets one within ~0.5 s in sporadic traffic, ~1.5 s under continuous load); answers agree with the dynamic
+  graph to |dp| < 0.01.
 
 ## Lifecycle of the sidecar
 
@@ -138,6 +149,7 @@ Errors: 400 with `{ error }` for bad input (unknown preset, invalid questions, m
 | `LAYA_IDLE` | default idle exit (default `5m`) |
 | `LAYA_MAX_AGE` | default max age before the sidecar recycles itself (default never) |
 | `LAYA_GPU_KEEPALIVE` | default GPU keep-alive window of `serve.mjs` (default `30s`; `0` = off) |
+| `LAYA_CUDA_GRAPH` | `off` disables CUDA Graph replay in the CUDA lane of `serve.mjs` (`--cuda-graph off`); default on |
 | `LAYA_LANES` | default lanes for `serve.mjs` (default `cuda:fp16,webgpu:fp16,cpu:8`; `cuda:fp16` needs the Python venv from `npm run cuda:setup` and is dropped otherwise) |
 | `LAYA_PYTHON` | Python with onnxruntime-gpu for the CUDA lane (default `<project>/.venv/Scripts/python.exe`) |
 | `LAYA_CACHE` | model cache directory (default `<project>/models`) |

@@ -5,7 +5,12 @@
  *   node experiments/ab.mjs --variant fp16=webgpu:fp16 --variant fused=webgpu@models/laya-onnx-fp16-fused --preset dev-request
  *   node experiments/ab.mjs --variant gpu=webgpu:fp16 --variant cpu=cpu:8 --workload preset --preset triage --inputs my-texts.json
  *
- * Variant spec:  label=lane[@modelDir][?webgpuOpt=v&webgpuOpt=v]
+ * Variant spec:  label=lane[@modelDir][?opt=v&opt=v]
+ *   For webgpu lanes the options are WebGPU session options (validationMode=disabled, ...). For the cuda process lane
+ *   `graph=false` is the per-call exec override (dynamic graph instead of CUDA Graph replay) and the other keys are
+ *   lane load options: cudaGraph=false, graphBuckets=1x96x8,3x96x8 (use a second `?` clause or `;` to keep the
+ *   commas), graphMaxWork=0, graphMaxSessions=4.
+ *   node experiments/ab.mjs --variant cuda=cuda:fp16 --variant cudadyn="cuda:fp16?graph=false"
  *   lane as in the router (webgpu, webgpu:fp16, cpu, cpu:8, cpu:auto, dml, cuda, cuda:fp16 ...); @dir overrides the bundle
  *   directory; ?k=v are WebGPU EP provider options (see WEBGPU_OPTION_KEYS in src/laya-client.mjs).
  *   The first variant is the baseline every other one is compared against.
@@ -28,7 +33,7 @@ import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parseArgs } from "node:util";
 import { parseWebgpuOptions, pinProcessToPCores, resolveModelDir } from "../src/laya-client.mjs";
-import { openLane } from "../src/lane.mjs";
+import { openLane, PROCESS_EPS } from "../src/lane.mjs";
 import { parseLane } from "../src/ep-router.mjs";
 import { optionLabels } from "../src/calibration.mjs";
 import { cpuInfo, latencyStats, queryGpu } from "../src/metrics.mjs";
@@ -69,10 +74,20 @@ export function parseVariant(spec) {
   const label = spec.slice(0, eq).trim();
   let rest = spec.slice(eq + 1).trim();
   let webgpuOptions;
+  let exec;
+  const laneOpts = {};
   const q = rest.indexOf("?");
   if (q >= 0) {
-    webgpuOptions = parseWebgpuOptions(rest.slice(q + 1).replace(/&/g, ","));
+    const query = rest.slice(q + 1);
     rest = rest.slice(0, q);
+    if (PROCESS_EPS.includes(parseLane(rest.split("@")[0]).ep)) {
+      for (const kv of query.split(/[&?]/)) {
+        const [k, v = "true"] = kv.split("=");
+        const val = /^(true|false)$/i.test(v) ? v.toLowerCase() === "true" : /^\d+$/.test(v) ? Number(v) : v.replace(/;/g, ",");
+        if (k === "graph") exec = { ...exec, graph: val };
+        else laneOpts[k] = val;
+      }
+    } else webgpuOptions = parseWebgpuOptions(query.replace(/&/g, ","));
   }
   let modelDir;
   const at = rest.indexOf("@");
@@ -82,7 +97,7 @@ export function parseVariant(spec) {
   }
   const lane = rest;
   const { ep, threads, pin, modelDir: laneDir } = parseLane(lane);
-  return { label, lane, loadOpts: { ep, threads, pinToPCores: pin, modelDir: modelDir ?? laneDir, webgpuOptions } };
+  return { label, lane, exec, laneOpts, loadOpts: { ep, threads, pinToPCores: pin, modelDir: modelDir ?? laneDir, webgpuOptions, ...laneOpts } };
 }
 
 // ---- workload ---------------------------------------------------------------------------------------------------
@@ -179,15 +194,29 @@ for (const v of variants) {
   // in-thread sessions for the node EPs (this script measures the EP, not the worker hop); CUDA = the Python process lane
   const handle = await openLane(v.lane, v.loadOpts, { worker: false, log: () => {} });
   sessions.push({ ...v, laya: handle, loadMs: handle.loadMs, modelDir: resolveModelDir(v.loadOpts.modelDir), mode: handle.mode });
-  log(`  ${v.label.padEnd(12)} ${v.lane}${v.loadOpts.modelDir ? ` @ ${v.loadOpts.modelDir}` : ""}${v.loadOpts.webgpuOptions ? ` ${JSON.stringify(v.loadOpts.webgpuOptions)}` : ""}: loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s (${handle.mode})`);
+  log(`  ${v.label.padEnd(12)} ${v.lane}${v.loadOpts.modelDir ? ` @ ${v.loadOpts.modelDir}` : ""}${v.loadOpts.webgpuOptions ? ` ${JSON.stringify(v.loadOpts.webgpuOptions)}` : ""}${Object.keys(v.laneOpts).length ? ` ${JSON.stringify(v.laneOpts)}` : ""}${v.exec ? ` exec ${JSON.stringify(v.exec)}` : ""}: loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s (${handle.mode}${handle.graph ? `, cuda graphs ${handle.graph.enabled ? "on" : "off"}` : ""})`);
 }
 const gpu1 = await queryGpu();
 
 // warm-up: every variant sees every item (shader compilation per shape is not what we measure)
-for (let w = 0; w < WARMUP; w++) for (const it of workload) for (const s of sessions) await s.laya.systemOne(it.state, it.questions);
+for (let w = 0; w < WARMUP; w++) for (const it of workload) for (const s of sessions) await s.laya.systemOne(it.state, it.questions, undefined, s.exec);
+// process lanes build CUDA-graph buckets for the shapes the warm-up showed them, in idle gaps: wait for steady state
+for (const s of sessions) {
+  if (typeof s.laya.stats !== "function" || !s.laya.graph?.enabled) continue;
+  const t0 = performance.now();
+  let st = await s.laya.stats();
+  while (Object.values(st.buckets).some((b) => b.state === "building" || b.state === "prepared") || st.queued.length) {
+    if (performance.now() - t0 > 30_000) throw new Error(`${s.label}: buckets still building after 30 s: ${JSON.stringify(st.buckets)}`);
+    await new Promise((r) => setTimeout(r, 200));
+    st = await s.laya.stats();
+  }
+  const ready = Object.entries(st.buckets).filter(([, b]) => b.state === "ready");
+  log(`  ${s.label.padEnd(12)} ${ready.length} graph buckets ready (${ready.map(([k]) => k).join(" ")}), ${st.bucketVramMiB} MiB; ${st.build_failures} build failures`);
+}
 
 // measurement: rounds x items x variants (rotating order)
 const times = new Map(); // `${label}|${item}` -> ms[]
+const execModes = new Map(); // label -> { graph: n, dynamic: n } (process lanes report what they did)
 const answers = new Map(); // `${label}|${item}` -> answers of the last round
 const push = (k, v) => (times.get(k) ?? times.set(k, []).get(k)).push(v);
 const tRun = performance.now();
@@ -196,9 +225,13 @@ for (let r = 0; r < ROUNDS; r++) {
     for (let k = 0; k < sessions.length; k++) {
       const s = sessions[(k + r) % sessions.length];
       const t0 = performance.now();
-      const out = await s.laya.systemOne(it.state, it.questions);
+      const out = await s.laya.systemOne(it.state, it.questions, undefined, s.exec);
       push(`${s.label}|${it.id}`, performance.now() - t0);
       answers.set(`${s.label}|${it.id}`, out.answers);
+      if (out.exec) {
+        const m = execModes.get(s.label) ?? execModes.set(s.label, {}).get(s.label);
+        m[out.exec.mode] = (m[out.exec.mode] ?? 0) + 1;
+      }
     }
   }
   if (!args.quiet) process.stdout.write(`\r  round ${r + 1}/${ROUNDS}`);
@@ -266,6 +299,9 @@ for (const s of sessions) {
     mode: s.mode,
     modelDir: path.relative(process.cwd(), s.modelDir).replace(/\\/g, "/"),
     webgpuOptions: s.loadOpts.webgpuOptions ?? null,
+    laneOptions: Object.keys(s.laneOpts).length ? s.laneOpts : null,
+    exec: s.exec ?? null,
+    execModes: execModes.get(s.label) ?? null,
     loadMs: s.loadMs,
     latency: { p50: st.p50, p90: st.p90, mean: st.mean, n: st.n },
     groups,
@@ -286,6 +322,7 @@ for (const v of report.variants) {
   console.log(`${v.label.padEnd(12)} ${groupNames.map((g) => `${f1(v.groups[g]?.p50)}/${f1(v.groups[g]?.p90)}`.padStart(15)).join("")}   ${f1(v.latency.p50).padStart(8)}  ${(r ? `${f3(r.median)} [${f3(r.lo)}, ${f3(r.hi)}] ${pct(r.median - 1)}` : "baseline").padStart(26)}  ${(v.fidelity ? `${v.fidelity.agree}/${v.fidelity.total}` : "-").padStart(14)}  ${(v.fidelity ? f4(v.fidelity.maxAbsDiff) : "-").padStart(8)}  ${(v.accuracy ? f3(v.accuracy.correct / v.accuracy.graded) : "-").padStart(6)}`);
 }
 console.log(`(group cells: p50/p90 ms; ratio < 1 = faster than ${base.label}; a CI that excludes 1.000 is a real difference)`);
+for (const v of report.variants) if (v.execModes) console.log(`${v.label}: process lane ran ${Object.entries(v.execModes).map(([m, n]) => `${n} calls ${m}`).join(", ")}`);
 
 const stamp = report.timestamp.replace(/[:.]/g, "-");
 const outJson = args.out ?? path.join("results", `ab-${stamp}.json`);
@@ -298,7 +335,8 @@ md.push(`| variant | lane | options | ${groupNames.map((g) => `${g} p50/p90`).jo
 md.push(`|---|---|---|${groupNames.map(() => "---").join("|")}|---|---|---|---|---|---|`);
 for (const v of report.variants) {
   const r = v.ratioToBase;
-  md.push(`| ${v.label} | \`${v.lane}\`${v.modelDir ? ` @ ${v.modelDir}` : ""} | ${v.webgpuOptions ? `\`${JSON.stringify(v.webgpuOptions)}\`` : "-"} | ${groupNames.map((g) => `${f1(v.groups[g]?.p50)} / ${f1(v.groups[g]?.p90)}`).join(" | ")} | ${f1(v.latency.p50)} | ${r ? `${f3(r.median)} [${f3(r.lo)}, ${f3(r.hi)}] (${pct(r.median - 1)})` : "baseline"} | ${v.fidelity ? `${v.fidelity.agree}/${v.fidelity.total}` : "-"} | ${v.fidelity ? f4(v.fidelity.maxAbsDiff) : "-"} | ${v.fidelity ? f4(v.fidelity.meanAbsDiff) : "-"} | ${v.accuracy ? `${v.accuracy.correct}/${v.accuracy.graded}` : "-"} |`);
+  const options = [v.webgpuOptions && JSON.stringify(v.webgpuOptions), v.laneOptions && JSON.stringify(v.laneOptions), v.exec && `exec ${JSON.stringify(v.exec)}`, v.execModes && `ran ${Object.entries(v.execModes).map(([m, n]) => `${n} ${m}`).join(" / ")}`].filter(Boolean);
+  md.push(`| ${v.label} | \`${v.lane}\`${v.modelDir ? ` @ ${v.modelDir}` : ""} | ${options.length ? `\`${options.join("; ")}\`` : "-"} | ${groupNames.map((g) => `${f1(v.groups[g]?.p50)} / ${f1(v.groups[g]?.p90)}`).join(" | ")} | ${f1(v.latency.p50)} | ${r ? `${f3(r.median)} [${f3(r.lo)}, ${f3(r.hi)}] (${pct(r.median - 1)})` : "baseline"} | ${v.fidelity ? `${v.fidelity.agree}/${v.fidelity.total}` : "-"} | ${v.fidelity ? f4(v.fidelity.maxAbsDiff) : "-"} | ${v.fidelity ? f4(v.fidelity.meanAbsDiff) : "-"} | ${v.accuracy ? `${v.accuracy.correct}/${v.accuracy.graded}` : "-"} |`);
 }
 await writeFile(outJson.replace(/\.json$/, "-summary.md"), md.join("\n") + "\n");
 console.log(`\nwrote ${outJson}\n      ${outJson.replace(/\.json$/, "-summary.md")}`);

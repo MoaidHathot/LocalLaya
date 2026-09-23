@@ -25,6 +25,7 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
 | fp16 bundle (`models/laya-onnx-fp16`) as the GPU default lane, built by `tools/optimize_graph.py` (2026-09-23) | The ORT profiler showed the export's 28 `IsNaN` NaN guards running on the CPU (WebGPU EP has no IsNaN): 28 GPU->CPU round trips per call, plus 196 Cast dispatches from the first converter's fp32 islands. Exact rewrites (`IsNaN` -> `Not(Equal(x,x))`, Reshape `allowzero` cleared, ORT Gelu fusion) + fp16 without islands: 2101 -> 1753 nodes, **1.87-2.13x faster** than the previous fp16 bundle (paired, interleaved, CI [0.448, 0.457] of fp32 time), arg-max agreement with fp32 134/134 + 118/120 = identical to before, same accuracy. Attention / RoPE / SkipLayerNorm patterns do not match this export - not hand-written (agreed stop point). Previous bundle kept as `models/laya-onnx-fp16-v1` for A/B. |
 | DirectML: fixed but not a lane | The failure was `Reshape(allowzero=1)` + `-1` (torch.export emits it for every `view`); clearing the attribute makes DML run on 1.30.0 and the nightly. 18-19 ms for 1 question (fastest EP) but 6-10x slower than WebGPU for batch > 1 even on a fixed shape (3 q 217 ms). Priors updated; not in the default lanes. |
 | CUDA lane as a Python process, default first lane (`cuda:fp16,webgpu:fp16,cpu:8`) (2026-09-23) | `onnxruntime-node` has no CUDA EP on Windows; the Python wheel has, and Microsoft's `onnxruntime-cuda-13` feed + NVIDIA's wheel index are reachable here (PyPI's file host is not). `tools/cuda_lane.py` (stdio, NDJSON + base64 tensors) behind `ProcessLane` / `RemoteSession` in `src/lane.mjs`, so `@receptron/laya` runs unchanged against a remote session. Paired ratio to fp32: **0.131 [0.130, 0.132]** vs 0.429 WebGPU (3.3x), 8.9 / 12.1 / 24.1 ms for 1 / 3 / 10 q; 195/195 arg-max agreement with WebGPU, accuracy = fp32. Dropped with a log line where the venv is missing, so the defaults work everywhere. User decision: default on if faster. |
+| CUDA Graph replay on static bucket graphs, default on in the CUDA lane (`--cuda-graph off`, per call `exec: { graph: false }`) (2026-09-23) | The lane was launch-bound (6 ms + 22 us/token, ~1400 kernels per call); capture failed on the exported graph because ORT 1.30's CUDA `GatherND` copies a host buffer during `Compute` (bisected to one node). `tools/static_graph.py` builds a static-shape graph per (rows, tokens, options) bucket with that node rewritten; `tools/cuda_lane.py` captures it and replays with padded inputs, sharing one device copy of the weights across buckets. Paired vs the dynamic path: **0.858 [0.848, 0.862]** overall, 1 q 10.8 -> 5.0 ms, 3 q 12.4 -> 8.6, 10 q 24.5 -> 22.9; 195/195 arg-max agreement, max abs dp 0.006; throughput 3 q 66-86 -> 114 calls/s. Threading follows two ORT facts (graph owned by the capturing thread; other threads' CUDA calls during a capture fail with error 900): a builder thread prepares sessions, the serving thread captures in idle gaps, every capture is checked against the dynamic graph before it serves. Buckets follow the traffic (a shape seen twice) plus four eager ones before ready. |
 | GPU keep-alive on by default in the sidecar (`--gpu-keepalive 30s`, tiny call every 500 ms on the lane that served last) (2026-09-23) | The CUDA lane is bimodal after a pause (3 q after 3 s: ~50 or ~200-300 ms). Through the sidecar, n = 20 per arm, arms alternated: median 174 -> 46 ms, slow calls 12/20 -> 4/20, for 1-4 W of GPU power while active and nothing when idle. Two earlier n = 6-8 comparisons pointed in opposite directions - the bimodality needs n >= 20. A 1 s interval does not help; on WebGPU the trick never did. |
 | Skill wrapper answers one-shot calls itself over HTTP (no second Node process) | 130-165 ms -> 80-90 ms per agent call; the remaining cost is Node start-up + imports around a 12 ms inference, so the guidance for many calls is a kept HTTP connection (13-15 ms). Lifecycle / `--local` / `--pretty` / REPL / sidecar failures are still delegated to `ask.mjs`. |
 | The CPU lane keeps the pinned, hash-verified HF fp32 bundle | The same graph clean-up gives nothing on the CPU EP (1.030 [0.953, 1.058]; IsNaN is native there), fp16 on the CPU EP is not faster either. |
@@ -52,8 +53,9 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
   concurrency, fp16 fidelity; throughput matrix (`experiments/throughput.mjs`: lanes x closed-loop concurrency
   x open-loop arrival rate, policy auto vs prefer-gpu, cross-lane interference), interference mechanism
   (`experiments/interference.mjs`: same thread vs child process), worker-thread lanes
-  (`experiments/worker-lanes.mjs`), CUDA per-call floor + graph-capture probe (`experiments/cuda_graph_probe.py`,
-  Python). Results in `results/*-summary.md` and README.
+  (`experiments/worker-lanes.mjs`), CUDA per-call floor + graph-capture probes (`experiments/cuda_graph_probe.py`,
+  `cuda_capture_attempt.py`, `cuda_capture_bisect.py`, `cuda_static_probe.py`, `cuda_shared_weights_probe.py`,
+  `cuda_input_race_probe.py`, `cuda_gil_probe.py`, Python). Results in `results/*-summary.md` and README.
 - **Router** (`src/ep-router.mjs`, `router-demo.mjs`): lanes `webgpu[:fp16]`, `cpu[:N][:nopin]`, `cpu:auto`,
   `dml` (default `webgpu,cpu:8`); probe with real inference; EMA latency model normalised by estimated work;
   contention inflation; one FIFO queue for all lanes with `wait + own` predictions, the GPU state expected at
@@ -65,8 +67,13 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
   thread (default), in-thread, or in a Python process (CUDA EP), same handle (`systemOne(state, questions, temps)`,
   `close()`, `onDeath`); per-call temperature override applied inside the lane; workers unref'd while idle;
   ordered message handling so `close` never releases a session under a running inference; the process lane
-  builds a stock `Laya` on a `RemoteSession` (run / release over stdio). `tools/setup-cuda-lane.mjs`
-  (`npm run cuda:setup` / `cuda:check`) installs the pinned wheels and verifies a CUDA session.
+  builds a stock `Laya` on a `RemoteSession` (run / release over stdio) and passes a per-call `exec`
+  (`{ graph: false }`) through; the result's `exec` (`mode`, `bucket`, `remoteMs`) becomes `routing.exec`.
+  `tools/cuda_lane.py`: dynamic session + CUDA Graph bucket sessions on one shared device copy of the weights,
+  buckets built from the traffic in idle gaps (`--graph auto|off`, `--graph-buckets`, `--graph-max-sessions`,
+  `--graph-max-vram-mib`, `--graph-max-work`, `--self-test`, ops `stats` / `bucket`); `tools/static_graph.py`
+  makes the static bucket graphs. `tools/setup-cuda-lane.mjs` (`npm run cuda:setup` / `cuda:check`, `--graphs`)
+  installs the pinned wheels, verifies a CUDA session and pre-generates the eager buckets' graphs.
 - **Graph tool** (`tools/optimize_graph.py`, `npm run fp16:convert`): IsNaN -> Not(Equal), Reshape allowzero,
   ORT Gelu fusion, fp16 without islands; `optimize-report.json` next to the bundle.
 - **A/B tool** (`experiments/ab.mjs`, `npm run fp16:check`): interleaved variants, paired ratio + bootstrap CI,
@@ -89,10 +96,12 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
 - **Agent skill** (`skills/laya-decisions/`): `SKILL.md`, `references/api.md`, `references/presets.md`,
   `scripts/laya.mjs` (resolves the project via `LAYA_DIR`, runs `ask.mjs --sidecar --json`).
 - **Tests**: `npm test` (10 unit tests, no model; also in GitHub Actions on Ubuntu/Windows x Node 20/22 -
-  `.github/workflows/unit-tests.yml`, not yet seen running on GitHub), `npm run test:router` (7 worker-lane /
-  failover / early-serving scenarios, ~35 s), `npm run test:cuda` (3 process-lane scenarios: fidelity vs WebGPU
-  on the full eval set, kill -> failover, close / bad python; skipped without the venv), `npm run test:sidecar`
-  (13 lifecycle scenarios, ~60 s, port 8797), `npm run test:all`.
+  `.github/workflows/unit-tests.yml`, not yet seen running on GitHub), `npm run test:router` (8 worker-lane /
+  failover / early-serving / keep-alive scenarios, ~45 s), `npm run test:cuda` (5 process-lane scenarios: fidelity
+  vs WebGPU on the full eval set, CUDA Graph replay vs the dynamic graph on the eval set + `exec.graph` + bucket
+  grid + 1 q speed, `cudaGraph: false` + lazy bucket build, router `routing.exec` + kill -> failover, close / bad
+  python; ~40 s, skipped without the venv), `npm run test:sidecar` (14 lifecycle scenarios, ~65 s, port 8797),
+  `npm run test:demo` (5), `npm run test:all`.
 
 ## Key measurements (this machine; treat as +-20 %)
 
@@ -103,7 +112,8 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
 | `webgpu` fp32 (HF export as is) | 30.5 | 53 | 143 | 2 % | 1.1 GiB | +1636 MiB |
 | `webgpu:fp16` first converter (2026-09-21) | 29.1 | 47 | 122 | 2 % | 0.6 GiB | +832 MiB |
 | `webgpu:fp16` optimised graph (2026-09-23) | 21.1 | 32.0 | 83.1 | 2 % | 0.6 GiB | +832 MiB |
-| **`cuda:fp16` process lane (2026-09-23, default first lane)** | **8.9** | **12.1** | **24.1** | 3 % | 1.0 GiB | +~1250 MiB |
+| `cuda:fp16` process lane, dynamic graph (2026-09-23) | 8.9 | 12.1 | 24.1 | 3 % | 1.0 GiB | +~1250 MiB |
+| **`cuda:fp16` + CUDA Graph replay (2026-09-23, default first lane)** | **5.0** | **8.6** | **22.9** | 3 % | 1.0 GiB | +~1250 MiB + 28-240 MiB per bucket |
 | `dml` optimised graph (not a lane) | 18-19 | 217 | 264 | | | |
 
 Sporadic 1-question calls (3 s gaps): WebGPU ~101 ms (was ~180), CPU ~105 ms. Sidecar: first call 3.1-4.5 s
@@ -114,8 +124,9 @@ during a 10-q CPU call 1.1 s -> 18 ms; two lanes load in 2.2-2.3 s instead of 3.
 smart-home intent 0.72, should_execute 0.66, target_device 0.77 (65 items); dev-request task 0.75, language
 0.85 (40 items) - unchanged by fp16 or the graph optimisation.
 
-Throughput (3 q per call, `results/throughput-*-summary.md`): `cuda:fp16` 66 calls/s with one caller, 83-86
-with 4-8 queued (12 ms per inference), 40/s offered served at 13 ms; 10 q 41 calls/s = 409 questions/s.
+Throughput (3 q per call, `results/throughput-*-summary.md`): `cuda:fp16` with CUDA Graph replay 114-115
+calls/s at 1-8 callers (8-9 ms per inference; 1 q 194 calls/s, 10 q 45 calls/s = 447 questions/s); on the
+dynamic graph 66 calls/s with one caller, 83-86 with 4-8 queued (12 ms), 40/s offered served at 13 ms.
 `webgpu:fp16` (optimised bundle) 30-31 calls/s
 back-to-back (91-93 questions/s; was 19-21), 20/s offered served at 33 ms p50 (was 110-146 with a queue), 10/s
 at 35 ms, 5/s at 70 ms (GPU clocks sag between calls), 1 per 3 s at 156 ms; `cpu:8` 2.5-3.8 calls/s, saturates
@@ -128,7 +139,8 @@ calls/s at 4 callers and 6.6 at 8 (p95 1.5 s); after: equal to `prefer-gpu` at e
 Ordered roughly by value. Done on 2026-09-23: sidecar serves from the first lane + `--max-age`, lanes in
 worker threads, `cpu:8` as the default CPU lane, `bench-all` defaults, GitHub Actions for the unit tests,
 optimised fp16 graph (1.9-2.1x), CUDA process lane (another 3x), generic A/B tooling, GPU keep-alive default,
-skill wrapper fast path, call-path decision guide (README "Choosing how to call it").
+skill wrapper fast path, call-path decision guide (README "Choosing how to call it"), `demo/`, CUDA Graph replay
+on static bucket graphs (1 q 2x, 3 q 1.4x; item 7 below is now the record of how).
 
 1. **Real traffic, real labels.** Everything above is measured on hand-written examples. Collect 50+ real
    inputs per preset that matters, label them, run `calibrate.mjs`, act on the verdicts.
@@ -166,27 +178,33 @@ skill wrapper fast path, call-path decision guide (README "Choosing how to call 
    mixed long / short states waste padding (cap); the coalesced call's `ms` is shared, so `routing.ms`
    becomes "batch ms" and the EMA needs the per-row share (batch ms / n, work-normalised).
    *When it pays:* several concurrent callers sending small calls (agents in parallel, a service fan-out).
-   The sidecar's 8-caller burst today: 8 x 12 ms = ~100 ms end to end for the last caller; coalesced ~25 ms.
+   The sidecar's 8-caller burst today: 8 x 9 ms = ~70 ms end to end for the last caller; coalesced ~25 ms.
+   With graph replay the per-call floor is ~2 ms rather than 6, so the bound has shrunk to ~2x for 1-question
+   callers.
    *Decide from real traffic:* `routing.queueMs > 0` on a meaningful share of calls is the signal.
-7. **CUDA lane: the per-call floor, and why CUDA Graph capture is not a quick win.** Measured
-   (`experiments/cuda_graph_probe.py`): every `session.run` costs **6.0 ms + 21.6 us/token** on this graph -
-   1 x 32 tokens 7.0 ms, 1 x 500 tokens 17.1 ms - because ORT issues ~1400 CUDA kernels per forward pass
-   (one per graph node) at ~4 us each; the GPU is mostly idle between them. This is paid on *every* call
-   (the one-time costs are separate: session 1.0-1.2 s, first inference ~200 ms cuDNN/arena, absorbed by the
-   lane warm-up). CUDA Graph capture (`enable_cuda_graph`, replay the recorded launches with one call) is
-   the standard fix and would leave ~2-3 ms per call - but on this graph as exported it **fails in ORT 1.30
-   with "CUDA failure 700: illegal memory access" during the capture run** and kills the CUDA context. The
-   dynamic-shape plumbing (Shape -> Slice -> Concat on the CPU, host<->device copies, data-dependent ops)
-   inside the captured stream is the likely reason. Prerequisite work: a static-shape variant of the graph
-   per shape bucket (fixed `[n, L]`, shape plumbing constant-folded away by `tools/optimize_graph.py`), one
-   session + capture per bucket in `tools/cuda_lane.py`, padding requests to the bucket. Same prerequisite
-   for a TensorRT EP session (fused engines, far fewer kernels). Estimate 1-2 days incl. fidelity checks;
-   the payoff is ~2x on small calls for every caller, so it ranks above coalescing unless traffic is
-   concurrent. For machines with a CUDA 12 driver: `node tools/setup-cuda-lane.mjs --cuda 12` (PyPI wheels;
-   pinned but untested here, PyPI's file host is blocked on this network). The remaining sporadic slow mode
-   (4/20 calls ~200 ms with keep-alive) is the GPU's power management; user-side levers are the NVIDIA
-   "prefer maximum performance" setting or a locked clock (`nvidia-smi -lgc`, admin) - not something this
-   project should set.
+7. **CUDA lane: the per-call floor - DONE via CUDA Graph replay (2026-09-23), what remains.** Measured
+   (`experiments/cuda_graph_probe.py`): every `session.run` cost **6.0 ms + 21.6 us/token** on this graph
+   because ORT issues ~1400 CUDA kernels per forward pass at ~4 us each. `enable_cuda_graph` on the exported
+   graph failed ("CUDA failure 700: illegal memory access" during the capture run, context dead) - not the
+   shape plumbing in general but one kernel: ORT 1.30's CUDA `GatherND` copies a host vector during `Compute`
+   (`cuda_capture_bisect.py`). Built: `tools/static_graph.py` (static bucket graphs, that node -> `Reshape`,
+   weights as inputs) + bucket sessions in `tools/cuda_lane.py` with the threading the ORT design forces
+   (details and all numbers: `results/cuda-graph-2026-09-23-summary.md`). Result: 1 q 10.8 -> 5.0 ms, 3 q
+   12.4 -> 8.6, dev-request 18.8 -> 16.0; paired 0.858 [0.848, 0.862]; same answers.
+   *Left on the table:* (a) the remaining ~4 ms of a 1-question replay is the stdio hop + tokenising in Node
+   (~1.5 ms) and the padded forward pass itself; a TensorRT EP session per bucket (fused kernels) is the next
+   lever, same static-graph prerequisite, untested; (b) buckets are per exact (rows, tokens, options) grid
+   cell, so a burst of a never-seen shape runs dynamic once and pays ~250 ms once for the session creation
+   (ORT holds the GIL) - `--graph-buckets` can pre-build known shapes; (c) the grid (`GRAPH_L/N/K`) is
+   hand-chosen from this machine's traffic - a preset with long states (300+ tokens x 5+ rows) sits above
+   `--graph-max-work` and gains nothing, by design (the gain there is < 5 %); (d) the fidelity check at
+   capture uses the last real inputs of that shape (threshold 0.5 logits = broken capture); on random-token
+   soup the static and dynamic fp16 graphs differ by up to 0.12 logits (kernel selection differs with the
+   shape), on real text by 0.002-0.02. For machines with a CUDA 12 driver: `node tools/setup-cuda-lane.mjs
+   --cuda 12` (PyPI wheels; pinned but untested here, PyPI's file host is blocked on this network). The
+   remaining sporadic slow mode (4/20 calls ~200 ms with keep-alive) is the GPU's power management; user-side
+   levers are the NVIDIA "prefer maximum performance" setting or a locked clock (`nvidia-smi -lgc`, admin) -
+   not something this project should set.
 8. **DirectML**: works on the optimised graph (`allowzero` fix) and is the fastest EP for a single question
    (18-19 ms) but 6-10x slower than WebGPU for batch > 1 on a fixed shape - cause unknown (not shape
    recompilation). Not a lane. Worth a look only if single-question traffic dominates somewhere.
@@ -199,10 +217,10 @@ skill wrapper fast path, call-path decision guide (README "Choosing how to call 
 
 ## How to call it (the short version; measured in results/sidecar-modes-2026-09-23-summary.md)
 
-- Many decisions from a process: `node ask.mjs --start`, then `POST /decide` on a kept connection - 13-15 ms.
+- Many decisions from a process: `node ask.mjs --start`, then `POST /decide` on a kept connection - ~10 ms.
 - A decision from a shell / agent tool call: `node skills/laya-decisions/scripts/laya.mjs ...` - 80-90 ms
-  (Node start-up; the inference is 12 ms of it). First call after idle 2.5-4.5 s.
-- All questions about one text in one call (10 q = 24 ms on CUDA, not 10 x 9 ms).
+  (Node start-up; the inference is 5-9 ms of it). First call after idle 2.5-4.5 s.
+- All questions about one text in one call (10 q = 23 ms on CUDA, not 10 x 5 ms).
 - Calls seconds apart: the default GPU keep-alive handles it (median 46 ms instead of 174); calls minutes
   apart: idle-exit and reload (2.5 s) or `--idle 0`.
 - The lane is never the caller's decision; `routing.lane` / `routing.reason` show what the router did.
@@ -219,6 +237,11 @@ skill wrapper fast path, call-path decision guide (README "Choosing how to call 
   `0xC0000409` (terminating an idle worker is fine).
 - Early serving trades the first second: a call that arrives while only the CPU lane is up runs there
   (~300 ms for 3 q) rather than waiting ~0.5-1 s for the GPU lane; bursts move over as soon as it joins.
+- The CUDA lane replays CUDA Graphs only for shapes it has seen twice (plus four eager buckets): the first
+  burst of a new shape runs on the dynamic graph (~2x slower for 1 question), and under continuous traffic the
+  bucket build stalls one call ~250 ms (ORT holds the GIL while it creates a session). `routing.exec.mode`
+  tells which path served a call. Turn off with `--cuda-graph off` / `exec: { graph: false }` if that ever
+  matters more than the steady-state gain.
 - The CUDA lane after a pause of >= 1 s is bimodal (~50 or ~200-300 ms); the keep-alive removes most but not
   all slow calls (4/20 remain). A cold single question is a tie between CUDA, WebGPU (~101 ms) and CPU
   (~105 ms) that the router settles from its EMA; expect either lane in `routing.lane` for such calls.
@@ -241,7 +264,8 @@ skill wrapper fast path, call-path decision guide (README "Choosing how to call 
 ```powershell
 cd W:\Github\LocalLaya
 npm test                      # 10 unit tests, no model needed
-npm run test:router           # worker lanes, failover, early serving (~35 s, needs model + GPU)
+npm run test:router           # worker lanes, failover, early serving (~45 s, needs model + GPU)
+npm run test:cuda             # CUDA process lane incl. CUDA Graph replay vs dynamic (~40 s, needs the venv)
 node ask.mjs --status         # is a sidecar running?
 node ask.mjs --sidecar "..."  # start using it
 npm run test:sidecar          # full lifecycle check (~1 min)
@@ -253,4 +277,6 @@ Models are in `models/` (ignored by git, 3.2 GB incl. the previous fp16 bundle `
 missing, `node poc.mjs` re-downloads and verifies the pinned fp32 bundle; `npm run fp16:convert` rebuilds the
 optimised fp16 bundle with `tools/optimize_graph.py` (needs `.venv`: `uv venv .venv` +
 `uv pip install --python .venv/Scripts/python.exe onnx onnxruntime`; `npm run cuda:setup` then swaps
-`onnxruntime` for `onnxruntime-gpu` + the CUDA / cuDNN wheels, ~1.6 GiB, from Microsoft's and NVIDIA's feeds).
+`onnxruntime` for `onnxruntime-gpu` + the CUDA / cuDNN wheels, ~1.6 GiB, from Microsoft's and NVIDIA's feeds,
+and pre-generates the static bucket graphs `laya-static-*-w.onnx` / `laya-dynamic-w.onnx` next to `laya.onnx`;
+`tools/cuda_lane.py` regenerates any that are missing on its first start).

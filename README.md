@@ -18,8 +18,9 @@ Everything downloaded lives under this directory (`models/`, `node_modules/`, `.
 | `poc.mjs` | load once, answer 3 questions in one pass, 10 timed runs, sanity check on contrasting states |
 | `src/laya-client.mjs` | reusable loader: pinned HF revision, project-local cache, SHA256 verification, no network after first download, EP selection, P-core pinning (threads and, on Windows, the process), calibration, `createDecider()` facade |
 | `src/ep-router.mjs` | per-call execution-provider router (`LayaRouter`): probes lanes, predicts latency per (lane, GPU thermal state, question bucket, work), one FIFO queue for all lanes with the lane bound at the front of the queue, contention-aware, quarantines failing lanes, serves from the first lane while the others load |
-| `src/lane.mjs`, `src/lane-worker.mjs`, `tools/cuda_lane.py` | a lane = one Laya session in a worker thread (default), in this thread, or in a Python process (CUDA EP over stdio), behind one handle: `systemOne(state, questions, temps)`, `close()`, death notification |
-| `tools/setup-cuda-lane.mjs` | `npm run cuda:setup` / `cuda:check`: onnxruntime-gpu (Microsoft's CUDA 13 feed) + CUDA / cuDNN wheels (NVIDIA's index) into `.venv`, pinned, verified with a CUDA session |
+| `src/lane.mjs`, `src/lane-worker.mjs`, `tools/cuda_lane.py` | a lane = one Laya session in a worker thread (default), in this thread, or in a Python process (CUDA EP over stdio, CUDA Graph replay on static bucket graphs, finding 12), behind one handle: `systemOne(state, questions, temps, exec)`, `close()`, death notification |
+| `tools/setup-cuda-lane.mjs` | `npm run cuda:setup` / `cuda:check`: onnxruntime-gpu (Microsoft's CUDA 13 feed) + CUDA / cuDNN wheels (NVIDIA's index) into `.venv`, pinned, verified with a CUDA session; `--graphs` pre-generates the static bucket graphs |
+| `tools/static_graph.py` | static-shape variant of the graph per (rows, length, options) bucket for CUDA Graph capture: Shape outputs baked, constants folded, `GatherND` -> `Reshape` (the kernel that broke the capture), weights as inputs so every bucket shares one device copy; `--check` vs the dynamic graph |
 | `router-demo.mjs` | the router under burst / sporadic / batch traffic, deadline and forced-lane calls |
 | `src/calibration.mjs`, `calibrate.mjs` | raw-logit capture, accuracy + NLL / Brier / ECE + reliability tables, per-bucket temperature refit with leave-one-out |
 | `data/smart-home-eval.mjs`, `data/question-variants.mjs` | 65 hand-labelled utterances; three question wordings (v1 original, v2 explicit, v3 best per question) |
@@ -73,7 +74,8 @@ npm run serve                 # http://127.0.0.1:8787 - browser page + JSON API,
 ```powershell
 Invoke-RestMethod -Method Post http://127.0.0.1:8787/decide -ContentType application/json `
   -Body (@{ preset = "triage"; text = "Charged twice, refund me today or I cancel" } | ConvertTo-Json)
-# body: { text | state, preset?, questions?, lane?, deadlineMs? } -> { answers, usage, routing }
+# body: { text | state, preset?, questions?, lane?, policy?, deadlineMs?, exec? } -> { answers, usage, routing }
+# exec: { graph: false } = cuda lane without CUDA Graph replay for this call; routing.exec says what it did
 # GET /presets, /health, /stats.  Binds 127.0.0.1 only; --cors to allow other origins.
 ```
 
@@ -244,7 +246,8 @@ Latency of one `systemOne` call, p50 ms, 20 runs back-to-back after warm-up:
 | `webgpu` fp32 (pinned HF export as is) | 30.5 | 53 | 143 | 2 % | 1.1 GiB | +1636 MiB | 42-161 W |
 | `webgpu:fp16`, first converter (2026-09-21) | 29.1 | 47 | 122 | 2 % | 0.6 GiB | +832 MiB | 53-144 W |
 | `webgpu:fp16`, optimised graph (2026-09-23) | 21.1 | 32.0 | 83.1 | 2 % | 0.6 GiB | +832 MiB | 38-166 W |
-| **`cuda:fp16`, same bundle in a Python process (2026-09-23, default first lane)** | **8.9** | **12.1** | **24.1** | 3 % | 1.0 GiB (process) | +~1250 MiB incl. CUDA context | - |
+| `cuda:fp16`, same bundle in a Python process (2026-09-23), dynamic graph | 8.9 | 12.1 | 24.1 | 3 % | 1.0 GiB (process) | +~1250 MiB incl. CUDA context | - |
+| **`cuda:fp16` + CUDA Graph replay (2026-09-23, default first lane)** | **5.0** | **8.6** | **22.9** | 3 % | 1.0 GiB (process) | +~1250 MiB + 28-240 MiB per shape bucket | - |
 | `dml` (DirectML), optimised graph | 18-19 | 217 | 264 | | | | batch > 1 pathological, not a lane |
 
 Model-card reference on a Tesla T4 (PyTorch): 39.5 ms (1 q), 158.6 ms (10 q). All lanes return identical
@@ -260,10 +263,11 @@ the optimised fp16 bundle (the 2026-09-21 numbers in brackets):
 
 | lane | calls/s | questions/s | per minute | latency at that rate |
 |---|---|---|---|---|
-| **`cuda:fp16`, back-to-back, 1 caller** | **66** | 198 | ~4000 | 14 ms |
-| **`cuda:fp16`, 4-8 callers queued** | **83-86** | 250-260 | ~5000 | 12 ms per inference, 48-92 ms end to end |
+| **`cuda:fp16` (graph replay), back-to-back, 1-8 callers** | **114-115** | 343-346 | ~6900 | 8-9 ms per inference, 17-52 ms end to end with a queue |
+| **`cuda:fp16`, 1 question per call** | **194** | 194 | ~11600 | 5 ms |
+| `cuda:fp16`, 10 questions per call | 45 | **447** | 2680 | 22 ms |
+| `cuda:fp16` dynamic graph (`exec: { graph: false }`), 3 q | 66-86 | 198-260 | ~4000-5000 | 12 ms |
 | `cuda:fp16`, 40 calls/s offered | 40 | 120 | 2400 | 13 ms |
-| `cuda:fp16`, 10 questions per call | 41 | **409** | 2460 | 24 ms |
 | `webgpu:fp16`, back-to-back | **30-31** (19-21) | 91-93 | ~1800 | 32-33 ms |
 | `webgpu:fp16`, 20 calls/s offered | 20 (queued) | 60 | 1200 | 33 ms (110-146 with a queue) |
 | `webgpu:fp16`, 10 calls/s offered | 10 | 30 | 600 | 35 ms (53-60) |
@@ -273,9 +277,10 @@ the optimised fp16 bundle (the 2026-09-21 numbers in brackets):
 | `cpu:8`, anything above ~3 calls/s | saturates | | | queue grows without bound |
 
 Batching questions into one call is the lever, most of all on CUDA where the per-call cost is almost flat:
-409 questions/s at 10 per call vs 96 at 1 per call (WebGPU: ~120 vs ~47). Parallel callers do not add
-throughput on WebGPU (one FIFO; each caller just sees `queueMs` grow) and add ~30 % on CUDA (the process
-pipelines the next request while the GPU finishes the current one).
+447 questions/s at 10 per call vs 194 at 1 per call (WebGPU: ~120 vs ~47). Parallel callers do not add
+throughput (one FIFO; each caller just sees `queueMs` grow) - the ~30 % the CUDA process used to gain from
+pipelining the next request behind a 12 ms inference is gone now that the inference is 8 ms and the CPU side
+(tokenising, stdio, padding) is the larger share.
 
 Deployment overhead on top: HTTP `serve.mjs` +1-3 ms; `ask.mjs --sidecar` (new CLI process per call) ~140 ms
 per call, so ~7 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1.5-2.5 s load every time.
@@ -361,14 +366,33 @@ per call, so ~7 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1
     ~4 us each - paid on every call, not only the first - so it is almost flat in batch size: 8.9 / 12.1 /
     24.1 ms for 1 / 3 / 10 questions vs 21 / 32 / 83 on WebGPU (stdio round trip + tokenising 0.7-1.8 ms of
     that; 2 CPU-side threads on the P-cores - the unpinned default measured 20 ms). CUDA Graph capture, the
-    standard fix for the floor, fails on this graph in ORT 1.30 (illegal memory access during capture); it
-    needs a static-shape graph per bucket first (`docs/STATUS.md`).
+    standard fix for the floor, fails on this graph as exported (illegal memory access during capture) - solved
+    with static-shape bucket graphs in finding 12.
     Paired ratio to fp32 (`experiments/ab.mjs`): **0.131 [0.130, 0.132]** vs 0.429 for WebGPU on PoC +
     smart-home (3.3x), 0.140 vs 0.423 on dev-request (3.0x); arg-max agreement with fp32 134/134 and 119/120,
     195/195 with the WebGPU lane over the full eval set (max |dp| 0.035), same accuracy. Throughput 66 calls/s
     (3 q, one caller), 83-86 with a queue, 409 questions/s at 10 per call. Killing the Python process fails
     in-flight calls over and marks the lane gone (`test/cuda-lane.test.mjs`); without the venv the lane is
     dropped at start-up and WebGPU serves. Details: `results/cuda-lane-2026-09-23-summary.md`.
+12. **CUDA Graph replay on static bucket graphs: 2x on 1 question, 1.4x on 3, same answers.** The capture failure
+    was one kernel: `experiments/cuda_capture_bisect.py` narrowed it to `GatherND` (the attention-mask broadcast
+    with constant indices), whose ORT 1.30 CUDA implementation copies a host vector during `Compute` and so
+    replays from a dead stack buffer. `tools/static_graph.py` makes a static-shape graph per (rows, tokens,
+    options) bucket - Shape outputs baked, 202 constant nodes folded, that `GatherND` rewritten to a `Reshape` -
+    and the capture works. `tools/cuda_lane.py` keeps the dynamic session for anything else and replays
+    buckets: inputs padded up (mask 0), outputs sliced, one shared device copy of the weights (weights are graph
+    inputs), buckets built from the shapes that arrive (a shape seen twice gets one, in an idle gap) plus a few
+    eager ones before the lane reports ready. Two ORT facts dictated the threading: the captured graph belongs
+    to the *calling thread* and any other thread's CUDA call during the (global-mode) capture fails with error
+    900 - so a builder thread prepares sessions under a lock and the serving thread captures them, in idle gaps,
+    each replay checked against the dynamic graph on real inputs before it serves (`results/cuda-graph-2026-09-23-summary.md`).
+    Paired against the dynamic CUDA path (`experiments/ab.mjs`, 8 rounds, PoC + 40 dev-request items):
+    **0.858 [0.848, 0.862]**; 1 / 3 / 10 questions **5.0 / 8.6 / 22.9 ms** vs 10.8 / 12.4 / 24.5, dev-request
+    18.8 -> 16.0; 0.150 of fp32 time vs 0.213. Fidelity: 134/134 arg-max with the dynamic graph (max |dp| 0.006),
+    195/195 on the eval set (0.0055), same accuracy. Throughput 194 / 114 / 45 calls/s for 1 / 3 / 10 questions
+    (was 96 / 66-86 / 41). Costs: +1.4 s start-up (eager buckets), 28-240 MiB VRAM per bucket, and the first
+    burst of a never-seen shape still runs dynamic. Off per call with `exec: { graph: false }`
+    (`--no-graph`), per lane with `serve.mjs --cuda-graph off`; `routing.exec` reports `mode` and `bucket`.
 
 ## The execution-provider router (`src/ep-router.mjs`)
 
@@ -400,7 +424,9 @@ its own worker thread (`workers: false` for in-thread sessions) or process; RAM 
   (nvidia-smi utilisation weighted by SM clock, sampled while we are idle) inflates the affected lane's `own`.
 - **Decision**: `auto` = fastest predicted, with 5 % exploration among lanes within 2x when nothing is queued
   behind the call; `prefer-gpu`, `prefer-cpu`, `min-cpu`; per call `{ lane }` or `{ deadlineMs }` (meet the
-  deadline, queue included, with the least CPU share).
+  deadline, queue included, with the least CPU share); `{ exec: { graph: false } }` runs a CUDA call on the
+  dynamic graph instead of a CUDA Graph replay (finding 12). `routing.exec = { mode, bucket, remoteMs }` says what
+  the process lane did; `router.detailedStats()` adds the lane's buckets, hits and VRAM.
 - **Process affinity**: on Windows hybrid CPUs the process is restricted to the P-cores (finding 7; `pinProcess: false` to opt out).
 - **Shutdown**: `close()` rejects new calls, lets the queue drain, then releases every session (a worker
   releases its own session and exits; see finding 8 for why it is never terminated under a running inference).
@@ -486,6 +512,9 @@ original is `convaiinnovations/laya` (`pip install laya`, Python 3.10+, torch 2.
 ## Known limits / next steps
 
 - WebGPU EP is marked experimental by ORT; first call ~180 ms; sporadic calls pay GPU clock ramp-up.
+- CUDA Graph buckets follow the traffic: the first burst of a never-seen shape runs on the dynamic graph (1 q
+  10 ms instead of 5), the bucket is ready ~0.5 s later in sporadic traffic, ~1.5 s under continuous load (one
+  call stalls ~250 ms while ORT creates the session). `--graph-buckets` names shapes to prepare before ready.
 - `head_max_len` 192 tokens shared by all options of a question; < 20 options recommended; state truncated at 512.
 - English checkpoint only; non-Latin scripts fail confidently (model card).
 - Next: collect real traffic -> labels -> `calibrate.mjs`; iterate wording per question; if accuracy is not

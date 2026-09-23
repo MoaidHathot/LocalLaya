@@ -30,6 +30,8 @@
  *   --state <file|json>   JSON state, replaces the preset's text wrapper (text arguments are ignored)
  *   --lanes a,b           lanes to load (default cuda:fp16,webgpu:fp16 one-shot, + cpu:8 for the REPL / sidecar; a lane that cannot load is dropped)
  *   --lane <lane>         force a lane for every call (default: router decides)
+ *   --policy <p>          auto | prefer-gpu | prefer-cpu | min-cpu (default auto)
+ *   --no-graph            cuda lane: skip CUDA Graph replay for these calls (exec: { graph: false })
  *   --calibration <file>  temperature table for the active preset; default: calibration/<preset>.json if it exists
  *   --idle <dur>          sidecar idle exit, used only when this call spawns it (default $LAYA_IDLE or 5m; 0 = never)
  *   --max-age <dur>       sidecar recycles itself after this long (default $LAYA_MAX_AGE or never); also only when spawning
@@ -58,6 +60,8 @@ const { values: args, positionals } = parseArgs({
     state: { type: "string" },
     lanes: { type: "string" },
     lane: { type: "string" },
+    policy: { type: "string" },
+    "no-graph": { type: "boolean", default: false },
     calibration: { type: "string" },
     sidecar: { type: "boolean", default: false },
     local: { type: "boolean", default: false },
@@ -210,7 +214,7 @@ async function remoteBackend() {
       return this.lanes;
     },
     decide: async (state, qs, o) => {
-      const r = await sidecar.decide({ state, questions: qs, preset: presetName, lane: o.lane, calibration: o.calibration ?? undefined }, { port });
+      const r = await sidecar.decide({ state, questions: qs, preset: presetName, lane: o.lane, policy: o.policy, exec: o.exec, calibration: o.calibration ?? undefined }, { port });
       return { answers: r.answers, usage: r.usage, routing: r.routing };
     },
     stats: () => sidecar.stats({ port }),
@@ -235,7 +239,7 @@ if (useSidecar) {
 say(dim(`preset ${presetName}${calibration ? ` (calibration ${calibration.file})` : " (shipped temperatures)"}; ${backend.via}`));
 
 async function ask(state, shownText) {
-  const result = await backend.decide(state, questions, { ...(forcedLane ? { lane: forcedLane } : {}), calibration });
+  const result = await backend.decide(state, questions, { ...(forcedLane ? { lane: forcedLane } : {}), ...(args.policy ? { policy: args.policy } : {}), ...(args["no-graph"] ? { exec: { graph: false } } : {}), calibration });
   lastState = state;
   lastText = shownText;
   if (jsonOut) {

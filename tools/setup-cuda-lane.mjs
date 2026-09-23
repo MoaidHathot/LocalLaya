@@ -4,6 +4,11 @@
  *   npm run cuda:setup                 # CUDA 13 (driver >= 580 / "CUDA Version: 13.x" in nvidia-smi)
  *   node tools/setup-cuda-lane.mjs --cuda 12       # CUDA 12 wheels (driver 525+); needs PyPI to be reachable
  *   node tools/setup-cuda-lane.mjs --check          # only verify what is installed
+ *   node tools/setup-cuda-lane.mjs --graphs         # only (re)generate the static CUDA-graph bucket files
+ *
+ * After the install the static-shape graphs for the lane's default eager buckets are generated next to
+ * models/laya-onnx-fp16/laya.onnx (tools/static_graph.py, ~1-3 s each on the CPU); tools/cuda_lane.py would
+ * otherwise do it on its first start. Skipped when the fp16 bundle is not there yet (`npm run fp16:check`).
  *
  * Sources (chosen because they are reachable from networks that block files.pythonhosted.org):
  *   - onnxruntime-gpu: Microsoft's release feed for the CUDA 13 build
@@ -27,7 +32,7 @@ import { parseArgs, promisify } from "node:util";
 const run = promisify(execFile);
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PY = process.env.LAYA_PYTHON ?? path.join(ROOT, ".venv", "Scripts", "python.exe");
-const { values: args } = parseArgs({ options: { cuda: { type: "string", default: "13" }, check: { type: "boolean", default: false } } });
+const { values: args } = parseArgs({ options: { cuda: { type: "string", default: "13" }, check: { type: "boolean", default: false }, graphs: { type: "boolean", default: false }, "model-dir": { type: "string", default: "models/laya-onnx-fp16" }, buckets: { type: "string", default: "1x96x8,3x96x8,5x96x8,5x128x8" } } });
 
 const PINS = {
   13: {
@@ -79,6 +84,23 @@ if (args.check) {
   say(JSON.stringify(info, null, 2));
   process.exit(info.cuda_ok ? 0 : 1);
 }
+
+/** Static-shape graphs for the lane's eager buckets (+ the dynamic graph with the weights as inputs). */
+async function buildGraphs() {
+  const dir = path.resolve(ROOT, args["model-dir"]);
+  if (!(await exists(path.join(dir, "laya.onnx")))) {
+    say(`no fp16 bundle at ${dir} - skipping the static graphs (tools/cuda_lane.py generates them on first start)`);
+    return;
+  }
+  say(`> static graphs for ${args.buckets} in ${dir}`);
+  const { stdout } = await run(PY, ["-u", path.join(ROOT, "tools", "static_graph.py"), dir, "--buckets", args.buckets, "--weights-as-inputs", "--dynamic"], { env: { ...process.env, PYTHONUTF8: "1" }, maxBuffer: 16 * 1024 * 1024 });
+  for (const l of stdout.trim().split(/\r?\n/)) say(`  ${l}`);
+}
+
+if (args.graphs) {
+  await buildGraphs();
+  process.exit(0);
+}
 const pins = PINS[args.cuda];
 if (!pins) {
   say(`--cuda must be 12 or 13`);
@@ -104,4 +126,5 @@ if (!info.cuda_ok) {
   say("CUDA EP did not come up. Check `nvidia-smi` (driver / CUDA version) and the versions pinned in this script.");
   process.exit(1);
 }
+await buildGraphs().catch((e) => say(`static graphs not generated (${String(e.message).split("\n")[0].slice(0, 120)}); tools/cuda_lane.py generates them on first start`));
 say(`CUDA lane ready: onnxruntime-gpu ${info.onnxruntime}. Try: node router-demo.mjs --lanes cuda:fp16,webgpu:fp16,cpu:8`);

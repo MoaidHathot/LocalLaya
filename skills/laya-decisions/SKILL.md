@@ -5,7 +5,7 @@ license: Unlicense (this project). Vendored @receptron/laya is MIT; Laya model w
 compatibility: Requires Node.js 20+ and a checkout of the LocalLaya project (github.com/MoaidHathot/LocalLaya) with the model downloaded (first run fetches 1.7 GB). Tested on Windows 11 with an NVIDIA GPU (fastest with the optional CUDA lane, `npm run cuda:setup`); works CPU-only. Binds 127.0.0.1 only.
 metadata:
   author: moaid
-  version: "1.1"
+  version: "1.2"
   project: LocalLaya (set LAYA_DIR to its checkout path when this skill lives elsewhere)
 ---
 
@@ -33,14 +33,14 @@ node scripts/laya.mjs --preset triage "Charged twice. Refund today or I cancel."
 - The wrapper talks to one shared background instance (the *sidecar*) and prints one JSON object on stdout:
   `{ state, answers, usage, routing, backend }`. Progress and warnings go to stderr. Exit code 0 on success,
   1 on error (message on stderr), 2 for an unknown preset or an invalid question set.
-- Cost per call: **~80-90 ms** (Node start-up + HTTP; the inference itself is ~12-15 ms on the CUDA lane). The
+- Cost per call: **~80-90 ms** (Node start-up + HTTP; the inference itself is ~5-10 ms on the CUDA lane). The
   first call after an idle period takes ~2.5-4.5 s (it starts the sidecar; stderr says `starting one`).
   The sidecar exits by itself after 5 min without calls.
 - **Making many calls?** Do not spawn a process per decision. Start the sidecar once and call it over HTTP from
-  your own process: `node ask.mjs --start` prints `{ url, pid, lanes }`; then `POST /decide` - **13-15 ms per
+  your own process: `node ask.mjs --start` prints `{ url, pid, lanes }`; then `POST /decide` - **~10 ms per
   call** with a kept connection. See [references/api.md](references/api.md).
 - **Several questions about the same text?** Put them in one call (one preset or one `--questions` set): 3
-  questions cost 12 ms, 10 questions 24 ms - not 3 or 10 separate calls.
+  questions cost ~9 ms, 10 questions ~23 ms - not 3 or 10 separate calls.
 
 Presets (question sets + a wrapper that turns text into a state): `smart-home` (default), `triage`, `guard`,
 `moderation`, `route`, `sentiment`, `dev-request`, plus any `presets/<name>.json` in the project.
@@ -70,9 +70,10 @@ see [references/presets.md](references/presets.md) for the format and how to wri
 - Reasonable defaults: act automatically at >= 0.8; ask for confirmation / add context between 0.55 and 0.8;
   treat < 0.55 as "don't know" and fall back to the LLM or a human. Tune per question with labelled data.
 - A `noul` near 0.5 after calibration means the model cannot tell - do not read it as "maybe".
-- `routing.lane` / `routing.ms` say where and how fast it ran (`cuda:fp16` ~12 ms, `webgpu:fp16` ~32 ms,
+- `routing.lane` / `routing.ms` say where and how fast it ran (`cuda:fp16` ~9 ms, `webgpu:fp16` ~32 ms,
   `cpu:8` ~270 ms for 3 questions); `routing.queueMs` > 0 means it waited behind other callers. You do not
-  choose the lane; the sidecar picks the fastest predicted one per call.
+  choose the lane; the sidecar picks the fastest predicted one per call. On the CUDA lane `routing.exec.mode`
+  is `graph` (a replayed CUDA Graph for a known shape) or `dynamic` (a new or large shape: ~3-5 ms slower).
 
 ## When to use / not to use
 
@@ -127,7 +128,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8787/decide -Method Post -ContentType ap
 - First call after idle: ~2.5-4.5 s and stderr says `starting one`. Subsequent calls are fast. Do not run several
   first calls in parallel to "warm it up"; one is enough (racing launchers are handled, but waste ~1 s each).
 - Calls a few seconds apart are slower than back-to-back ones (the GPU drops its clocks between calls): expect
-  ~45-50 ms instead of 12 ms, occasionally ~200 ms. The sidecar keeps the GPU awake for 30 s after each call
+  ~40-50 ms instead of 9 ms, occasionally ~200 ms. The sidecar keeps the GPU awake for 30 s after each call
   (`--gpu-keepalive`); this is already on.
 - `warning: sidecar unavailable ... handing over to ask.mjs` / `falling back to in-process` on stderr: the
   answer is still valid; the port is busy or the sidecar failed to start. `node ask.mjs --status` explains;

@@ -48,8 +48,13 @@ calibration, exec }`, all optional. `decideMany(inputs, opts, { concurrency })` 
 You normally do not choose. The sidecar loads three lanes - `cuda:fp16` (Python process, if `npm run cuda:setup`
 was run), `webgpu:fp16`, `cpu:8` - and its router picks, per call, the lane with the lowest predicted latency
 including the queue and the GPU's thermal state; `routing.lane` / `routing.reason` say what it did. Measured
-on the reference machine (RTX 4070), 3 questions: CUDA ~12 ms, WebGPU ~32 ms, CPU ~270 ms; a cold single
-question is a three-way tie around 100 ms, which the router settles from what it has seen.
+on the reference machine (RTX 4070), 3 questions: CUDA ~9 ms (~12 on its dynamic graph), WebGPU ~32 ms, CPU
+~270 ms; a cold single question is a three-way tie around 100 ms, which the router settles from what it has seen.
+
+The CUDA lane replays a captured CUDA Graph for shapes it has seen before (`routing.exec.mode: "graph"`,
+`bucket: [rows, tokens, options]`) and falls back to its generic graph for the first two calls of a new shape
+or for large calls (`mode: "dynamic"`). Answers agree to |dp| < 0.01; the difference is speed (1 question 5 vs
+10 ms).
 
 Overrides, per call: `lane` (`"webgpu:fp16"`, `"cpu:8"`, ...), `policy` (`"prefer-gpu"`, `"prefer-cpu"`, `"min-cpu"`),
 `deadlineMs` (meet it with the least CPU share), `exec: { graph: false }` (cuda lane: skip CUDA-graph replay).

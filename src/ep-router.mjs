@@ -217,6 +217,11 @@ export class LayaRouter {
    * @param {boolean} [o.workers=true]               run each lane's session in a worker thread (lane.mjs); false = in this thread
    * @param {string} [o.python]                      Python with onnxruntime-gpu for cuda lanes (default LAYA_PYTHON or .venv/Scripts/python.exe)
    * @param {number} [o.deviceId]                    GPU index for cuda / dml lanes (default 0)
+   * @param {boolean} [o.cudaGraph=true]             cuda lanes: CUDA Graph replay on static bucket graphs (tools/cuda_lane.py); false = dynamic graph only
+   * @param {string} [o.graphBuckets]                cuda lanes: buckets built eagerly ("1x96x8,3x96x8,..."); the rest come from traffic
+   * @param {number} [o.graphMaxSessions]            cuda lanes: LRU bound on captured buckets (default 16)
+   * @param {number} [o.graphMaxVramMiB]             cuda lanes: VRAM budget for the buckets' activations (default 1536)
+   * @param {number} [o.graphMaxWork]                cuda lanes: rows x length above which calls stay dynamic (default 1536)
    * @param {{state?:object, sizes?:number[]}} [o.warmup]  warm every lane (shader compile, EMA priming) before it serves
    * @param {"all"|"first"} [o.waitFor="all"]        resolve when every lane is done, or as soon as the first lane serves;
    *                                                 `router.ready` resolves when all lanes are done either way
@@ -266,7 +271,7 @@ export class LayaRouter {
     const t0 = performance.now();
     let session = null;
     try {
-      session = await openLane(lane, { ep, threads, pinToPCores: pin, modelDir, calibration: this.opts.calibration, python: this.opts.python, deviceId: this.opts.deviceId }, { worker: this.opts.workers, log: () => {} });
+      session = await openLane(lane, { ep, threads, pinToPCores: pin, modelDir, calibration: this.opts.calibration, python: this.opts.python, deviceId: this.opts.deviceId, cudaGraph: this.opts.cudaGraph, graphBuckets: this.opts.graphBuckets, graphMaxSessions: this.opts.graphMaxSessions, graphMaxVramMiB: this.opts.graphMaxVramMiB, graphMaxWork: this.opts.graphMaxWork }, { worker: this.opts.workers, log: () => {} });
       if (this.closed) throw new Error("router closed while loading");
       const L = { lane, session, model: new LatencyModel(lane), healthy: true, dead: false, failures: 0, quarantinedUntil: 0, calls: 0, pending: 0, loadMs: session.loadMs, probeMs: 0 };
       session.onDeath((cause) => this._laneDied(L, cause));
@@ -276,7 +281,7 @@ export class LayaRouter {
       if (this.closed) throw new Error("router closed while loading");
       this.lanes.set(lane, L);
       const readyMs = performance.now() - t0;
-      this.log(`lane ${lane}: ready (load ${(session.loadMs / 1000).toFixed(1)} s, probe ${L.probeMs.toFixed(0)} ms${warm ? `, warm-up ${Object.entries(warm).map(([n, v]) => `${n}q ${v.ms.toFixed(0)}`).join(" / ")} ms` : ""}, ${session.mode})`);
+      this.log(`lane ${lane}: ready (load ${(session.loadMs / 1000).toFixed(1)} s, probe ${L.probeMs.toFixed(0)} ms${warm ? `, warm-up ${Object.entries(warm).map(([n, v]) => `${n}q ${v.ms.toFixed(0)}`).join(" / ")} ms` : ""}, ${session.mode}${session.graph ? `, cuda graphs ${session.graph.enabled ? "on" : "off"}` : ""})`);
       this.opts.onLaneReady?.(lane, { loadMs: session.loadMs, probeMs: L.probeMs, warmup: warm, readyMs, mode: session.mode });
       return true;
     } catch (e) {
@@ -375,8 +380,11 @@ export class LayaRouter {
     for (const n of sizes) {
       const qs = warmupQuestions(n);
       const work = estimateWork(state, qs);
-      const first = await this._direct(L, () => L.session.systemOne(state, qs));
-      const timed = gpu ? await this._direct(L, () => L.session.systemOne(state, qs)) : first;
+      // exec.graph = false: the cuda lane answers on its dynamic graph and does not build a bucket for the warm-up
+      // shapes (real traffic decides which shapes deserve one); the EMA starts from the dynamic times, which is
+      // conservative and corrected by the first replays
+      const first = await this._direct(L, () => L.session.systemOne(state, qs, undefined, { graph: false }));
+      const timed = gpu ? await this._direct(L, () => L.session.systemOne(state, qs, undefined, { graph: false })) : first;
       L.model.observe(n, timed.stateAtStart, timed.ms, work);
       report[n] = { firstMs: first.ms, ms: timed.ms };
     }
@@ -530,12 +538,14 @@ export class LayaRouter {
         // temperature override travels with the call and is applied by the lane right before it runs.
         const run = await this._enqueue(L, choice.ownMs, (lane) => lane.session.systemOne(state, questions, o.calibration?.temperature_by_options, o.exec), rebind);
         L = run.L;
+        const exec = run.result.exec ?? null; // what the lane did (cuda: { mode: "graph"|"dynamic", bucket, remoteMs })
+        if (exec) delete run.result.exec;
         L.model.observe(n, run.stateAtStart, run.ms, work);
         L.calls++;
         L.healthy = true;
         L.failures = 0;
         const gpu = isGpuLane(L.lane);
-        const routing = { lane: L.lane, ms: run.ms, queueMs: run.queueMs, n, work, gpuState: run.stateAtStart, predictedMs: choice.predictedMs, ownMs: choice.ownMs, waitMs: choice.waitMs ?? 0, pendingAtChoice: choice.pending ?? 0, reason: choice.reason, explored: !!choice.explored, ...(L.lane !== provisionalLane ? { provisionalLane } : {}), alternatives: alternatives.filter((c) => c.lane !== L.lane).map((c) => ({ lane: c.lane, predictedMs: c.predictedMs })), load: { cpuOthers: this.load.cpuOthers, gpuOthersUtil: this.load.gpuOthersUtil } };
+        const routing = { lane: L.lane, ms: run.ms, queueMs: run.queueMs, n, work, gpuState: run.stateAtStart, predictedMs: choice.predictedMs, ownMs: choice.ownMs, waitMs: choice.waitMs ?? 0, pendingAtChoice: choice.pending ?? 0, reason: choice.reason, explored: !!choice.explored, ...(exec ? { exec } : {}), ...(L.lane !== provisionalLane ? { provisionalLane } : {}), alternatives: alternatives.filter((c) => c.lane !== L.lane).map((c) => ({ lane: c.lane, predictedMs: c.predictedMs })), load: { cpuOthers: this.load.cpuOthers, gpuOthersUtil: this.load.gpuOthersUtil } };
         this.history.push(routing);
         if (this.history.length > 1000) this.history.shift();
         if (gpu && this.opts.gpuKeepAliveMs > 0) this._scheduleKeepAlive(L);
@@ -570,7 +580,8 @@ export class LayaRouter {
       if (!L) return;
       if (!this.inflight.length) {
         try {
-          await this._enqueue(L, 30, () => L.session.systemOne("x", { k: { type: "noul", instructions: "keep-alive" } }));
+          // exec.graph = false: a synthetic shape must not earn a CUDA-graph bucket (buckets follow real traffic)
+          await this._enqueue(L, 30, () => L.session.systemOne("x", { k: { type: "noul", instructions: "keep-alive" } }, undefined, { graph: false }));
           this.keepAliveCalls = (this.keepAliveCalls ?? 0) + 1;
         } catch {
           /* ignore */
@@ -590,9 +601,18 @@ export class LayaRouter {
     return report;
   }
 
+  /** stats() plus what the process lanes report about themselves (cuda: captured buckets, hits, VRAM). */
+  async detailedStats() {
+    const s = this.stats();
+    for (const L of this.lanes.values()) {
+      if (typeof L.session.stats === "function") s.lanes[L.lane].process = await L.session.stats().catch(() => null);
+    }
+    return s;
+  }
+
   stats() {
     const lanes = {};
-    for (const L of this.lanes.values()) lanes[L.lane] = { healthy: L.healthy, dead: L.dead, mode: L.session.mode, calls: L.calls, pending: L.pending, failures: L.failures, loadMs: L.loadMs, probeMs: L.probeMs, share: L.model.share, ema: L.model.ema };
+    for (const L of this.lanes.values()) lanes[L.lane] = { healthy: L.healthy, dead: L.dead, mode: L.session.mode, calls: L.calls, pending: L.pending, failures: L.failures, loadMs: L.loadMs, probeMs: L.probeMs, share: L.model.share, ema: L.model.ema, ...(L.session.graph ? { cudaGraph: L.session.graph } : {}) };
     return { lanes, loading: [...this.loading], queue: { pending: this.inflight.length, waitMs: this.waitMs() }, load: this.load, sampling: !!this.sampling, processAffinity: this.processAffinity ?? null, keepAliveCalls: this.keepAliveCalls ?? 0, gpuState: thermalState(performance.now() - this.lastGpuWorkEnd) };
   }
 
