@@ -24,6 +24,7 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
 | GPU path = WebGPU EP; DirectML abandoned | `onnxruntime-node` does not build the CUDA EP for Windows at all (README matrix, `install-metadata.js` `requirements['win32/x64'] = []`, no CUDA symbols in the win32 binding) - a build gap, not a download gap. DML loads the graph but every inference fails in a `Reshape` node at all optimisation levels (same class as ORT issue #27118: DML + int64 indices in transformer graphs, closed stale). WebGPU works and matches CPU answers. |
 | fp16 bundle (`models/laya-onnx-fp16`) as the GPU default lane, built by `tools/optimize_graph.py` (2026-09-23) | The ORT profiler showed the export's 28 `IsNaN` NaN guards running on the CPU (WebGPU EP has no IsNaN): 28 GPU->CPU round trips per call, plus 196 Cast dispatches from the first converter's fp32 islands. Exact rewrites (`IsNaN` -> `Not(Equal(x,x))`, Reshape `allowzero` cleared, ORT Gelu fusion) + fp16 without islands: 2101 -> 1753 nodes, **1.87-2.13x faster** than the previous fp16 bundle (paired, interleaved, CI [0.448, 0.457] of fp32 time), arg-max agreement with fp32 134/134 + 118/120 = identical to before, same accuracy. Attention / RoPE / SkipLayerNorm patterns do not match this export - not hand-written (agreed stop point). Previous bundle kept as `models/laya-onnx-fp16-v1` for A/B. |
 | DirectML: fixed but not a lane | The failure was `Reshape(allowzero=1)` + `-1` (torch.export emits it for every `view`); clearing the attribute makes DML run on 1.30.0 and the nightly. 18-19 ms for 1 question (fastest EP) but 6-10x slower than WebGPU for batch > 1 even on a fixed shape (3 q 217 ms). Priors updated; not in the default lanes. |
+| CUDA lane as a Python process, default first lane (`cuda:fp16,webgpu:fp16,cpu:8`) (2026-09-23) | `onnxruntime-node` has no CUDA EP on Windows; the Python wheel has, and Microsoft's `onnxruntime-cuda-13` feed + NVIDIA's wheel index are reachable here (PyPI's file host is not). `tools/cuda_lane.py` (stdio, NDJSON + base64 tensors) behind `ProcessLane` / `RemoteSession` in `src/lane.mjs`, so `@receptron/laya` runs unchanged against a remote session. Paired ratio to fp32: **0.131 [0.130, 0.132]** vs 0.429 WebGPU (3.3x), 8.9 / 12.1 / 24.1 ms for 1 / 3 / 10 q; 195/195 arg-max agreement with WebGPU, accuracy = fp32. Dropped with a log line where the venv is missing, so the defaults work everywhere. User decision: default on if faster. |
 | The CPU lane keeps the pinned, hash-verified HF fp32 bundle | The same graph clean-up gives nothing on the CPU EP (1.030 [0.953, 1.058]; IsNaN is native there), fp16 on the CPU EP is not faster either. |
 | Gains are only claimed from `experiments/ab.mjs` | Variants in one process, interleaved rounds, paired ratio with bootstrap 95 % CI, fidelity vs a reference on any preset's eval set. Noise floor 1.000 [0.997, 1.001]. Sequential single runs on this machine swing 1.1-1.3x and cannot resolve a 5 % effect. |
 | CPU lanes pin 16 (or 8) intra-op threads to the P-cores | ORT's default 24-thread pool spans E-cores; Windows scheduling makes 3 questions take 215 ms or 1200 ms (p95 > 1.1 s in half the sessions). Pinning: p95 284-350 ms for ~10 % cost. `cpu:8` pinned equals `cpu:16` pinned at half the CPU share. |
@@ -57,10 +58,16 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
   `min-cpu`, `deadlineMs`, forced lane; quarantine + fallback, dead-lane handling; per-call calibration;
   `pauseSampling`/`resumeSampling`; P-core process affinity on Windows; `waitFor: "first"` + `warmup` +
   `onLaneReady` + `router.ready` for early serving; `close()` drains the queue.
-- **Lanes** (`src/lane.mjs`, `src/lane-worker.mjs`): one Laya session per lane in a worker thread (default) or
-  in-thread, same handle (`systemOne(state, questions, temps)`, `close()`, `onDeath`); per-call temperature
-  override applied inside the lane; workers unref'd while idle; ordered message handling so `close` never
-  releases a session under a running inference.
+- **Lanes** (`src/lane.mjs`, `src/lane-worker.mjs`, `tools/cuda_lane.py`): one Laya session per lane in a worker
+  thread (default), in-thread, or in a Python process (CUDA EP), same handle (`systemOne(state, questions, temps)`,
+  `close()`, `onDeath`); per-call temperature override applied inside the lane; workers unref'd while idle;
+  ordered message handling so `close` never releases a session under a running inference; the process lane
+  builds a stock `Laya` on a `RemoteSession` (run / release over stdio). `tools/setup-cuda-lane.mjs`
+  (`npm run cuda:setup` / `cuda:check`) installs the pinned wheels and verifies a CUDA session.
+- **Graph tool** (`tools/optimize_graph.py`, `npm run fp16:convert`): IsNaN -> Not(Equal), Reshape allowzero,
+  ORT Gelu fusion, fp16 without islands; `optimize-report.json` next to the bundle.
+- **A/B tool** (`experiments/ab.mjs`, `npm run fp16:check`): interleaved variants, paired ratio + bootstrap CI,
+  fidelity vs a reference on any preset's eval set (`--preset`, `--inputs`).
 - **Calibration** (`src/calibration.mjs`, `calibrate.mjs`, `data/`, `calibration/`): raw-logit capture,
   accuracy / NLL / Brier / ECE, reliability tables, per-bucket temperature refit with leave-one-out,
   majority/chance baselines with a verdict per question; generic `--preset --eval` for any domain.
@@ -78,10 +85,11 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
   `--stop` / `--idle` / `--max-age` / `--port`; client `waitAllLanes()`.
 - **Agent skill** (`skills/laya-decisions/`): `SKILL.md`, `references/api.md`, `references/presets.md`,
   `scripts/laya.mjs` (resolves the project via `LAYA_DIR`, runs `ask.mjs --sidecar --json`).
-- **Tests**: `npm test` (9 unit tests, no model; also in GitHub Actions on Ubuntu/Windows x Node 20/22 -
+- **Tests**: `npm test` (10 unit tests, no model; also in GitHub Actions on Ubuntu/Windows x Node 20/22 -
   `.github/workflows/unit-tests.yml`, not yet seen running on GitHub), `npm run test:router` (7 worker-lane /
-  failover / early-serving scenarios, ~35 s), `npm run test:sidecar` (13 lifecycle scenarios, ~65 s, port
-  8797), `npm run test:all`.
+  failover / early-serving scenarios, ~35 s), `npm run test:cuda` (3 process-lane scenarios: fidelity vs WebGPU
+  on the full eval set, kill -> failover, close / bad python; skipped without the venv), `npm run test:sidecar`
+  (13 lifecycle scenarios, ~60 s, port 8797), `npm run test:all`.
 
 ## Key measurements (this machine; treat as +-20 %)
 
@@ -91,7 +99,8 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
 | `cpu:8` (8 pinned) | 113 | 272 | 921 | 24 % | 1.6-1.8 GiB | 0 |
 | `webgpu` fp32 (HF export as is) | 30.5 | 53 | 143 | 2 % | 1.1 GiB | +1636 MiB |
 | `webgpu:fp16` first converter (2026-09-21) | 29.1 | 47 | 122 | 2 % | 0.6 GiB | +832 MiB |
-| **`webgpu:fp16` optimised graph (2026-09-23, current)** | **21.1** | **32.0** | **83.1** | 2 % | 0.6 GiB | +832 MiB |
+| `webgpu:fp16` optimised graph (2026-09-23) | 21.1 | 32.0 | 83.1 | 2 % | 0.6 GiB | +832 MiB |
+| **`cuda:fp16` process lane (2026-09-23, default first lane)** | **8.9** | **12.1** | **24.1** | 3 % | 1.0 GiB | +~1250 MiB |
 | `dml` optimised graph (not a lane) | 18-19 | 217 | 264 | | | |
 
 Sporadic 1-question calls (3 s gaps): WebGPU ~101 ms (was ~180), CPU ~105 ms. Sidecar: first call 3.1-4.5 s
@@ -102,7 +111,9 @@ during a 10-q CPU call 1.1 s -> 18 ms; two lanes load in 2.2-2.3 s instead of 3.
 smart-home intent 0.72, should_execute 0.66, target_device 0.77 (65 items); dev-request task 0.75, language
 0.85 (40 items) - unchanged by fp16 or the graph optimisation.
 
-Throughput (3 q per call, `results/throughput-*-summary.md`, optimised bundle): `webgpu:fp16` 30-31 calls/s
+Throughput (3 q per call, `results/throughput-*-summary.md`): `cuda:fp16` 66 calls/s with one caller, 83-86
+with 4-8 queued (12 ms per inference), 40/s offered served at 13 ms; 10 q 41 calls/s = 409 questions/s.
+`webgpu:fp16` (optimised bundle) 30-31 calls/s
 back-to-back (91-93 questions/s; was 19-21), 20/s offered served at 33 ms p50 (was 110-146 with a queue), 10/s
 at 35 ms, 5/s at 70 ms (GPU clocks sag between calls), 1 per 3 s at 156 ms; `cpu:8` 2.5-3.8 calls/s, saturates
 above ~3/s. Concurrency adds nothing (one FIFO): 8 callers = same calls/s, each waits ~130 ms. 1 q per call
@@ -112,7 +123,8 @@ calls/s at 4 callers and 6.6 at 8 (p95 1.5 s); after: equal to `prefer-gpu` at e
 ## Open items / next steps
 
 Ordered roughly by value. Done on 2026-09-23: sidecar serves from the first lane + `--max-age`, lanes in
-worker threads, `cpu:8` as the default CPU lane, `bench-all` defaults, GitHub Actions for the unit tests.
+worker threads, `cpu:8` as the default CPU lane, `bench-all` defaults, GitHub Actions for the unit tests,
+optimised fp16 graph (1.9-2.1x), CUDA process lane (another 3x), generic A/B tooling.
 
 1. **Real traffic, real labels.** Everything above is measured on hand-written examples. Collect 50+ real
    inputs per preset that matters, label them, run `calibrate.mjs`, act on the verdicts.
@@ -125,15 +137,20 @@ worker threads, `cpu:8` as the default CPU lane, `bench-all` defaults, GitHub Ac
 5. **Router**: the CPU lane is only chosen for sporadic small calls on a cold GPU and as a fallback - decide
    whether loading it is worth 1.6 GiB RAM on GPU machines; token-length feature is an estimate
    (`estimateWork`); the start-up EMA of a GPU lane warmed while CPU calls run is ~1.5x pessimistic for its
-   first few calls (self-corrects).
-6. **DirectML**: re-test with newer `onnxruntime-node` releases (Reshape `node_view` failure, ORT 1.30).
-   Nothing newer than the installed 1.30.0 exists as a stable release (published 2026-09-14); the proxy
-   also serves the nightlies (`1.31.0-dev.*`), so a retest is a 5-minute job whenever a new version lands.
-   Likely the int64-index class of DML bug (ORT #27118, closed stale); graph surgery (int32 indices) is the
-   only client-side lever.
-7. **Unmeasured presets** (`triage`, `guard`, `moderation`, `route`, `sentiment`): label and measure before
+   first few calls (self-corrects). The `cuda` priors' warm/cold rows are assumed from WebGPU's clock behaviour,
+   not measured (`experiments/sporadic.mjs` has no cuda mode yet).
+6. **CUDA lane, next steps**: CUDA Graph capture (`enable_cuda_graph`, `tools/cuda_lane.py --cuda-graph`) would
+   remove most of the ~9 ms launch floor but needs fixed input shapes -> pad `[n, L]` to shape buckets, one
+   capture per bucket. A TensorRT EP session would ride the same lane mechanism but needs the same bucketing.
+   For machines with a CUDA 12 driver: `node tools/setup-cuda-lane.mjs --cuda 12` (PyPI wheels; pinned but
+   untested here, PyPI's file host is blocked on this network).
+7. **DirectML**: works on the optimised graph (`allowzero` fix) and is the fastest EP for a single question
+   (18-19 ms) but 6-10x slower than WebGPU for batch > 1 on a fixed shape - cause unknown (not shape
+   recompilation). Not a lane. Worth a look only if single-question traffic dominates somewhere.
+8. **Unmeasured presets** (`triage`, `guard`, `moderation`, `route`, `sentiment`): label and measure before
    relying on them; the `guard` preset answering 100 % on obvious injections says nothing about subtle ones.
-8. **Housekeeping**: confirm the GitHub Actions run is green after the first push (written blind: no runner
+   `experiments/ab.mjs --preset <name>` validates fp16 / CUDA fidelity on any preset that has an eval file.
+9. **Housekeeping**: confirm the GitHub Actions run is green after the first push (written blind: no runner
    here; GitHub's runners reach `registry.npmjs.org`, this machine does not), `skills-ref validate` on the
    skill (tool not installed here), decide whether to publish the skill separately.
 
@@ -172,10 +189,12 @@ npm run test:router           # worker lanes, failover, early serving (~35 s, ne
 node ask.mjs --status         # is a sidecar running?
 node ask.mjs --sidecar "..."  # start using it
 npm run test:sidecar          # full lifecycle check (~1 min)
-npm run fp16:check            # fp16 bundle vs fp32 reference: speed (paired CI) + fidelity; add --preset <yours>
+npm run fp16:check            # fp16 + cuda lanes vs fp32 reference: speed (paired CI) + fidelity; add --preset <yours>
+npm run cuda:check            # is the Python side of the CUDA lane installed and working? (npm run cuda:setup to install)
 ```
 
 Models are in `models/` (ignored by git, 3.2 GB incl. the previous fp16 bundle `laya-onnx-fp16-v1`). If
 missing, `node poc.mjs` re-downloads and verifies the pinned fp32 bundle; `npm run fp16:convert` rebuilds the
 optimised fp16 bundle with `tools/optimize_graph.py` (needs `.venv`: `uv venv .venv` +
-`uv pip install --python .venv/Scripts/python.exe onnx onnxruntime`).
+`uv pip install --python .venv/Scripts/python.exe onnx onnxruntime`; `npm run cuda:setup` then swaps
+`onnxruntime` for `onnxruntime-gpu` + the CUDA / cuDNN wheels, ~1.6 GiB, from Microsoft's and NVIDIA's feeds).

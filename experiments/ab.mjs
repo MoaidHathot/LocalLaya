@@ -27,7 +27,8 @@
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parseArgs } from "node:util";
-import { loadLaya, parseWebgpuOptions, pinProcessToPCores } from "../src/laya-client.mjs";
+import { parseWebgpuOptions, pinProcessToPCores, resolveModelDir } from "../src/laya-client.mjs";
+import { openLane } from "../src/lane.mjs";
 import { parseLane } from "../src/ep-router.mjs";
 import { optionLabels } from "../src/calibration.mjs";
 import { cpuInfo, latencyStats, queryGpu } from "../src/metrics.mjs";
@@ -175,9 +176,10 @@ const gpu0 = await queryGpu();
 const sessions = [];
 for (const v of variants) {
   const t0 = performance.now();
-  const { laya, loadMs, modelDir } = await loadLaya({ ...v.loadOpts, log: () => {}, logSeverityLevel: 3 });
-  sessions.push({ ...v, laya, loadMs, modelDir });
-  log(`  ${v.label.padEnd(12)} ${v.lane}${v.loadOpts.modelDir ? ` @ ${v.loadOpts.modelDir}` : ""}${v.loadOpts.webgpuOptions ? ` ${JSON.stringify(v.loadOpts.webgpuOptions)}` : ""}: loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+  // in-thread sessions for the node EPs (this script measures the EP, not the worker hop); CUDA = the Python process lane
+  const handle = await openLane(v.lane, v.loadOpts, { worker: false, log: () => {} });
+  sessions.push({ ...v, laya: handle, loadMs: handle.loadMs, modelDir: resolveModelDir(v.loadOpts.modelDir), mode: handle.mode });
+  log(`  ${v.label.padEnd(12)} ${v.lane}${v.loadOpts.modelDir ? ` @ ${v.loadOpts.modelDir}` : ""}${v.loadOpts.webgpuOptions ? ` ${JSON.stringify(v.loadOpts.webgpuOptions)}` : ""}: loaded in ${((performance.now() - t0) / 1000).toFixed(1)} s (${handle.mode})`);
 }
 const gpu1 = await queryGpu();
 
@@ -261,6 +263,7 @@ for (const s of sessions) {
   report.variants.push({
     label: s.label,
     lane: s.lane,
+    mode: s.mode,
     modelDir: path.relative(process.cwd(), s.modelDir).replace(/\\/g, "/"),
     webgpuOptions: s.loadOpts.webgpuOptions ?? null,
     loadMs: s.loadMs,

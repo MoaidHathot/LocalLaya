@@ -18,7 +18,8 @@ Everything downloaded lives under this directory (`models/`, `node_modules/`, `.
 | `poc.mjs` | load once, answer 3 questions in one pass, 10 timed runs, sanity check on contrasting states |
 | `src/laya-client.mjs` | reusable loader: pinned HF revision, project-local cache, SHA256 verification, no network after first download, EP selection, P-core pinning (threads and, on Windows, the process), calibration, `createDecider()` facade |
 | `src/ep-router.mjs` | per-call execution-provider router (`LayaRouter`): probes lanes, predicts latency per (lane, GPU thermal state, question bucket, work), one FIFO queue for all lanes with the lane bound at the front of the queue, contention-aware, quarantines failing lanes, serves from the first lane while the others load |
-| `src/lane.mjs`, `src/lane-worker.mjs` | a lane = one Laya session in a worker thread (default) or in this thread, behind one handle: `systemOne(state, questions, temps)`, `close()`, death notification |
+| `src/lane.mjs`, `src/lane-worker.mjs`, `tools/cuda_lane.py` | a lane = one Laya session in a worker thread (default), in this thread, or in a Python process (CUDA EP over stdio), behind one handle: `systemOne(state, questions, temps)`, `close()`, death notification |
+| `tools/setup-cuda-lane.mjs` | `npm run cuda:setup` / `cuda:check`: onnxruntime-gpu (Microsoft's CUDA 13 feed) + CUDA / cuDNN wheels (NVIDIA's index) into `.venv`, pinned, verified with a CUDA session |
 | `router-demo.mjs` | the router under burst / sporadic / batch traffic, deadline and forced-lane calls |
 | `src/calibration.mjs`, `calibrate.mjs` | raw-logit capture, accuracy + NLL / Brier / ECE + reliability tables, per-bucket temperature refit with leave-one-out |
 | `data/smart-home-eval.mjs`, `data/question-variants.mjs` | 65 hand-labelled utterances; three question wordings (v1 original, v2 explicit, v3 best per question) |
@@ -29,7 +30,7 @@ Everything downloaded lives under this directory (`models/`, `node_modules/`, `.
 | `verify-model.mjs` | re-hash the cached bundle against the pinned SHA256 values |
 | `vendor/receptron-laya-0.1.2.tgz` | the exact published npm tarball (see Supply chain) |
 | `skills/laya-decisions/` | Agent Skill (agentskills.io format): `SKILL.md` + `references/` + `scripts/laya.mjs` wrapper; copy the folder into an agent's skills directory and set `LAYA_DIR` |
-| `test/unit.test.mjs`, `test/router.test.mjs`, `test/sidecar.test.mjs` | unit tests (router maths, latency model, calibration maths, presets, durations; no model needed - run in CI); router integration tests (worker lanes, failover, early serving; model needed); sidecar lifecycle tests |
+| `test/unit.test.mjs`, `test/router.test.mjs`, `test/cuda-lane.test.mjs`, `test/sidecar.test.mjs` | unit tests (router maths, latency model, session options, calibration maths, presets, durations; no model needed - run in CI); router integration tests (worker lanes, failover, early serving); CUDA process-lane tests (fidelity vs WebGPU, failover, close; skipped without the venv); sidecar lifecycle tests |
 | `.github/workflows/unit-tests.yml` | GitHub Actions: `npm ci` + syntax check + unit tests on Ubuntu / Windows, Node 20 / 22 (no model in CI) |
 
 ## Quick start
@@ -38,8 +39,9 @@ Everything downloaded lives under this directory (`models/`, `node_modules/`, `.
 npm install                 # deps via the configured registry; @receptron/laya from vendor/
 node poc.mjs                # first run downloads the pinned 1.7 GB bundle into models/ and verifies SHA256
 node poc.mjs --ep webgpu    # RTX 4070 through the WebGPU EP
-node router-demo.mjs        # auto CPU / GPU selection per call
-npm test                    # unit tests (no model needed); npm run test:router / test:sidecar need the model + GPU
+npm run cuda:setup          # optional, 3x faster GPU lane: onnxruntime-gpu + CUDA 13 / cuDNN wheels into .venv (see Results)
+node router-demo.mjs        # auto lane selection per call (cuda:fp16 if set up, webgpu:fp16, cpu:8)
+npm test                    # unit tests (no model needed); npm run test:router / test:cuda / test:sidecar need the model + GPU
 ```
 
 ## Ask it something
@@ -95,8 +97,8 @@ Each `node ask.mjs "..."` loads the model (~1.6 s, 0.4 GB RAM + 0.8 GB VRAM), an
 calling it at once = ten copies. `serve.mjs` keeps one copy forever, even when nobody calls. The middle ground:
 
 ```powershell
-node ask.mjs --sidecar "Lock the front door"   # first call: starts serve.mjs in the background (~3-4.5 s), answers
-node ask.mjs --sidecar "..."                    # every later call: ~0.15-0.4 s, no model load
+node ask.mjs --sidecar "Lock the front door"   # first call: starts serve.mjs in the background (~2.5-4.5 s), answers
+node ask.mjs --sidecar "..."                    # every later call: ~0.14-0.4 s, no model load
 $env:LAYA_SIDECAR = "1"                         # make --sidecar the default for a shell / orchestration
 node ask.mjs --status | --stop | --start [--idle 10m] [--max-age 12h] [--lanes ...]
 ```
@@ -109,26 +111,30 @@ node ask.mjs --status | --stop | --start [--idle 10m] [--max-age 12h] [--lanes .
   launchers racing at the same instant produce exactly one instance (the loser exits with code 3 without
   loading); callers arriving during the load wait for `status: ready`. Anything else on the port is
   detected via `/health` (`service: "laya"`) and never touched; the CLI then falls back to in-process.
-- Lanes live in worker threads and load side by side; the sidecar is ready as soon as the first lane has been
-  probed and warmed (~2.5 s), the other joins while it serves (`/health.lanesLoading`; a call that forces a
-  lane still loading gets a 503 the client retries). The main thread never runs an inference, so `/health`,
-  the idle timer and new requests are served while a 1 s CPU inference runs.
+- Default lanes `cuda:fp16,webgpu:fp16,cpu:8` (`--lanes`, `LAYA_LANES`): the CUDA lane is a Python process
+  (`npm run cuda:setup`; without it the lane is dropped with a log line and WebGPU serves), the others live in
+  worker threads; all load side by side and the sidecar is ready as soon as the first lane has been probed and
+  warmed (~2.4 s), the others join while it serves (`/health.lanesLoading`; a call that forces a lane still
+  loading gets a 503 the client retries). The main thread never runs an inference, so `/health`, the idle
+  timer and new requests are served while a 1 s CPU inference runs.
 - One queue: inferences of different lanes never run at the same time - mixing them is a net loss (see
   Results) - and a call is bound to a lane when it reaches the front of the queue, not when it is queued: 8
   parallel callers are served FIFO on the fastest lane (`routing.queueMs` tells you how long a call waited),
-  and calls queued during start-up move over to the GPU lane the moment it joins. Presets and calibration
+  and calls queued during start-up move over to a faster lane the moment it joins. Presets and calibration
   tables are re-read when their files change. Background CPU/GPU sampling pauses after 10 s idle.
 - Programs that would rather call HTTP directly: `node ask.mjs --start` prints `{ url, pid, lanes }` once every
   lane is loaded; then `POST /decide` (see Ask it something). `/health` shows `idleRemainingS`; `POST /touch` extends it.
 - The CLI client uses `node:http`, not `fetch`: on this Node (25.3, Windows) undici crashes the process at exit
   (`0xC0000409`) after a couple of requests - visible only as a wrong exit code.
 
-Measured here: first call 3.1-4.5 s (spawn + load + warm-up + answer; 5.0-6.3 s when the lanes loaded one after
-the other in the main thread), second call 143-366 ms; ready with the first lane 2.6-2.9 s after spawn, both lanes 3.5-3.8 s;
-8 parallel 5-question calls in 1.1-1.4 s on one lane, zero errors (2.6 s when the router still spread them
-over GPU + CPU; 7.6 s when a start-up burst was bound to the CPU lane before the GPU lane had joined - fixed by
-binding at the front of the queue); VRAM 5688 -> 4807 MiB after the idle exit. `npm run test:sidecar` runs
-the 13 lifecycle scenarios (~1 min; uses port 8797), `npm run test:router` the 7 worker-lane scenarios.
+Measured here: first call 2.5-4.5 s (spawn + load + warm-up + answer; 5.0-6.3 s when the lanes loaded one after
+the other in the main thread), second call 137-366 ms; ready with the first lane 2.4-2.9 s after spawn, all
+lanes 3.5-4.0 s; 8 parallel 5-question calls in **202 ms** on the CUDA lane, zero errors (676 ms on the
+optimised WebGPU lane, 1.1-1.4 s on the first fp16 bundle, 2.6 s when the router still spread them over GPU +
+CPU; 7.6 s when a start-up burst was bound to the CPU lane before the GPU lane had joined - fixed by binding
+at the front of the queue); VRAM 7077 -> 5090 MiB after the idle exit (three lanes). `npm run test:sidecar`
+runs the 13 lifecycle scenarios (~1 min; uses port 8797), `npm run test:router` the 7 worker-lane scenarios,
+`npm run test:cuda` the 3 process-lane scenarios (skipped without the venv).
 ## Using it from agents: the skill
 
 `skills/laya-decisions/` is an [Agent Skill](https://agentskills.io): `SKILL.md` tells an agent what Laya
@@ -209,7 +215,8 @@ Latency of one `systemOne` call, p50 ms, 20 runs back-to-back after warm-up:
 | `cpu:auto` ORT default (24 threads, unpinned) | 101 | 248 | 809 | 74 % | 1.6-1.8 GiB | 0 | - |
 | `webgpu` fp32 (pinned HF export as is) | 30.5 | 53 | 143 | 2 % | 1.1 GiB | +1636 MiB | 42-161 W |
 | `webgpu:fp16`, first converter (2026-09-21) | 29.1 | 47 | 122 | 2 % | 0.6 GiB | +832 MiB | 53-144 W |
-| **`webgpu:fp16`, optimised graph (2026-09-23, current)** | **21.1** | **32.0** | **83.1** | 2 % | 0.6 GiB | +832 MiB | 38-166 W |
+| `webgpu:fp16`, optimised graph (2026-09-23) | 21.1 | 32.0 | 83.1 | 2 % | 0.6 GiB | +832 MiB | 38-166 W |
+| **`cuda:fp16`, same bundle in a Python process (2026-09-23, default first lane)** | **8.9** | **12.1** | **24.1** | 3 % | 1.0 GiB (process) | +~1250 MiB incl. CUDA context | - |
 | `dml` (DirectML), optimised graph | 18-19 | 217 | 264 | | | | batch > 1 pathological, not a lane |
 
 Model-card reference on a Tesla T4 (PyTorch): 39.5 ms (1 q), 158.6 ms (10 q). All lanes return identical
@@ -225,6 +232,10 @@ the optimised fp16 bundle (the 2026-09-21 numbers in brackets):
 
 | lane | calls/s | questions/s | per minute | latency at that rate |
 |---|---|---|---|---|
+| **`cuda:fp16`, back-to-back, 1 caller** | **66** | 198 | ~4000 | 14 ms |
+| **`cuda:fp16`, 4-8 callers queued** | **83-86** | 250-260 | ~5000 | 12 ms per inference, 48-92 ms end to end |
+| `cuda:fp16`, 40 calls/s offered | 40 | 120 | 2400 | 13 ms |
+| `cuda:fp16`, 10 questions per call | 41 | **409** | 2460 | 24 ms |
 | `webgpu:fp16`, back-to-back | **30-31** (19-21) | 91-93 | ~1800 | 32-33 ms |
 | `webgpu:fp16`, 20 calls/s offered | 20 (queued) | 60 | 1200 | 33 ms (110-146 with a queue) |
 | `webgpu:fp16`, 10 calls/s offered | 10 | 30 | 600 | 35 ms (53-60) |
@@ -233,13 +244,13 @@ the optimised fp16 bundle (the 2026-09-21 numbers in brackets):
 | `cpu:8`, back-to-back | 2.5-3.8 | 7-11 | 150-230 | 260-375 ms |
 | `cpu:8`, anything above ~3 calls/s | saturates | | | queue grows without bound |
 
-1 question per call runs ~1.5x more calls/s than 3 questions (~47/s hot GPU), 10 questions ~0.4x (12/s),
-so batching questions into one call is the lever: ~120 questions/s at 10 per call vs ~47 at 1 per call. With
-8 callers in parallel the throughput is the same as with 1; each caller just sees `queueMs` grow (8 x 3 q:
-p50 ~130 ms end to end at 31 calls/s).
+Batching questions into one call is the lever, most of all on CUDA where the per-call cost is almost flat:
+409 questions/s at 10 per call vs 96 at 1 per call (WebGPU: ~120 vs ~47). Parallel callers do not add
+throughput on WebGPU (one FIFO; each caller just sees `queueMs` grow) and add ~30 % on CUDA (the process
+pipelines the next request while the GPU finishes the current one).
 
-Deployment overhead on top: HTTP `serve.mjs` +1-3 ms; `ask.mjs --sidecar` (new CLI process per call) ~150 ms
-per call, so ~6 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1.5-2.5 s load every time.
+Deployment overhead on top: HTTP `serve.mjs` +1-3 ms; `ask.mjs --sidecar` (new CLI process per call) ~140 ms
+per call, so ~7 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1.5-2.5 s load every time.
 
 ### Findings that change how you should run it
 
@@ -312,17 +323,33 @@ per call, so ~6 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1
     bundle, the two flips being near-ties (0.426 vs 0.419) - and identical accuracy. The same clean-up does
     nothing for the CPU lane (1.03 [0.95, 1.06]), which keeps the pinned, hash-verified HF bundle. Details:
     `results/graph-opt-2026-09-23-summary.md`.
+11. **CUDA lane in a Python process: another 3x, same answers.** `onnxruntime-node` has no CUDA EP on Windows,
+    but the Python wheel has, and Microsoft's release feed for the CUDA 13 build plus NVIDIA's wheel index are
+    reachable where PyPI's file host is not (`npm run cuda:setup`, pinned versions, ~1.6 GiB). `tools/cuda_lane.py`
+    holds one CUDA session and answers over stdio; `src/lane.mjs` presents it behind the same handle as the
+    worker lanes, with a `RemoteSession` implementing the two methods `@receptron/laya` calls, so nothing of
+    the sequence logic is duplicated. The CUDA EP is launch-bound at ~9-12 ms for this graph and almost flat in
+    batch size: 8.9 / 12.1 / 24.1 ms for 1 / 3 / 10 questions vs 21 / 32 / 83 on WebGPU (stdio round trip +
+    tokenising 0.7-1.8 ms of that; 2 CPU-side threads on the P-cores - the unpinned default measured 20 ms).
+    Paired ratio to fp32 (`experiments/ab.mjs`): **0.131 [0.130, 0.132]** vs 0.429 for WebGPU on PoC +
+    smart-home (3.3x), 0.140 vs 0.423 on dev-request (3.0x); arg-max agreement with fp32 134/134 and 119/120,
+    195/195 with the WebGPU lane over the full eval set (max |dp| 0.035), same accuracy. Throughput 66 calls/s
+    (3 q, one caller), 83-86 with a queue, 409 questions/s at 10 per call. Killing the Python process fails
+    in-flight calls over and marks the lane gone (`test/cuda-lane.test.mjs`); without the venv the lane is
+    dropped at start-up and WebGPU serves. Details: `results/cuda-lane-2026-09-23-summary.md`.
 
 ## The execution-provider router (`src/ep-router.mjs`)
 
-Lanes: `webgpu`, `webgpu:fp16`, `dml`, `cpu` (16 threads pinned), `cpu:8` (8 pinned), `cpu:24:nopin`, `cpu:auto`.
-Default `webgpu` + `cpu:8` (`cpu:8` equals `cpu` in latency at half the CPU share). Each lane is a separate
-`Laya` session in its own worker thread (`workers: false` for in-thread sessions); RAM ~1.6 GiB per CPU lane,
-~1.1 / 0.6 GiB + VRAM per GPU lane.
+Lanes: `cuda`, `cuda:fp16` (Python process, finding 11), `webgpu`, `webgpu:fp16`, `dml`, `cpu` (16 threads pinned),
+`cpu:8` (8 pinned), `cpu:24:nopin`, `cpu:auto`. Default `cuda:fp16` + `webgpu:fp16` + `cpu:8` (a lane that cannot
+load is dropped; `cpu:8` equals `cpu` in latency at half the CPU share). Each lane is a separate `Laya` session in
+its own worker thread (`workers: false` for in-thread sessions) or process; RAM ~1.6 GiB per CPU lane, ~1.1 / 0.6 GiB
++ VRAM per WebGPU lane, ~1.0 GiB + ~1.25 GiB VRAM for the CUDA process.
 
-- **Probe**: every lane is loaded and must pass a real inference; DML is dropped here. A lane that throws later is
-  quarantined for 60 s and the call is retried on the next-best lane; a lane whose worker exits is marked gone,
-  its in-flight calls fail over, and it is never picked again.
+- **Probe**: every lane is loaded and must pass a real inference; a lane that cannot load (no venv for `cuda`,
+  no GPU, DML on an unfixed graph) is dropped with a log line. A lane that throws later is quarantined for 60 s
+  and the call is retried on the next-best lane; a lane whose worker or process exits is marked gone, its
+  in-flight calls fail over, and it is never picked again.
 - **Start-up**: lanes load in parallel; with `waitFor: "first"` (what `serve.mjs` uses) `create()` returns as soon
   as one lane has been probed and warmed (`warmup: { state, sizes }`), the others join while calls are served
   (`router.pendingLanes`, `router.ready`, `onLaneReady`). Probes and warm-ups run outside the FIFO so a lane

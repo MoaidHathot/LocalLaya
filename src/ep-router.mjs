@@ -60,9 +60,12 @@ export const DEFAULT_PRIORS = {
   },
   // DirectML runs the optimised graph (allowzero=0) but is 6-10x slower than WebGPU for batch > 1 (measured 2026-09-23)
   dml: { share: 0.03, ms: { hot: { "1": 19, "2-3": 217, "4-6": 240, "7-10": 264, "11+": 330 }, warm: { "1": 50, "2-3": 250, "4-6": 280, "7-10": 300, "11+": 380 }, cold: { "1": 110, "2-3": 320, "4-6": 350, "7-10": 380, "11+": 470 } } },
+  // CUDA EP in a Python process (tools/cuda_lane.py): launch-bound at ~20 ms, almost flat in batch size (measured 2026-09-23,
+  // in-process session; the stdio round trip adds ~1 ms); cold-clock penalty assumed like WebGPU
+  cuda: { share: 0.03, ms: { hot: { "1": 22, "2-3": 23, "4-6": 25, "7-10": 28, "11+": 36 }, warm: { "1": 50, "2-3": 55, "4-6": 60, "7-10": 70, "11+": 90 }, cold: { "1": 105, "2-3": 115, "4-6": 125, "7-10": 140, "11+": 170 } } },
 };
 
-export const isGpuLane = (lane) => lane.startsWith("webgpu") || lane.startsWith("dml");
+export const isGpuLane = (lane) => lane.startsWith("webgpu") || lane.startsWith("dml") || lane.startsWith("cuda");
 /** Bundle directory used by the ":fp16" lane variant (output of tools/optimize_graph.py). */
 export const FP16_MODEL_DIR = process.env.LAYA_FP16_DIR ?? "models/laya-onnx-fp16";
 /**
@@ -200,7 +203,7 @@ export class LayaRouter {
 
   /**
    * @param {object} o
-   * @param {string[]} [o.lanes=["webgpu","cpu:8"]] lanes to load; a lane whose load or probe fails is dropped
+   * @param {string[]} [o.lanes=["cuda:fp16","webgpu:fp16","cpu:8"]] lanes to load; a lane whose load or probe fails is dropped (e.g. cuda without the Python venv)
    * @param {"auto"|"prefer-gpu"|"prefer-cpu"|"min-cpu"} [o.policy="auto"]
    * @param {number} [o.explore=0.05]                exploration probability (auto policy, idle only)
    * @param {string|object} [o.calibration]          applied to every lane (see loadLaya)
@@ -209,6 +212,8 @@ export class LayaRouter {
    * @param {number} [o.minGpuFreeMiB=2200]          skip GPU lanes when less VRAM than this is free
    * @param {boolean} [o.pinProcess=true]            Windows hybrid CPUs: restrict the process to the P-cores (see pinProcessToPCores)
    * @param {boolean} [o.workers=true]               run each lane's session in a worker thread (lane.mjs); false = in this thread
+   * @param {string} [o.python]                      Python with onnxruntime-gpu for cuda lanes (default LAYA_PYTHON or .venv/Scripts/python.exe)
+   * @param {number} [o.deviceId]                    GPU index for cuda / dml lanes (default 0)
    * @param {{state?:object, sizes?:number[]}} [o.warmup]  warm every lane (shader compile, EMA priming) before it serves
    * @param {"all"|"first"} [o.waitFor="all"]        resolve when every lane is done, or as soon as the first lane serves;
    *                                                 `router.ready` resolves when all lanes are done either way
@@ -216,7 +221,7 @@ export class LayaRouter {
    * @param {(m:string)=>void} [o.log]
    */
   static async create(o = {}) {
-    const r = new LayaRouter({ lanes: ["webgpu", "cpu:8"], policy: "auto", explore: 0.05, sampleLoad: true, gpuKeepAliveMs: 0, minGpuFreeMiB: 2200, pinProcess: true, workers: true, warmup: null, waitFor: "all", onLaneReady: null, ...o });
+    const r = new LayaRouter({ lanes: ["cuda:fp16", "webgpu:fp16", "cpu:8"], policy: "auto", explore: 0.05, sampleLoad: true, gpuKeepAliveMs: 0, minGpuFreeMiB: 2200, pinProcess: true, workers: true, warmup: null, waitFor: "all", onLaneReady: null, ...o });
     // in the background: overlaps with the model loads, done before the first call
     const pinned = r.opts.pinProcess ? pinProcessToPCores({ log: r.log }) : Promise.resolve({ applied: false, reason: "disabled" });
     const gpu = await queryGpu();
@@ -258,7 +263,7 @@ export class LayaRouter {
     const t0 = performance.now();
     let session = null;
     try {
-      session = await openLane(lane, { ep, threads, pinToPCores: pin, modelDir, calibration: this.opts.calibration }, { worker: this.opts.workers, log: () => {} });
+      session = await openLane(lane, { ep, threads, pinToPCores: pin, modelDir, calibration: this.opts.calibration, python: this.opts.python, deviceId: this.opts.deviceId }, { worker: this.opts.workers, log: () => {} });
       if (this.closed) throw new Error("router closed while loading");
       const L = { lane, session, model: new LatencyModel(lane), healthy: true, dead: false, failures: 0, quarantinedUntil: 0, calls: 0, pending: 0, loadMs: session.loadMs, probeMs: 0 };
       session.onDeath((cause) => this._laneDied(L, cause));

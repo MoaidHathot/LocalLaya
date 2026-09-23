@@ -1,7 +1,7 @@
 /**
  * Experiment: throughput (calls/s, questions/s) and latency of the router's lanes under load.
  *
- *   node experiments/throughput.mjs                                   # lanes webgpu:fp16,cpu:8 ; 3 questions
+ *   node experiments/throughput.mjs                                   # lanes cuda:fp16,webgpu:fp16,cpu:8 ; 3 questions
  *   node experiments/throughput.mjs --questions 5                     # 5 questions per call
  *   node experiments/throughput.mjs --lanes webgpu:fp16,cpu --quick   # 16-thread CPU lane, shorter runs
  *   node experiments/throughput.mjs --scenarios A,C                   # subset of the scenarios below
@@ -33,7 +33,7 @@ import { STATE, QUESTIONS_10 } from "../src/questions.mjs";
 
 const { values: args } = parseArgs({
   options: {
-    lanes: { type: "string", default: "webgpu:fp16,cpu:8" },
+    lanes: { type: "string", default: "cuda:fp16,webgpu:fp16,cpu:8" },
     questions: { type: "string", default: "3" },
     scenarios: { type: "string", default: "A,B,C,D" },
     concurrency: { type: "string", default: "1,2,4,8" },

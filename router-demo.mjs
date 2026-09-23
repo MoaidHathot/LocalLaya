@@ -1,7 +1,7 @@
 /**
  * Demo of the execution-provider router under the traffic patterns that matter for a desktop assistant.
  *
- *   node router-demo.mjs                              # lanes webgpu + cpu:8 (the defaults), policy auto, lanes in worker threads
+ *   node router-demo.mjs                              # lanes cuda:fp16 + webgpu:fp16 + cpu:8 (the defaults; cuda is dropped without the venv), policy auto
  *   node router-demo.mjs --lanes webgpu:fp16,cpu      # fp16 GPU bundle + the 16-thread CPU lane
  *   node router-demo.mjs --lanes webgpu,cpu,dml       # dml is probed and dropped (fails at inference here)
  *   node router-demo.mjs --in-process                 # sessions in this thread (blocks the event loop per call)
@@ -15,7 +15,7 @@ import { STATE, QUESTIONS_1, QUESTIONS_3, QUESTIONS_10 } from "./src/questions.m
 
 const { values: args } = parseArgs({
   options: {
-    lanes: { type: "string", default: "webgpu,cpu:8" },
+    lanes: { type: "string", default: "cuda:fp16,webgpu:fp16,cpu:8" },
     policy: { type: "string", default: "auto" },
     keepalive: { type: "string", default: "0" },
     calibration: { type: "string" },

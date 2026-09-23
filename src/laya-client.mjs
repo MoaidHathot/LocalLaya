@@ -51,6 +51,9 @@ export const MODEL_DIR = path.join(CACHE_DIR, MODEL_REPO.replace("/", "--"), MOD
 
 export const SUPPORTED_EPS = ["cpu", "dml", "webgpu"];
 
+/** Absolute bundle directory: the pinned fp32 download when `modelDir` is not given, else project-relative. */
+export const resolveModelDir = (modelDir) => (modelDir ? path.resolve(PROJECT_ROOT, modelDir) : MODEL_DIR);
+
 async function exists(p) {
   try {
     await access(p);
@@ -194,7 +197,7 @@ export function parseWebgpuOptions(spec) {
 }
 
 export function buildSessionConfig(ep = "cpu", { threads, deviceId = 0, logSeverityLevel, optLevel, pinToPCores = false, affinity, webgpuOptions } = {}) {
-  if (!SUPPORTED_EPS.includes(ep)) throw new Error(`unsupported ep "${ep}" (Windows x64 options: ${SUPPORTED_EPS.join(", ")})`);
+  if (!SUPPORTED_EPS.includes(ep)) throw new Error(`unsupported ep "${ep}" (in-process options on Windows x64: ${SUPPORTED_EPS.join(", ")}; "cuda" runs as a process lane via src/lane.mjs openLane / the router)`);
   const sessionOptions = {};
   if (logSeverityLevel !== undefined) sessionOptions.logSeverityLevel = logSeverityLevel;
   // "disabled" | "basic" | "extended" | "all" (Laya defaults to "all"; lower levels can work around EP-specific fusion bugs)

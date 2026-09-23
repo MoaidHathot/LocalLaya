@@ -7,7 +7,7 @@
  *   node serve.mjs --idle 5m               # exit after 5 minutes without requests (frees RAM + VRAM); 30s, 10m, 0 = never
  *   node serve.mjs --sidecar               # spawned by ask.mjs: --idle defaults to $LAYA_IDLE or 5m
  *   node serve.mjs --max-age 12h           # recycle: exit (once nothing is in flight) after this long; the next call spawns a fresh one
- *   node serve.mjs --port 9000 --lanes webgpu:fp16,cpu:8
+ *   node serve.mjs --port 9000 --lanes webgpu:fp16,cpu:8     # default cuda:fp16,webgpu:fp16,cpu:8 (cuda dropped without the venv)
  *   node serve.mjs --calibration calibration/smart-home-v3.json   # one table for every preset (default: per preset,
  *                                                                 # calibration/<preset>.json when present)
  *   node serve.mjs --cors                  # allow browser pages from other origins to call the API (off by default)
@@ -54,7 +54,7 @@ const { values: args } = parseArgs({
   options: {
     port: { type: "string", default: process.env.LAYA_PORT ?? "8787" },
     host: { type: "string", default: "127.0.0.1" },
-    lanes: { type: "string", default: process.env.LAYA_LANES ?? "webgpu:fp16,cpu:8" },
+    lanes: { type: "string", default: process.env.LAYA_LANES ?? "cuda:fp16,webgpu:fp16,cpu:8" },
     calibration: { type: "string" },
     cors: { type: "boolean", default: false },
     idle: { type: "string" },

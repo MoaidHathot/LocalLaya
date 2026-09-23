@@ -24,6 +24,10 @@ import { queryGpu } from "../src/metrics.mjs";
 const PORT = 8797;
 const run = promisify(execFile);
 const node = process.execPath;
+/** serve.mjs default lanes; the CUDA lane is dropped by the router on machines without the Python venv (npm run cuda:setup) */
+const DEFAULT_LANES = ["cuda:fp16", "webgpu:fp16", "cpu:8"];
+let EXPECTED_LANES = DEFAULT_LANES;
+const isGpu = (lane) => /^(webgpu|cuda|dml)/.test(lane);
 const ask = (args, opts = {}) => run(node, ["ask.mjs", "--port", String(PORT), ...args], { cwd: PROJECT_ROOT, timeout: 180_000, ...opts });
 /** Run ask.mjs with a scripted stdin (the REPL); execFile has no `input` option, spawnSync would block the loop. */
 const askStdin = (args, script) =>
@@ -63,6 +67,9 @@ const waitGone = async (port, ms = 30_000) => {
 
 before(async () => {
   await stop({ port: PORT }).catch(() => {});
+  const cudaOk = await run(node, ["tools/setup-cuda-lane.mjs", "--check"], { cwd: PROJECT_ROOT, timeout: 60_000 }).then(() => true, () => false);
+  EXPECTED_LANES = cudaOk ? DEFAULT_LANES : DEFAULT_LANES.filter((l) => l !== "cuda:fp16");
+  console.log(`      expected lanes: ${EXPECTED_LANES.join(", ")} (CUDA lane ${cudaOk ? "available" : "not available on this machine"})`);
 });
 after(async () => {
   await stop({ port: PORT }).catch(() => {});
@@ -137,7 +144,7 @@ test("8 parallel callers: zero errors, one queue, no spill to the CPU lane", asy
   // inferences never overlap in one process (onnxruntime-node runs synchronously on the JS thread), so a burst
   // stays on the fastest lane: a CPU call in the middle would stall every GPU call behind it
   assert.equal(lanes.size, 1, `expected a burst to stay on one lane, got ${[...lanes].join(", ")}`);
-  const gpu = results.filter((r) => r.routing.lane.startsWith("webgpu"));
+  const gpu = results.filter((r) => isGpu(r.routing.lane));
   if (gpu.length) assert.ok(gpu.every((r) => r.routing.ms < 600), `GPU inferences should not be stalled by other lanes: ${gpu.map((r) => r.routing.ms.toFixed(0)).join(", ")} ms`);
 });
 
@@ -248,7 +255,7 @@ test("--start makes it ready and prints connection info; a foreground serve on t
     const info = JSON.parse(s.stdout);
     assert.equal(info.url, `http://127.0.0.1:${PORT}`);
     assert.ok(info.spawned);
-    assert.deepEqual(info.lanes, ["webgpu:fp16", "cpu:8"], "--start reports every lane, in the configured order, once all are loaded");
+    assert.deepEqual(info.lanes, EXPECTED_LANES, "--start reports every lane, in the configured order, once all are loaded");
     const again = JSON.parse((await ask(["--start"])).stdout);
     assert.equal(again.spawned, false);
     assert.equal(again.pid, info.pid);
@@ -269,20 +276,20 @@ test("ready as soon as the first lane serves; a call forced onto a lane still lo
     const h = await waitReady({ port: PORT, child });
     const readyMs = Date.now() - t0;
     assert.ok(h.lanes.length >= 1);
-    assert.equal(h.lanes.length + h.lanesLoading.length, 2, `lanes ${h.lanes} + loading ${h.lanesLoading}`);
+    assert.ok(h.lanes.length + h.lanesLoading.length >= EXPECTED_LANES.length, `lanes ${h.lanes} + loading ${h.lanesLoading}`);
     assert.equal(h.workers, true);
     // the forced lane may still be loading: the server answers 503 + retryAfterMs and the client retries
     const r = await decide({ preset: "smart-home", text: "Turn off the living room lights", lane: "cpu:8" }, { port: PORT });
     assert.equal(r.routing.lane, "cpu:8");
     assert.equal(r.answers.intent.choice, "control_device");
     const all = await waitAllLanes({ port: PORT });
-    assert.deepEqual(all.lanes, ["webgpu:fp16", "cpu:8"], "configured order, whatever the load order was");
+    assert.deepEqual(all.lanes, EXPECTED_LANES, "configured order, whatever the load order was");
     assert.deepEqual(all.lanesLoading, []);
     const allMs = Date.now() - t0;
     const log = await readFile(logFileFor(PORT), "utf8");
     const tail = log.slice(log.lastIndexOf("listening on"));
     assert.match(tail, /ready in [\d.]+ s with /);
-    assert.match(tail, /all lanes ready in [\d.]+ s: webgpu:fp16, cpu:8/);
+    assert.match(tail, new RegExp(`all lanes ready in [\\d.]+ s: ${EXPECTED_LANES.join(", ")}`));
     console.log(`      ready with ${h.lanes.join(",")} after ${readyMs} ms${h.lanesLoading.length ? ` (${h.lanesLoading.join(",")} still loading)` : ""}; all lanes after ${allMs} ms`);
     // a lane that does not exist is a 400, not a retry loop
     await assert.rejects(decide({ preset: "smart-home", text: "x", lane: "cpu:99" }, { port: PORT }), (e) => e.code === "BAD_REQUEST" && /not loaded/.test(e.message));
@@ -298,7 +305,7 @@ test("ready as soon as the first lane serves; a call forced onto a lane still lo
     console.log(`      8-call burst right after start (${h2.lanes.join(",")} ready, ${h2.lanesLoading.join(",") || "nothing"} loading): ${burstMs} ms on ${[...new Set(lanes)].join(" + ")}${burst.some((b) => b.routing.provisionalLane) ? ", some calls re-bound to a lane that joined" : ""}`);
     assert.ok(burst.every((b) => b.answers.intent), "every call answered");
     assert.ok(burstMs < 5000, `burst took ${burstMs} ms (all on the CPU lane would take ~8 s)`);
-    assert.ok(lanes.includes("webgpu:fp16"), `the GPU lane took part: ${lanes.join(", ")}`);
+    assert.ok(lanes.some(isGpu), `a GPU lane took part: ${lanes.join(", ")}`);
   } finally {
     await stop({ port: PORT }).catch(() => {});
   }

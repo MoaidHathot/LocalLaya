@@ -167,6 +167,39 @@ User: "go ahead; keep it generic (more presets coming); make sure the gains are 
 Numbers worth remembering (updated): `webgpu:fp16` 3 q 32 ms / 30 calls/s / 92 questions/s; 1 q 21 ms; 10 q
 83 ms; the two fp16 arg-max flips on dev-request are 0.426 vs 0.419 and 0.194 vs 0.192.
 
+## Phase 8 - the CUDA process lane
+
+- **The real fetch limit, stated precisely this time**: `pypi.org` answers but `files.pythonhosted.org` (every
+  PyPI wheel) and `api.nuget.org` are TLS-blocked. Reachable: Microsoft's ORT release feeds on
+  `aiinfra.pkgs.visualstudio.com` (`onnxruntime-cuda-13` has `onnxruntime-gpu` 1.30.0 cp312/win_amd64 built for
+  CUDA 13; `onnxruntime-cuda-12` only dev builds; `ORT-Nightly` 1.31 dev), NVIDIA's `pypi.nvidia.com` (CUDA 13.x
+  runtime wheels un-suffixed: `nvidia-cublas` 13.x etc., plus `nvidia-cudnn-cu13`). Installed with `--no-deps`
+  (Python deps already present): CUDA 13.2 libs matching the driver's "CUDA 13.2", cuDNN 9.14.
+- First CUDA session (Python, random tokens, default 24 threads): 20 ms flat for 1-10 questions. In the lane
+  (2 threads, P-core affinity): **8.9 / 12.1 / 24.1 ms** for 1 / 3 / 10 q - the E-core effect once more.
+- `tools/cuda_lane.py` (stdio NDJSON, base64 tensors, ordered) + `ProcessLane` / `RemoteSession` in
+  `src/lane.mjs`: a stock `Laya` is built on the remote session (`new Laya(session, tok, config, ids, dir)` - the
+  constructor is public), so nothing of the sequence logic is ported. `openLane` dispatches `PROCESS_EPS`.
+- Pitfalls: `preload_dlls(verbose=...)` does not exist in 1.30 and the failed call left the CUDA DLLs off the
+  path ("cublasLt64_13.dll missing"); Python's stderr came out UTF-16 (`PYTHONUTF8=1`, `PYTHONIOENCODING`);
+  ORT 1.30 prints a "No registered plugin EP device" notice (`set_default_logger_severity`); `--input-type`
+  piped scripts break worker threads (test artefact, not a bug).
+- **A/B** (vs fp32 WebGPU): cuda **0.131 [0.130, 0.132]** vs webgpu 0.429 (PoC + smart-home, 3.3x); 0.140 vs
+  0.423 (dev-request, 3.0x). Fidelity 134/134 and 119/120 vs fp32, 195/195 vs WebGPU over the full eval set,
+  accuracy = fp32. Throughput 66 calls/s (3 q), 83-86 with a queue, 409 questions/s at 10 q.
+- Router: `cuda` in `isGpuLane`, priors, `python` / `deviceId` options; defaults `cuda:fp16,webgpu:fp16,cpu:8`
+  everywhere (serve, ask, router-demo, throughput); `ask.mjs` one-shot uses `waitFor: "first"` and no load
+  sampling. `tools/setup-cuda-lane.mjs` (`npm run cuda:setup` / `cuda:check`) pins the versions and verifies a
+  CUDA session. Sidecar tests derive the expected lane list from a CUDA availability probe.
+- `test/cuda-lane.test.mjs` (3 scenarios, skipped without the venv): fidelity + temps override + speed sanity;
+  hot burst on cuda, `process.kill(pid)` mid-queue -> queued calls fail over to `cpu:8`, lane gone, no leaks;
+  `close()` ends the process, bad python path -> "unavailable" in the router log, other lanes serve.
+- Sidecar: first call 2.5 s, 8 parallel 5-q calls **202 ms** (day started at 2576 ms), idle exit frees ~2 GB VRAM.
+
+Day total for the GPU lane (3 questions, 8 parallel callers): 2576 ms -> 1381 (queue fix) -> 676 (graph) ->
+202 ms (CUDA); single call 47 ms -> 12 ms; throughput 19-21 -> 66-86 calls/s. Every step measured
+interleaved against the previous one and against the fp32 reference for fidelity.
+
 ## Numbers worth remembering (2026-09-21/23, before the graph optimisation where GPU numbers are given)
 
 - `webgpu:fp16` 3 q: 19-21 calls/s back-to-back (57-63 questions/s), 10/s at 53-60 ms, 5/s at 61-85 ms,

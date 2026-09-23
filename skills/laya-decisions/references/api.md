@@ -92,9 +92,10 @@ Errors: 400 with `{ error }` for bad input (unknown preset, invalid questions, m
 
 - Started by `ask.mjs --sidecar` / `--start` as `node serve.mjs --sidecar --idle <dur> [--max-age <dur>]`,
   detached, hidden window, log appended to `.laya/sidecar-<port>.log` in the project.
-- Binds the port before loading; racing launchers -> one instance (loser exits 3). Lanes load in parallel in
-  worker threads; `status: ready` comes as soon as the first lane is probed and warmed (~2.5 s after spawn),
-  the other lane joins ~1 s later (`/health.lanesLoading`). Callers during the load wait for `ready`; a
+- Binds the port before loading; racing launchers -> one instance (loser exits 3). Lanes (default `cuda:fp16`
+  in a Python process, `webgpu:fp16` and `cpu:8` in worker threads) load in parallel; `status: ready` comes as
+  soon as the first lane is probed and warmed (~2.4 s after spawn), the others join ~1-1.5 s later
+  (`/health.lanesLoading`). Callers during the load wait for `ready`; a
   `/decide` that forces a lane still loading gets `503 { retryAfterMs }` (the CLI client retries).
 - Exits on its own after `idle` without `/decide` or `/touch` calls, with nothing in flight, and at `maxAge`
   if set. RAM and VRAM are released; the next call spawns a new one.
@@ -112,6 +113,7 @@ Errors: 400 with `{ error }` for bad input (unknown preset, invalid questions, m
 | `LAYA_PORT` | sidecar port (default 8787) |
 | `LAYA_IDLE` | default idle exit (default `5m`) |
 | `LAYA_MAX_AGE` | default max age before the sidecar recycles itself (default never) |
-| `LAYA_LANES` | default lanes for `serve.mjs` (default `webgpu:fp16,cpu:8`) |
+| `LAYA_LANES` | default lanes for `serve.mjs` (default `cuda:fp16,webgpu:fp16,cpu:8`; `cuda:fp16` needs the Python venv from `npm run cuda:setup` and is dropped otherwise) |
+| `LAYA_PYTHON` | Python with onnxruntime-gpu for the CUDA lane (default `<project>/.venv/Scripts/python.exe`) |
 | `LAYA_CACHE` | model cache directory (default `<project>/models`) |
 | `LAYA_PCORE_LOGICAL` | number of logical P-core processors for CPU pinning (default 16) |

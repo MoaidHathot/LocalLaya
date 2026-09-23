@@ -28,7 +28,7 @@
  *   --preset <name>       smart-home (default) | triage | guard | moderation | route | sentiment | presets/*.json
  *   --questions <file>    JSON question set, replaces the preset's questions
  *   --state <file|json>   JSON state, replaces the preset's text wrapper (text arguments are ignored)
- *   --lanes a,b           lanes to load (local one-shot: webgpu:fp16 ; REPL / sidecar: webgpu:fp16,cpu:8)
+ *   --lanes a,b           lanes to load (default cuda:fp16,webgpu:fp16 one-shot, + cpu:8 for the REPL / sidecar; a lane that cannot load is dropped)
  *   --lane <lane>         force a lane for every call (default: router decides)
  *   --calibration <file>  temperature table for the active preset; default: calibration/<preset>.json if it exists
  *   --idle <dur>          sidecar idle exit, used only when this call spawns it (default $LAYA_IDLE or 5m; 0 = never)
@@ -170,11 +170,12 @@ let calibration = await calibrationFor(presetName);
 
 // ---- backends --------------------------------------------------------------------------------------------------
 async function localBackend() {
-  const lanes = (args.lanes ?? (interactive ? "webgpu:fp16,cpu:8" : "webgpu:fp16")).split(",");
+  const lanes = (args.lanes ?? (interactive ? "cuda:fp16,webgpu:fp16,cpu:8" : "cuda:fp16,webgpu:fp16")).split(",");
   const t0 = performance.now();
   say(dim(`loading ${lanes.join(" + ")} in this process ...`));
   const { LayaRouter } = await import("./src/ep-router.mjs"); // lazy: pulls in onnxruntime
-  const router = await LayaRouter.create({ lanes, log: (m) => say(dim(`  ${m}`)) });
+  // one-shot: answer from whichever lane is ready first and skip the background load sampling; REPL: full router
+  const router = await LayaRouter.create({ lanes, waitFor: interactive ? "all" : "first", sampleLoad: interactive, log: (m) => say(dim(`  ${m}`)) });
   if (interactive) await router.warmup({ state: preset.state("Please turn off the lights in the living room now"), sizes: [Object.keys(questions).length] });
   say(dim(`ready in ${((performance.now() - t0) / 1000).toFixed(1)} s; lanes: ${[...router.lanes.keys()].join(", ")}`));
   return {
