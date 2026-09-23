@@ -69,9 +69,10 @@ Raw JSON in `results/throughput-*.json` (ignored), summaries in `results/through
 ## Phase 5 - commit, then the next STATUS items: worker lanes, early serving, late binding, max-age, CI
 
 User: "commit, and go ahead with the next items in docs/status.md; add tests, verify everything, fix bugs."
-Items 1-3 (real labels, fine-tuning, multilingual) need data or hours of GPU; 7 (DirectML retest) needs a
-newer `onnxruntime-node` that npm cannot fetch here. Done: 4 (first-lane serving, `--max-age`), 5 (worker
-lanes), 6 (`cpu:8` default), 9 (GitHub Actions, `bench-all` defaults).
+Items 1-3 (real labels, fine-tuning, multilingual) need data or hours of GPU; 7 (DirectML retest) was
+skipped with a wrong reason ("npm cannot fetch a newer onnxruntime-node" - see Phase 6: there is nothing
+newer, and it is fetchable). Done: 4 (first-lane serving, `--max-age`), 5 (worker lanes), 6 (`cpu:8`
+default), 9 (GitHub Actions, `bench-all` defaults).
 
 - **Worker lanes** (`src/lane.mjs`, `src/lane-worker.mjs`): one handle for in-thread and worker sessions
   (`systemOne(state, questions, temps)`, `close()`, `onDeath`); the router talks to `L.session`, never to
@@ -105,6 +106,33 @@ lanes), 6 (`cpu:8` default), 9 (GitHub Actions, `bench-all` defaults).
 - Verification: `npm test` 9/9, `npm run test:router` 7/7 (~35 s), `npm run test:sidecar` 13/13 (~65 s),
   throughput quick run in worker mode 19.8 calls/s (same as in-process), `npm run router` scenarios unchanged.
 - Not done from item 4: named pipes, Windows service (no need shown); `skills-ref validate` (tool absent).
+
+## Phase 6 - "what exactly can't be fetched, and would having it make it faster?"
+
+User challenged the "npm cannot fetch" claim. Checked instead of repeating it:
+
+- Blocked: `registry.npmjs.org` (TLS handshake fails). The proxy `packagefeedproxy.microsoft.io/npm/` returns
+  404 for **`@receptron/laya` only** - that is the whole reason for `vendor/`. It serves `onnxruntime-node`
+  completely: 181 versions, `latest` 1.30.0 (= installed, published 2026-09-14), nightly
+  `1.31.0-dev.20260918`. GitHub (incl. release zips), jsDelivr, unpkg, Hugging Face, PyPI all reachable.
+- So nothing fetchable would make it faster: `@receptron/laya` from the registry is the same bytes, no newer
+  `onnxruntime-node` exists, and the CUDA EP is missing from the Windows build of `onnxruntime-node`
+  (README matrix, `install-metadata.js`, no CUDA symbols in the binary) - not from any download.
+- Where the time really goes (P-core pinned, `webgpu:fp16`): 99 % inside `session.run` (JS side 0.3-1.9 ms);
+  27.8 / 50.9 / 139.8 ms for 83 / 236 / 775 tokens = **~14 ms fixed + 0.16 ms/token**, i.e. 5-10 % of the
+  RTX 4070's fp16 tensor throughput. The fp16 graph has **2101 nodes** (286 Slice, 262 Mul, 182 MatMul,
+  158 Transpose, 32 Softmax; only LayerNormalization is fused) -> dispatch-bound, which also explains why
+  fp16 gained only 5-13 %.
+- Levers checked against the installed 1.30.0 binary + binding source (`js/node/src/session_options_helper.cc`):
+  WebGPU graph capture exists in the DLL but the Node binding rejects the option (lines 104-108); the binding
+  forwards `preferredLayout`, `validationMode`, `*BufferCacheMode`, `enableRobustness`, `forceCpuNodeNames`.
+  DML failure matches ORT #27118 (closed stale). CUDA is reachable via Python `onnxruntime-gpu` wheels (PyPI,
+  ~1.5 GiB with the CUDA/cuDNN wheels) as a process lane.
+- Plan agreed: (1) this correction; (2) cheap sweep of forwardable WebGPU options + CPU-fallback audit +
+  nightly DML test; (3) offline transformer fusion -> fused fp16 bundle (stop and report if ORT's patterns do
+  not match ModernBERT); (4) CUDA process lane behind the lane handle, default if it measures faster.
+  Constraints from the user: keep everything preset-agnostic (more presets coming), and make sure gains are
+  real (interleaved A/B in one session, not single runs).
 
 ## Numbers worth remembering
 

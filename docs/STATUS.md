@@ -19,9 +19,9 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
 | decision | rationale |
 |---|---|
 | ONNX port (`@receptron/laya` 0.1.2 + `onnxruntime-node` 1.30) rather than the original PyTorch package | Node integration, no Python/PyTorch/CUDA at runtime, output matches the reference to 4 decimals. The original is needed only for multilingual / typed-decisions checkpoints, fine-tuning, `predict_shortlist`. |
-| Vendored npm tarball (`vendor/receptron-laya-0.1.2.tgz`) | npm on this machine routes through `packagefeedproxy.microsoft.io`, which does not carry the package; `registry.npmjs.org` is blocked at TLS. Fetched from jsDelivr, SHA256-verified against an independent unpkg copy (23/23 files), `dist/` audited against GitHub source. |
+| Vendored npm tarball (`vendor/receptron-laya-0.1.2.tgz`) | npm on this machine routes through `packagefeedproxy.microsoft.io`, which returns 404 for `@receptron/laya` (the only package we need that it lacks); `registry.npmjs.org` fails at TLS. Everything else - `onnxruntime-node` (all 181 versions incl. nightlies), `@huggingface/tokenizers` - is served by the proxy; GitHub, jsDelivr, unpkg, Hugging Face and PyPI are reachable. Fetched from jsDelivr, SHA256-verified against an independent unpkg copy (23/23 files), `dist/` audited against GitHub source. |
 | Model pinned to HF commit `68f27dfe5a27a54fb2b1fefc432f43f972e90868`, SHA256-verified, cached in `models/` | The library follows `main` and only compares byte sizes. After the first download loading is offline (`modelDir`). |
-| GPU path = WebGPU EP; DirectML abandoned | `onnxruntime-node` ships no CUDA EP for Windows. DML loads the graph but every inference fails in a `Reshape` node at all optimisation levels. WebGPU works and matches CPU answers. |
+| GPU path = WebGPU EP; DirectML abandoned | `onnxruntime-node` does not build the CUDA EP for Windows at all (README matrix, `install-metadata.js` `requirements['win32/x64'] = []`, no CUDA symbols in the win32 binding) - a build gap, not a download gap. DML loads the graph but every inference fails in a `Reshape` node at all optimisation levels (same class as ORT issue #27118: DML + int64 indices in transformer graphs, closed stale). WebGPU works and matches CPU answers. |
 | fp16 bundle (`models/laya-onnx-fp16`) as the GPU default lane | Built with ORT's transformer float16 pass (onnxconverter-common left a broken Cast). 195/195 arg-max agreement, max delta p 0.034; half the VRAM (830 MiB) and RSS, 5-13 % faster. |
 | CPU lanes pin 16 (or 8) intra-op threads to the P-cores | ORT's default 24-thread pool spans E-cores; Windows scheduling makes 3 questions take 215 ms or 1200 ms (p95 > 1.1 s in half the sessions). Pinning: p95 284-350 ms for ~10 % cost. `cpu:8` pinned equals `cpu:16` pinned at half the CPU share. |
 | Per-call execution-provider router (`src/ep-router.mjs`) | Back-to-back traffic: WebGPU 3-5x faster. Sporadic traffic: the GPU drops to 225 MHz between calls and a single question takes ~180 ms vs ~105 ms on CPU. The router predicts per (lane, GPU thermal state at start, question bucket, work) plus the shared queue wait, and picks. |
@@ -120,13 +120,16 @@ worker threads, `cpu:8` as the default CPU lane, `bench-all` defaults, GitHub Ac
    whether loading it is worth 1.6 GiB RAM on GPU machines; token-length feature is an estimate
    (`estimateWork`); the start-up EMA of a GPU lane warmed while CPU calls run is ~1.5x pessimistic for its
    first few calls (self-corrects).
-6. **DirectML**: re-test with newer `onnxruntime-node` releases (Reshape `node_view` failure, ORT 1.30) -
-   needs a registry that carries them (npm here goes through a proxy that blocks `registry.npmjs.org`).
+6. **DirectML**: re-test with newer `onnxruntime-node` releases (Reshape `node_view` failure, ORT 1.30).
+   Nothing newer than the installed 1.30.0 exists as a stable release (published 2026-09-14); the proxy
+   also serves the nightlies (`1.31.0-dev.*`), so a retest is a 5-minute job whenever a new version lands.
+   Likely the int64-index class of DML bug (ORT #27118, closed stale); graph surgery (int32 indices) is the
+   only client-side lever.
 7. **Unmeasured presets** (`triage`, `guard`, `moderation`, `route`, `sentiment`): label and measure before
    relying on them; the `guard` preset answering 100 % on obvious injections says nothing about subtle ones.
 8. **Housekeeping**: confirm the GitHub Actions run is green after the first push (written blind: no runner
-   here, `npm ci` from `registry.npmjs.org` is blocked on this machine), `skills-ref validate` on the skill
-   (tool not installed here), decide whether to publish the skill separately.
+   here; GitHub's runners reach `registry.npmjs.org`, this machine does not), `skills-ref validate` on the
+   skill (tool not installed here), decide whether to publish the skill separately.
 
 ## Known issues / caveats
 

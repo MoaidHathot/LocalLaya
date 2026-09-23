@@ -285,6 +285,16 @@ per call, so ~6 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1
    `0xC0000409`. `close()` asks the worker to release the session and exit by itself; an idle worker can be
    terminated safely (the router marks the lane gone, fails in-flight calls over to another lane and never
    picks it again - `test/router.test.mjs`).
+9. **Where the time goes: dispatch overhead, not arithmetic.** 99 % of a `webgpu:fp16` call is inside
+   `session.run` (tokenising, padding and softmax take 0.3-1.9 ms). P-core pinned: 27.8 / 50.9 / 139.8 ms
+   for 83 / 236 / 775 tokens, i.e. **~14 ms fixed + 0.16 ms per token** - 5-10 % of the RTX 4070's fp16
+   tensor throughput. The exported graph has **2101 nodes** (286 Slice, 262 Mul, 182 MatMul, 158 Transpose,
+   32 Softmax; only `LayerNormalization` arrives fused), so each call is ~2000 small GPU dispatches. That is
+   also why fp16 bought only 5-13 %. Consequences: graph-level fusion (fewer dispatches) is the lever, a
+   faster EP helps only once the graph is fused, and nothing downloadable changes this: the installed
+   `onnxruntime-node` 1.30.0 is the newest release, and its Windows build simply has no CUDA EP (see
+   `docs/STATUS.md` decisions). WebGPU graph capture exists in the ORT DLL but the 1.30.0 Node binding
+   rejects the option.
 
 ## The execution-provider router (`src/ep-router.mjs`)
 
