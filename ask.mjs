@@ -32,6 +32,7 @@
  *   --lane <lane>         force a lane for every call (default: router decides)
  *   --calibration <file>  temperature table for the active preset; default: calibration/<preset>.json if it exists
  *   --idle <dur>          sidecar idle exit, used only when this call spawns it (default $LAYA_IDLE or 5m; 0 = never)
+ *   --max-age <dur>       sidecar recycles itself after this long (default $LAYA_MAX_AGE or never); also only when spawning
  *   --port <n>            sidecar port (default $LAYA_PORT or 8787)
  *   --json                machine-readable output
  *   --no-color
@@ -61,6 +62,7 @@ const { values: args, positionals } = parseArgs({
     sidecar: { type: "boolean", default: false },
     local: { type: "boolean", default: false },
     idle: { type: "string" },
+    "max-age": { type: "string" },
     port: { type: "string" },
     start: { type: "boolean", default: false },
     status: { type: "boolean", default: false },
@@ -80,6 +82,7 @@ const dim = (s) => (color ? c.dim(s) : s);
 const text = positionals.join(" ").trim();
 const port = Number(args.port ?? sidecar.DEFAULT_PORT);
 const idle = args.idle ?? sidecar.DEFAULT_IDLE;
+const maxAge = args["max-age"] ?? process.env.LAYA_MAX_AGE;
 const envSidecar = /^(1|true|yes|on)$/i.test(process.env.LAYA_SIDECAR ?? "");
 const useSidecar = !args.local && (args.sidecar || envSidecar);
 const interactive = !text && !args.state && !args.start && !args.status && !args.stop;
@@ -91,7 +94,7 @@ if (args.status) {
   else if (d.state === "foreign") stdout.write(`port ${port} is used by something else (not the Laya sidecar)\n`);
   else {
     const h = d.health;
-    stdout.write(`sidecar ${h.status} on 127.0.0.1:${port}  pid ${h.pid}  v${h.version}  up ${h.uptimeS} s\n  lanes: ${h.lanes.join(", ") || "-"}\n  idle exit: ${h.idleS ? `${h.idleS} s (${h.idleRemainingS} s remaining)` : "never"}  in flight: ${h.inFlight}  sampling: ${h.sampling ? "on" : "paused"}\n  log: ${sidecar.logFileFor(port)}\n`);
+    stdout.write(`sidecar ${h.status} on 127.0.0.1:${port}  pid ${h.pid}  v${h.version}  up ${h.uptimeS} s\n  lanes: ${h.lanes.join(", ") || "-"}${h.lanesLoading?.length ? `  (loading: ${h.lanesLoading.join(", ")})` : ""}\n  idle exit: ${h.idleS ? `${h.idleS} s (${h.idleRemainingS} s remaining)` : "never"}${h.maxAgeS ? `  max age: ${h.maxAgeS} s` : ""}  in flight: ${h.inFlight}  sampling: ${h.sampling ? "on" : "paused"}\n  log: ${sidecar.logFileFor(port)}\n`);
   }
   process.exit(0);
 }
@@ -107,9 +110,11 @@ if (args.stop) {
 }
 if (args.start) {
   try {
-    const { health, spawned } = await sidecar.ensureSidecar({ port, idle, lanes: args.lanes, calibration: args.calibration, onProgress: progress });
-    if (!spawned && args.lanes && health.lanes.join(",") !== args.lanes) say(dim(`note: sidecar already running with lanes ${health.lanes.join(",")}; --lanes ignored`));
-    stdout.write(`${JSON.stringify({ url: `http://127.0.0.1:${port}`, pid: health.pid, lanes: health.lanes, idleS: health.idleS, spawned })}\n`);
+    const { health, spawned } = await sidecar.ensureSidecar({ port, idle, maxAge, lanes: args.lanes, calibration: args.calibration, onProgress: progress });
+    // --start is for programs that will call HTTP directly: report the full lane set, not just the first one serving
+    const h = health.lanesLoading?.length ? await sidecar.waitAllLanes({ port }) : health;
+    if (!spawned && args.lanes && h.lanes.join(",") !== args.lanes) say(dim(`note: sidecar already running with lanes ${h.lanes.join(",")}; --lanes ignored`));
+    stdout.write(`${JSON.stringify({ url: `http://127.0.0.1:${port}`, pid: h.pid, lanes: h.lanes, idleS: h.idleS, spawned })}\n`);
     process.exit(0);
   } catch (e) {
     say(`${c.red("error:")} ${e.message}`);
@@ -122,7 +127,7 @@ function progress(state, ms, health) {
   if (state === "spawning") say(dim(`no sidecar on :${port}; starting one (idle exit after ${idle === "0" ? "never" : idle}) ...`));
   else if (state === "attaching") say(dim(`sidecar on :${port} is loading (pid ${health?.pid}); waiting ...`));
   else if (state === "loading") say(dim(`  sidecar loading (pid ${health?.pid}) ...`));
-  else if (state === "ready") say(dim(`  sidecar ready in ${t} (pid ${health?.pid}, lanes ${health?.lanes?.join(", ")})`));
+  else if (state === "ready") say(dim(`  sidecar ready in ${t} (pid ${health?.pid}, lanes ${health?.lanes?.join(", ")}${health?.lanesLoading?.length ? `; still loading ${health.lanesLoading.join(", ")}` : ""})`));
 }
 
 // ---- presets + calibration -------------------------------------------------------------------------------------
@@ -183,7 +188,7 @@ async function localBackend() {
 }
 
 async function remoteBackend() {
-  const { health, spawned } = await sidecar.ensureSidecar({ port, idle, lanes: args.lanes, calibration: args.calibration, onProgress: progress });
+  const { health, spawned } = await sidecar.ensureSidecar({ port, idle, maxAge, lanes: args.lanes, calibration: args.calibration, onProgress: progress });
   if (!spawned && args.lanes && health.lanes.join(",") !== args.lanes) say(dim(`note: sidecar already running with lanes ${health.lanes.join(",")}; --lanes ignored`));
   let keepAlive = null;
   if (interactive && health.idleS > 0) {
@@ -195,6 +200,12 @@ async function remoteBackend() {
     kind: "remote",
     via: `sidecar :${port} pid ${health.pid}`,
     lanes: health.lanes,
+    // lanes still loading when we attached join later: re-read /health on demand
+    refreshLanes: async function () {
+      const d = await sidecar.status({ port });
+      if (d.health?.lanes) this.lanes = d.health.lanes;
+      return this.lanes;
+    },
     decide: async (state, qs, o) => {
       const r = await sidecar.decide({ state, questions: qs, preset: presetName, lane: o.lane, calibration: o.calibration ?? undefined }, { port });
       return { answers: r.answers, usage: r.usage, routing: r.routing };
@@ -370,7 +381,7 @@ async function command(line) {
       break;
     case "lane":
       if (rest === "auto" || !rest) forcedLane = undefined;
-      else if (!backend.lanes.includes(rest)) return stdout.write(`lane not loaded; have ${backend.lanes.join(", ")}\n`);
+      else if (!backend.lanes.includes(rest) && !(await backend.refreshLanes?.())?.includes(rest)) return stdout.write(`lane not loaded; have ${backend.lanes.join(", ")}\n`);
       else forcedLane = rest;
       stdout.write(`lane: ${forcedLane ?? "auto (router decides)"}\n`);
       break;
@@ -380,8 +391,9 @@ async function command(line) {
       break;
     case "stats": {
       const s = await backend.stats();
-      for (const [lane, L] of Object.entries(s.lanes)) stdout.write(`  ${lane.padEnd(12)} calls=${L.calls} pending=${L.pending ?? 0} healthy=${L.healthy}  ${Object.entries(L.ema).map(([k, v]) => `${k}: ${v.ms.toFixed(0)} ms`).join("  ")}\n`);
-      stdout.write(`  others: CPU ${(s.load.cpuOthers * 100).toFixed(0)}%  GPU ${(s.load.gpuOthersUtil * 100).toFixed(0)}%  GPU clock ${s.load.gpuSmClockMHz ?? "-"} MHz  GPU state ${s.gpuState}  sampling ${s.sampling ? "on" : "paused"}  (${backend.via})\n`);
+      for (const [lane, L] of Object.entries(s.lanes)) stdout.write(`  ${lane.padEnd(12)} ${L.mode ?? ""} calls=${L.calls} pending=${L.pending ?? 0} healthy=${L.healthy}${L.dead ? " GONE" : ""}  ${Object.entries(L.ema).map(([k, v]) => `${k}: ${v.ms.toFixed(0)} ms`).join("  ")}\n`);
+      if (s.loading?.length) stdout.write(`  loading: ${s.loading.join(", ")}\n`);
+      stdout.write(`  queue: ${s.queue?.pending ?? 0} pending (~${(s.queue?.waitMs ?? 0).toFixed(0)} ms)  others: CPU ${(s.load.cpuOthers * 100).toFixed(0)}%  GPU ${(s.load.gpuOthersUtil * 100).toFixed(0)}%  GPU clock ${s.load.gpuSmClockMHz ?? "-"} MHz  GPU state ${s.gpuState}  sampling ${s.sampling ? "on" : "paused"}  (${backend.via})\n`);
       break;
     }
     case "exit":

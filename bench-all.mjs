@@ -1,8 +1,9 @@
 /**
  * Run bench.mjs once per configuration (separate processes) and print a combined comparison table.
  *
- *   node bench-all.mjs                                          # cpu+pin, cpu:8+pin, cpu (ORT default), webgpu, webgpu+fp16
+ *   node bench-all.mjs                                          # cpu:8+pin, cpu+pin, webgpu+fp16, webgpu (the lanes the router uses)
  *   node bench-all.mjs --configs cpu+pin,webgpu+fp16            # subset; config = ep[:threads][+pin][+fp16]
+ *   node bench-all.mjs --configs cpu                            # ORT default pool (24 threads, unpinned): fast p50, p95 > 1.1 s on hybrid CPUs
  *   node bench-all.mjs --configs dml                            # DirectML: loads, but inference fails on this graph (Reshape 'node_view')
  *   node bench-all.mjs --runs 30 --sizes 1,3,10
  */
@@ -13,7 +14,7 @@ import { parseArgs } from "node:util";
 
 const { values: args } = parseArgs({
   options: {
-    configs: { type: "string", default: "cpu+pin,cpu:8+pin,cpu,webgpu,webgpu+fp16" },
+    configs: { type: "string", default: "cpu:8+pin,cpu+pin,webgpu+fp16,webgpu" },
     sizes: { type: "string", default: "1,3,10" },
     runs: { type: "string", default: "20" },
     warmup: { type: "string", default: "3" },

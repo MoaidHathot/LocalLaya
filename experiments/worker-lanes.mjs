@@ -2,6 +2,9 @@
  * Experiment: can each lane live in its own worker thread, so that (a) CPU and GPU inferences overlap and
  * (b) the main thread stays responsive while an inference runs?
  *
+ * This was the prototype for src/lane.mjs (worker lanes are the router's default since 0.5). Kept as the
+ * measurement of what mixing lanes in parallel costs.
+ *
  * Background: onnxruntime-node 1.30 runs `session.run()` synchronously on the calling JS thread
  * (dist/backend.js wraps it in setImmediate + Promise). In one thread every inference blocks the event loop
  * for its full duration, so two lanes never run in parallel and an HTTP server cannot even read requests

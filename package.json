@@ -1,6 +1,6 @@
 {
   "name": "local-laya",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "PoC, benchmarks, calibration tooling and execution-provider router for Laya (ONNX port, @receptron/laya) on Windows",
   "type": "module",
@@ -24,7 +24,9 @@
     "fp16:convert": ".venv/Scripts/python.exe tools/convert_fp16.py models/receptron--laya-onnx/68f27dfe5a27a54fb2b1fefc432f43f972e90868 models/laya-onnx-fp16",
     "fp16:check": "node experiments/fp16-fidelity.mjs --ep webgpu",
     "test": "node --test test/unit.test.mjs",
-    "test:sidecar": "node --test --test-concurrency=1 test/sidecar.test.mjs"
+    "test:router": "node --test --test-concurrency=1 test/router.test.mjs",
+    "test:sidecar": "node --test --test-concurrency=1 test/sidecar.test.mjs",
+    "test:all": "node --test test/unit.test.mjs && node --test --test-concurrency=1 test/router.test.mjs && node --test --test-concurrency=1 test/sidecar.test.mjs"
   },
   "dependencies": {
     "@receptron/laya": "file:vendor/receptron-laya-0.1.2.tgz"

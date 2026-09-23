@@ -32,7 +32,7 @@ node scripts/laya.mjs --preset triage "Charged twice. Refund today or I cancel."
 ```
 
 - `--sidecar` (added by the wrapper) uses one shared background instance: the first call in an idle period
-  takes ~5 s (it starts the instance), later calls ~0.2-0.4 s. It exits by itself after 5 min without calls.
+  takes ~3-4.5 s (it starts the instance), later calls ~0.15-0.4 s. It exits by itself after 5 min without calls.
 - `--json` prints one JSON object on stdout: `{ state, answers, usage, routing, backend }`. Progress goes to
   stderr. Exit code 0 on success, 1 on error (message on stderr), 2 for an unknown preset.
 - Many calls? Start it once (`node ask.mjs --start` -> `{ url, pid, lanes }`) and `POST /decide` directly;
@@ -108,7 +108,7 @@ node scripts/laya.mjs --state '{"email":"Meeting moved to 3pm, can you make it?"
 
 ## Edge cases
 
-- First call after idle: ~5 s and stderr says `starting one`. Subsequent calls are fast. Do not run several
+- First call after idle: ~3-4.5 s and stderr says `starting one`. Subsequent calls are fast. Do not run several
   first calls in parallel to "warm it up"; one is enough (racing launchers are handled, but waste ~1 s each).
 - `warning: sidecar unavailable ... falling back to in-process` on stderr: the answer is still valid; the port
   is busy or the sidecar failed to start. `node ask.mjs --status` explains; `.laya/sidecar-<port>.log` has details.

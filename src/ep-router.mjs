@@ -12,12 +12,14 @@
  *
  * One queue for all lanes. onnxruntime-node (1.30) runs `session.run()` synchronously on the JS thread
  * (dist/backend.js: setImmediate + blocking run), so inferences of different lanes never overlap in one
- * process: a CPU call inserted into a GPU burst stalls every GPU call behind it for its full duration
+ * thread: a CPU call inserted into a GPU burst stalls every GPU call behind it for its full duration
  * (webgpu:fp16 3 q: 49 ms alone, 321-479 ms p50 while cpu:8 ran in the same thread; policy auto at 8 parallel
  * callers fell from 20 to 6.6 calls/s - experiments/throughput.mjs, experiments/interference.mjs). Lanes in
- * worker threads would overlap, but mixing still loses: the pinned CPU pool slows the GPU lane 1.5x while
- * adding 4 calls/s (experiments/worker-lanes.mjs). Hence a single FIFO: every lane waits for the same queue,
- * the choice is by the lane's own predicted latency at the moment it will run, and `ms` is pure inference.
+ * worker threads (the default, see lane.mjs) do overlap, but mixing still loses: the pinned CPU pool slows the
+ * GPU lane 1.5x while adding 4 calls/s (experiments/worker-lanes.mjs). Hence a single FIFO: every lane waits
+ * for the same queue, the choice is by the lane's own predicted latency at the moment it will run, and `ms` is
+ * pure inference. The workers buy a responsive main thread (a server keeps accepting requests during a 1 s
+ * CPU inference) and lanes that load side by side instead of one after the other.
  *
  * Decision = argmin over lanes of  wait_ms + own_ms(lane, gpu_state_at_start) * contention_factor(lane), where
  * own_ms comes from an exponentially-weighted average of observed latencies keyed by (lane, GPU thermal state,
@@ -26,7 +28,8 @@
  * "min-cpu"; per-call `lane` override and `deadlineMs` (meet the deadline with the least CPU share).
  */
 import { createCpuLoadMeter, queryGpu } from "./metrics.mjs";
-import { loadLaya, pinProcessToPCores } from "./laya-client.mjs";
+import { pinProcessToPCores } from "./laya-client.mjs";
+import { openLane } from "./lane.mjs";
 
 export const N_BUCKETS = ["1", "2-3", "4-6", "7-10", "11+"];
 export const nBucket = (n) => (n <= 1 ? "1" : n <= 3 ? "2-3" : n <= 6 ? "4-6" : n <= 10 ? "7-10" : "11+");
@@ -168,13 +171,19 @@ export class LatencyModel {
   }
 }
 
+/** Representative question set of size n for warm-ups (choice / noul / score mix). */
+const warmupQuestions = (n) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`q${i}`, i % 3 === 0 ? { type: "choice", instructions: `question ${i}`, criteria: { a: "option a", b: "option b", c: "option c", d: "option d" } } : i % 3 === 1 ? { type: "noul", instructions: `statement ${i}` } : { type: "score", instructions: `level ${i}`, criteria: ["low", "mid", "high", "max"] }]));
+const WARMUP_STATE = { warmup: "the quick brown fox jumps over the lazy dog" };
+
 export class LayaRouter {
   /** Use LayaRouter.create(). */
   constructor(opts) {
     this.opts = opts;
-    this.lanes = new Map(); // lane -> { laya, model, healthy, failures, quarantinedUntil, calls, pending }
-    this.queue = Promise.resolve(); // one FIFO for every lane (see the header: inferences cannot overlap)
+    this.lanes = new Map(); // lane -> { lane, session, model, healthy, dead, failures, quarantinedUntil, calls, pending, loadMs, probeMs }
+    this.loading = new Set(); // lanes still being loaded / probed / warmed
+    this.queue = Promise.resolve(); // one FIFO for every lane (see the header: mixing lanes loses)
     this.inflight = []; // queued + running calls: { lane, ownMs, startedAt }
+    this.direct = new Set(); // start-up probe / warm-up calls running outside the FIFO (see _direct)
     this.lastGpuWorkEnd = -Infinity;
     this.gpuBusy = 0;
     this.load = { cpuOthers: 0, gpuOthersUtil: 0, gpuSmClockMHz: null, gpuMemFreeMiB: null, sampledAt: null };
@@ -182,51 +191,185 @@ export class LayaRouter {
     this._keepAliveUntil = 0;
     this.log = opts.log ?? (() => {});
     this.history = [];
+    this.closed = false;
+    this.ready = Promise.resolve(this);
   }
 
   /**
    * @param {object} o
-   * @param {string[]} [o.lanes=["webgpu","cpu"]]   lanes to load; the first GPU lane whose probe fails is dropped
+   * @param {string[]} [o.lanes=["webgpu","cpu:8"]] lanes to load; a lane whose load or probe fails is dropped
    * @param {"auto"|"prefer-gpu"|"prefer-cpu"|"min-cpu"} [o.policy="auto"]
-   * @param {number} [o.explore=0.05]                exploration probability (auto policy)
+   * @param {number} [o.explore=0.05]                exploration probability (auto policy, idle only)
    * @param {string|object} [o.calibration]          applied to every lane (see loadLaya)
    * @param {boolean} [o.sampleLoad=true]            background CPU / nvidia-smi sampling for contention
    * @param {number} [o.gpuKeepAliveMs=0]            after a GPU call keep the GPU clocks up for this long with tiny dummy calls
    * @param {number} [o.minGpuFreeMiB=2200]          skip GPU lanes when less VRAM than this is free
    * @param {boolean} [o.pinProcess=true]            Windows hybrid CPUs: restrict the process to the P-cores (see pinProcessToPCores)
+   * @param {boolean} [o.workers=true]               run each lane's session in a worker thread (lane.mjs); false = in this thread
+   * @param {{state?:object, sizes?:number[]}} [o.warmup]  warm every lane (shader compile, EMA priming) before it serves
+   * @param {"all"|"first"} [o.waitFor="all"]        resolve when every lane is done, or as soon as the first lane serves;
+   *                                                 `router.ready` resolves when all lanes are done either way
+   * @param {(lane:string, info:{loadMs:number, probeMs:number, warmup:object|null, readyMs:number})=>void} [o.onLaneReady]
    * @param {(m:string)=>void} [o.log]
    */
   static async create(o = {}) {
-    const r = new LayaRouter({ lanes: ["webgpu", "cpu"], policy: "auto", explore: 0.05, sampleLoad: true, gpuKeepAliveMs: 0, minGpuFreeMiB: 2200, pinProcess: true, ...o });
+    const r = new LayaRouter({ lanes: ["webgpu", "cpu:8"], policy: "auto", explore: 0.05, sampleLoad: true, gpuKeepAliveMs: 0, minGpuFreeMiB: 2200, pinProcess: true, workers: true, warmup: null, waitFor: "all", onLaneReady: null, ...o });
     // in the background: overlaps with the model loads, done before the first call
     const pinned = r.opts.pinProcess ? pinProcessToPCores({ log: r.log }) : Promise.resolve({ applied: false, reason: "disabled" });
     const gpu = await queryGpu();
     if (gpu) r._ingestGpu(gpu);
-    await Promise.all(r.opts.lanes.map((lane) => r._probeLane(lane, gpu)));
-    if (!r.lanes.size) throw new Error("LayaRouter: no lane could be loaded");
+    let firstReady;
+    const first = new Promise((resolve) => (firstReady = resolve));
+    for (const lane of r.opts.lanes) r.loading.add(lane);
+    r.ready = Promise.all(
+      r.opts.lanes.map((lane) =>
+        r._probeLane(lane, gpu).then((ok) => {
+          r.loading.delete(lane);
+          if (ok) firstReady();
+        }),
+      ),
+    ).then(() => {
+      if (!r.lanes.size) throw new Error("LayaRouter: no lane could be loaded");
+      return r;
+    });
+    r.ready.catch(() => {}); // awaited below and/or by the caller; never an unhandled rejection
+    if (r.opts.waitFor === "first") await Promise.race([first, r.ready]);
+    else await r.ready;
     r.processAffinity = await pinned;
     if (r.opts.sampleLoad) r._startSampling(!!gpu);
     return r;
   }
 
+  /** Lanes that are still loading (waitFor: "first"). */
+  get pendingLanes() {
+    return [...this.loading];
+  }
+
+  /** Load, probe (a real inference: DML loads fine but throws on run) and optionally warm one lane. */
   async _probeLane(lane, gpu) {
     const { ep, threads, pin, modelDir } = parseLane(lane);
     if (isGpuLane(lane) && gpu && gpu.memTotalMiB - gpu.memUsedMiB < this.opts.minGpuFreeMiB) {
       this.log(`lane ${lane}: skipped, only ${gpu.memTotalMiB - gpu.memUsedMiB} MiB VRAM free`);
-      return;
+      return false;
     }
     const t0 = performance.now();
+    let session = null;
     try {
-      const { laya } = await loadLaya({ ep, threads, pinToPCores: pin, modelDir, calibration: this.opts.calibration, log: () => {}, logSeverityLevel: 3 });
-      // functional probe: a real inference (DML loads fine here but throws on run)
-      const p0 = performance.now();
-      await laya.systemOne({ probe: "ok" }, { q: { type: "noul", instructions: "Is this a probe?" } });
-      const probeMs = performance.now() - p0;
-      this.lanes.set(lane, { lane, laya, model: new LatencyModel(lane), healthy: true, failures: 0, quarantinedUntil: 0, calls: 0, pending: 0, loadMs: performance.now() - t0, probeMs, shippedTemps: { ...laya.config.temperature_by_options } });
-      this.log(`lane ${lane}: ready (load ${((performance.now() - t0) / 1000).toFixed(1)} s, probe ${probeMs.toFixed(0)} ms)`);
+      session = await openLane(lane, { ep, threads, pinToPCores: pin, modelDir, calibration: this.opts.calibration }, { worker: this.opts.workers, log: () => {} });
+      if (this.closed) throw new Error("router closed while loading");
+      const L = { lane, session, model: new LatencyModel(lane), healthy: true, dead: false, failures: 0, quarantinedUntil: 0, calls: 0, pending: 0, loadMs: session.loadMs, probeMs: 0 };
+      session.onDeath((cause) => this._laneDied(L, cause));
+      const probe = await this._direct(L, () => session.systemOne({ probe: "ok" }, { q: { type: "noul", instructions: "Is this a probe?" } }));
+      L.probeMs = probe.ms;
+      const warm = this.opts.warmup ? await this._warmLane(L, this.opts.warmup) : null;
+      if (this.closed) throw new Error("router closed while loading");
+      this.lanes.set(lane, L);
+      const readyMs = performance.now() - t0;
+      this.log(`lane ${lane}: ready (load ${(session.loadMs / 1000).toFixed(1)} s, probe ${L.probeMs.toFixed(0)} ms${warm ? `, warm-up ${Object.entries(warm).map(([n, v]) => `${n}q ${v.ms.toFixed(0)}`).join(" / ")} ms` : ""}, ${session.mode})`);
+      this.opts.onLaneReady?.(lane, { loadMs: session.loadMs, probeMs: L.probeMs, warmup: warm, readyMs, mode: session.mode });
+      return true;
     } catch (e) {
       this.log(`lane ${lane}: unavailable - ${String(e?.message ?? e).split("\n")[0].slice(0, 140)}`);
+      await session?.close().catch(() => {});
+      return false;
     }
+  }
+
+  _laneDied(L, cause) {
+    L.healthy = false;
+    L.dead = true;
+    L.quarantinedUntil = Infinity;
+    if (!this.closed) this.log(`lane ${L.lane}: gone (${cause}); calls go to the remaining lanes`);
+  }
+
+  /**
+   * Run `fn` on a lane right away, outside the FIFO, with the GPU bookkeeping the queue would do. For the
+   * start-up probe and warm-up: they must not wait behind (or hold up) the calls of the lanes already
+   * serving - a GPU lane that joins 2 s late costs a start-up burst 3-5x more than the moment of overlap.
+   * @returns {Promise<{result:any, ms:number, stateAtStart:string}>}
+   */
+  async _direct(L, fn) {
+    const gpu = isGpuLane(L.lane);
+    const tStart = performance.now();
+    const stateAtStart = gpu ? thermalState(tStart - this.lastGpuWorkEnd) : "any";
+    if (gpu) this.gpuBusy++;
+    const p = (async () => {
+      try {
+        const result = await fn();
+        return { result, ms: performance.now() - tStart, stateAtStart };
+      } finally {
+        if (gpu) {
+          this.gpuBusy--;
+          this.lastGpuWorkEnd = performance.now();
+        }
+      }
+    })();
+    this.direct.add(p);
+    p.finally(() => this.direct.delete(p)).catch(() => {});
+    return p;
+  }
+
+  /**
+   * Run a call on the FIFO shared by every lane. `L` is the lane it is provisionally bound to and `ownMs` its
+   * predicted duration (both feed the wait estimates of the callers behind it). When the call reaches the front
+   * `rebind()` may return another lane record to run on instead (lanes that joined, died or got quarantined
+   * while the call waited). Times the call from when it actually starts; tracks the GPU busy state and the
+   * per-lane pending counts.
+   * @returns {Promise<{L:object, result:any, ms:number, queueMs:number, stateAtStart:string}>}
+   */
+  _enqueue(L, ownMs, run, rebind = null) {
+    const t0 = performance.now();
+    const entry = { lane: L.lane, ownMs, startedAt: null };
+    this.inflight.push(entry);
+    L.pending++;
+    return (this.queue = this.queue.catch(() => {}).then(async () => {
+      const other = rebind?.();
+      if (other && other !== L) {
+        L.pending--;
+        L = other;
+        L.pending++;
+        entry.lane = L.lane;
+      }
+      const gpu = isGpuLane(L.lane);
+      const tStart = performance.now();
+      entry.startedAt = tStart;
+      const stateAtStart = gpu ? thermalState(tStart - this.lastGpuWorkEnd) : "any";
+      if (gpu) this.gpuBusy++;
+      try {
+        const result = await run(L);
+        return { L, result, ms: performance.now() - tStart, queueMs: tStart - t0, stateAtStart };
+      } catch (e) {
+        if (e && typeof e === "object" && !e.lane) e.lane = L.lane; // tell the caller which lane the call ran on
+        throw e;
+      } finally {
+        if (gpu) {
+          this.gpuBusy--;
+          this.lastGpuWorkEnd = performance.now();
+        }
+        L.pending--;
+        const i = this.inflight.indexOf(entry);
+        if (i >= 0) this.inflight.splice(i, 1);
+      }
+    }));
+  }
+
+  /**
+   * Warm one lane, outside the FIFO (see _direct): GPU lanes get two calls per size (the first compiles shaders
+   * for that shape and is not recorded, the second primes the EMA); CPU lanes have nothing to compile, so one
+   * call per size does both.
+   */
+  async _warmLane(L, { state = WARMUP_STATE, sizes = [1, 3, 10] } = {}) {
+    const report = {};
+    const gpu = isGpuLane(L.lane);
+    for (const n of sizes) {
+      const qs = warmupQuestions(n);
+      const work = estimateWork(state, qs);
+      const first = await this._direct(L, () => L.session.systemOne(state, qs));
+      const timed = gpu ? await this._direct(L, () => L.session.systemOne(state, qs)) : first;
+      L.model.observe(n, timed.stateAtStart, timed.ms, work);
+      report[n] = { firstMs: first.ms, ms: timed.ms };
+    }
+    return report;
   }
 
   _ingestGpu(g) {
@@ -302,21 +445,37 @@ export class LayaRouter {
    * The GPU thermal state is the one expected when the call starts, not now: "hot" when GPU work is queued
    * ahead of it; otherwise the projected idle time - but never "cold" while other calls are queued, because a
    * queue means traffic and the GPU's first call warms the clocks for everything behind it.
+   * `atFront`: the call is about to run (nothing ahead of it): no wait, the GPU state as it is right now.
    */
-  predictions(n, work) {
+  predictions(n, work, { atFront = false } = {}) {
     const now = performance.now();
-    const waitMs = this.waitMs(now);
-    const pending = this.inflight.length;
-    let state = this.inflight.some((e) => isGpuLane(e.lane)) ? "hot" : thermalState(now + waitMs - this.lastGpuWorkEnd);
+    const waitMs = atFront ? 0 : this.waitMs(now);
+    const pending = atFront ? 0 : this.inflight.length;
+    let state = !atFront && this.inflight.some((e) => isGpuLane(e.lane)) ? "hot" : thermalState(now + waitMs - this.lastGpuWorkEnd);
     if (pending && state === "cold") state = "warm";
     const out = [];
     for (const L of this.lanes.values()) {
-      if (!L.healthy && now < L.quarantinedUntil) continue;
+      if (L.dead || (!L.healthy && now < L.quarantinedUntil)) continue;
       const p = L.model.predict(n, state, work);
       const ownMs = p.ms * this._inflation(L.lane);
       out.push({ lane: L.lane, rawMs: p.ms, ownMs, waitMs, predictedMs: waitMs + ownMs, pending, source: p.source, share: L.model.share, state: isGpuLane(L.lane) ? state : "any" });
     }
     return out;
+  }
+
+  /** Candidates for one call: healthy lanes not yet tried, or the forced lane (which ignores a quarantine). */
+  _candidates(n, work, o, tried, atFront) {
+    let candidates = this.predictions(n, work, { atFront }).filter((c) => !tried.includes(c.lane));
+    if (!o.lane) return candidates;
+    candidates = candidates.filter((c) => c.lane === o.lane);
+    if (candidates.length) return candidates;
+    const L = this.lanes.get(o.lane);
+    if (!L) throw new Error(`lane ${o.lane} not loaded (have ${[...this.lanes.keys()].join(", ")}${this.loading.size ? `; loading ${[...this.loading].join(", ")}` : ""})`);
+    if (L.dead) throw new Error(`lane ${o.lane} is gone`);
+    if (tried.includes(o.lane)) return [];
+    const waitMs = atFront ? 0 : this.waitMs();
+    const ownMs = L.model.predict(n, thermalState(performance.now() - this.lastGpuWorkEnd), work).ms;
+    return [{ lane: o.lane, ownMs, waitMs, predictedMs: waitMs + ownMs, pending: atFront ? 0 : this.inflight.length, share: L.model.share, state: "forced" }];
   }
 
   /**
@@ -327,74 +486,54 @@ export class LayaRouter {
    * @returns result with an extra `routing` field
    */
   async decide(state, questions, o = {}) {
+    if (this.closed) throw new Error("router is closed");
+    if (!this.lanes.size) throw new Error(this.loading.size ? `no lane ready yet (loading ${[...this.loading].join(", ")})` : "no lanes loaded");
     const n = Object.keys(questions).length;
     const work = estimateWork(state, questions);
+    const policy = o.policy ?? this.opts.policy;
     const tried = [];
     for (let attempt = 0; attempt < this.lanes.size; attempt++) {
-      let candidates = this.predictions(n, work).filter((c) => !tried.includes(c.lane));
-      if (o.lane) {
-        candidates = candidates.filter((c) => c.lane === o.lane);
-        if (!candidates.length) {
-          const L = this.lanes.get(o.lane);
-          if (!L) throw new Error(`lane ${o.lane} not loaded (have ${[...this.lanes.keys()].join(", ")})`);
-          const waitMs = this.waitMs();
-          const ownMs = L.model.predict(n, thermalState(performance.now() - this.lastGpuWorkEnd), work).ms;
-          candidates = [{ lane: o.lane, ownMs, waitMs, predictedMs: waitMs + ownMs, pending: this.inflight.length, share: L.model.share, state: "forced" }];
-        }
-      }
-      if (!candidates.length) break;
-      // exploration only while idle: an exploratory slow call delays every call queued behind it
-      const choice = chooseLane(candidates, { policy: o.policy ?? this.opts.policy, deadlineMs: o.deadlineMs, explore: o.lane || this.inflight.length ? 0 : this.opts.explore });
-      const L = this.lanes.get(choice.lane);
-      const gpu = isGpuLane(choice.lane);
-      const t0 = performance.now();
-      let stateAtStart = gpu ? thermalState(t0 - this.lastGpuWorkEnd) : "any";
-      let tStart = t0;
-      const entry = { lane: choice.lane, ownMs: choice.ownMs ?? choice.predictedMs, startedAt: null };
-      this.inflight.push(entry);
-      L.pending++;
+      // Provisional choice now (fastest predicted, no exploration): it sets the wait estimate for the callers
+      // behind this one. The binding choice happens when the call reaches the front of the queue, because
+      // lanes may have joined (start-up), died or been quarantined meanwhile - and exploration only makes
+      // sense there, when nobody is queued behind to be delayed by an exploratory slow call.
+      const provisional = this._candidates(n, work, o, tried, false);
+      if (!provisional.length) break;
+      let choice = chooseLane(provisional, { policy, deadlineMs: o.deadlineMs, explore: 0 });
+      const provisionalLane = choice.lane;
+      let alternatives = provisional;
+      const rebind = () => {
+        const fresh = this._candidates(n, work, o, tried, true);
+        if (!fresh.length) return null; // keep the provisional lane; if it is gone the call fails and the retry loop moves on
+        alternatives = fresh;
+        const c = chooseLane(fresh, { policy, deadlineMs: o.deadlineMs, explore: o.lane || this.inflight.length > 1 ? 0 : this.opts.explore });
+        choice = { ...c, waitMs: choice.waitMs, predictedMs: choice.waitMs + c.ownMs, pending: choice.pending };
+        return this.lanes.get(c.lane);
+      };
+      let L = this.lanes.get(provisionalLane);
       try {
         // Timing and the GPU thermal state are taken when the call actually starts, not when it was queued;
-        // nothing else runs between tStart and completion, so `ms` is the inference alone. The per-call
-        // temperatures are switched here, inside the queue, so they cannot race another call.
-        const result = await (this.queue = this.queue.catch(() => {}).then(() => {
-          tStart = performance.now();
-          entry.startedAt = tStart;
-          if (gpu) {
-            stateAtStart = thermalState(tStart - this.lastGpuWorkEnd);
-            this.gpuBusy++;
-          }
-          const temps = L.laya.config.temperature_by_options;
-          for (const k of Object.keys(temps)) delete temps[k];
-          Object.assign(temps, L.shippedTemps, o.calibration?.temperature_by_options ?? {});
-          return L.laya.systemOne(state, questions).finally(() => {
-            if (gpu) {
-              this.gpuBusy--;
-              this.lastGpuWorkEnd = performance.now();
-            }
-          });
-        }));
-        const ms = performance.now() - tStart;
-        const queueMs = tStart - t0;
-        L.model.observe(n, stateAtStart, ms, work);
+        // nothing else runs between start and completion, so `ms` is the inference alone. The per-call
+        // temperature override travels with the call and is applied by the lane right before it runs.
+        const run = await this._enqueue(L, choice.ownMs, (lane) => lane.session.systemOne(state, questions, o.calibration?.temperature_by_options), rebind);
+        L = run.L;
+        L.model.observe(n, run.stateAtStart, run.ms, work);
         L.calls++;
         L.healthy = true;
         L.failures = 0;
-        const routing = { lane: choice.lane, ms, queueMs, n, work, gpuState: stateAtStart, predictedMs: choice.predictedMs, ownMs: choice.ownMs ?? choice.predictedMs, waitMs: choice.waitMs ?? 0, pendingAtChoice: choice.pending ?? 0, reason: choice.reason, explored: !!choice.explored, alternatives: candidates.filter((c) => c.lane !== choice.lane).map((c) => ({ lane: c.lane, predictedMs: c.predictedMs })), load: { cpuOthers: this.load.cpuOthers, gpuOthersUtil: this.load.gpuOthersUtil } };
+        const gpu = isGpuLane(L.lane);
+        const routing = { lane: L.lane, ms: run.ms, queueMs: run.queueMs, n, work, gpuState: run.stateAtStart, predictedMs: choice.predictedMs, ownMs: choice.ownMs, waitMs: choice.waitMs ?? 0, pendingAtChoice: choice.pending ?? 0, reason: choice.reason, explored: !!choice.explored, ...(L.lane !== provisionalLane ? { provisionalLane } : {}), alternatives: alternatives.filter((c) => c.lane !== L.lane).map((c) => ({ lane: c.lane, predictedMs: c.predictedMs })), load: { cpuOthers: this.load.cpuOthers, gpuOthersUtil: this.load.gpuOthersUtil } };
         this.history.push(routing);
         if (this.history.length > 1000) this.history.shift();
         if (gpu && this.opts.gpuKeepAliveMs > 0) this._scheduleKeepAlive();
-        return { ...result, routing };
+        return { ...run.result, routing };
       } catch (e) {
+        L = (e?.lane && this.lanes.get(e.lane)) || L; // the lane the call actually ran on (rebind may have moved it)
         L.failures++;
         L.healthy = false;
-        L.quarantinedUntil = performance.now() + 60_000;
-        tried.push(choice.lane);
-        this.log(`lane ${choice.lane} failed (${String(e?.message ?? e).split("\n")[0].slice(0, 120)}); quarantined 60 s, retrying on another lane`);
-      } finally {
-        L.pending--;
-        const i = this.inflight.indexOf(entry);
-        if (i >= 0) this.inflight.splice(i, 1);
+        L.quarantinedUntil = L.dead ? Infinity : performance.now() + 60_000;
+        tried.push(L.lane);
+        if (!this.closed) this.log(`lane ${L.lane} failed (${String(e?.message ?? e).split("\n")[0].slice(0, 120)}); ${L.dead ? "gone" : "quarantined 60 s"}, retrying on another lane`);
       }
     }
     throw new Error(`all lanes failed for this call (tried ${tried.join(", ")})`);
@@ -408,17 +547,13 @@ export class LayaRouter {
     if (!gpuLane) return;
     const tick = async () => {
       this._keepAliveTimer = null;
-      if (performance.now() >= this._keepAliveUntil) return;
-      if (!this.gpuBusy) {
+      if (performance.now() >= this._keepAliveUntil || this.closed) return;
+      if (!this.inflight.length) {
         try {
-          this.gpuBusy++;
-          await gpuLane.laya.systemOne("x", { k: { type: "noul", instructions: "keep-alive" } });
-          this.lastGpuWorkEnd = performance.now();
+          await this._enqueue(gpuLane, 30, () => gpuLane.session.systemOne("x", { k: { type: "noul", instructions: "keep-alive" } }));
           this.keepAliveCalls = (this.keepAliveCalls ?? 0) + 1;
         } catch {
           /* ignore */
-        } finally {
-          this.gpuBusy--;
         }
       }
       this._keepAliveTimer = setTimeout(tick, 250);
@@ -428,39 +563,32 @@ export class LayaRouter {
     this._keepAliveTimer.unref();
   }
 
-  /** Compile GPU shaders / prime the EMA with representative calls on every lane. */
-  async warmup({ state = { warmup: "the quick brown fox jumps over the lazy dog" }, sizes = [1, 3, 10] } = {}) {
-    const mk = (n) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`q${i}`, i % 3 === 0 ? { type: "choice", instructions: `question ${i}`, criteria: { a: "option a", b: "option b", c: "option c", d: "option d" } } : i % 3 === 1 ? { type: "noul", instructions: `statement ${i}` } : { type: "score", instructions: `level ${i}`, criteria: ["low", "mid", "high", "max"] }]));
+  /** Compile GPU shaders / prime the EMA with representative calls on every lane (also available per lane via create({ warmup })). */
+  async warmup({ state = WARMUP_STATE, sizes = [1, 3, 10] } = {}) {
     const report = {};
-    for (const L of this.lanes.values()) {
-      report[L.lane] = {};
-      for (const n of sizes) {
-        const qs = mk(n);
-        const first = performance.now();
-        await L.laya.systemOne(state, qs); // first call: may include shader compilation -> not recorded
-        const firstMs = performance.now() - first;
-        const t1 = performance.now();
-        await L.laya.systemOne(state, qs);
-        const ms = performance.now() - t1;
-        L.model.observe(n, isGpuLane(L.lane) ? "hot" : "any", ms, estimateWork(state, qs));
-        if (isGpuLane(L.lane)) this.lastGpuWorkEnd = performance.now();
-        report[L.lane][n] = { firstMs, ms };
-      }
-    }
+    for (const L of this.lanes.values()) report[L.lane] = await this._warmLane(L, { state, sizes });
     return report;
   }
 
   stats() {
     const lanes = {};
-    for (const L of this.lanes.values()) lanes[L.lane] = { healthy: L.healthy, calls: L.calls, pending: L.pending, failures: L.failures, loadMs: L.loadMs, share: L.model.share, ema: L.model.ema };
-    return { lanes, queue: { pending: this.inflight.length, waitMs: this.waitMs() }, load: this.load, sampling: !!this.sampling, processAffinity: this.processAffinity ?? null, keepAliveCalls: this.keepAliveCalls ?? 0, gpuState: thermalState(performance.now() - this.lastGpuWorkEnd) };
+    for (const L of this.lanes.values()) lanes[L.lane] = { healthy: L.healthy, dead: L.dead, mode: L.session.mode, calls: L.calls, pending: L.pending, failures: L.failures, loadMs: L.loadMs, probeMs: L.probeMs, share: L.model.share, ema: L.model.ema };
+    return { lanes, loading: [...this.loading], queue: { pending: this.inflight.length, waitMs: this.waitMs() }, load: this.load, sampling: !!this.sampling, processAffinity: this.processAffinity ?? null, keepAliveCalls: this.keepAliveCalls ?? 0, gpuState: thermalState(performance.now() - this.lastGpuWorkEnd) };
   }
 
+  /**
+   * Release every session (and end the worker threads). New calls are rejected immediately; calls already
+   * queued finish first (a session must not be released under a running inference). Lanes still loading are
+   * closed as they finish.
+   */
   async close() {
+    this.closed = true;
     this.pauseSampling();
     if (this._keepAliveTimer) clearTimeout(this._keepAliveTimer);
     this._keepAliveUntil = 0;
-    await Promise.all([...this.lanes.values()].map((L) => L.laya.close().catch(() => {})));
+    await this.queue.catch(() => {});
+    await Promise.allSettled([...this.direct]);
+    await Promise.all([...this.lanes.values()].map((L) => L.session.close().catch(() => {})));
     this.lanes.clear();
   }
 }

@@ -6,20 +6,24 @@
  *   node serve.mjs                         # foreground server on http://127.0.0.1:8787, never exits on its own
  *   node serve.mjs --idle 5m               # exit after 5 minutes without requests (frees RAM + VRAM); 30s, 10m, 0 = never
  *   node serve.mjs --sidecar               # spawned by ask.mjs: --idle defaults to $LAYA_IDLE or 5m
+ *   node serve.mjs --max-age 12h           # recycle: exit (once nothing is in flight) after this long; the next call spawns a fresh one
  *   node serve.mjs --port 9000 --lanes webgpu:fp16,cpu:8
  *   node serve.mjs --calibration calibration/smart-home-v3.json   # one table for every preset (default: per preset,
  *                                                                 # calibration/<preset>.json when present)
  *   node serve.mjs --cors                  # allow browser pages from other origins to call the API (off by default)
+ *   node serve.mjs --in-process            # lanes in this thread instead of worker threads (blocks the server during inference)
  *
  * Lifecycle: the port is bound BEFORE the model loads, so the port doubles as the mutex between racing
- * launchers (a second instance gets EADDRINUSE and exits with code 3 without loading anything). While
- * loading, /health reports status "loading" and /decide answers 503. Idle exit only happens with no request
- * in flight. Background load sampling (nvidia-smi / CPU) pauses after 10 s idle.
+ * launchers (a second instance gets EADDRINUSE and exits with code 3 without loading anything). Lanes load in
+ * parallel (worker threads) and the server is "ready" as soon as the first lane has been probed and warmed;
+ * the others join while it serves (/health lists them under lanesLoading). While loading, /health reports
+ * status "loading" and /decide answers 503. Idle exit only happens with no request in flight. Background load
+ * sampling (nvidia-smi / CPU) pauses after 10 s idle.
  *
  * Endpoints (all JSON):
  *   GET  /                 browser UI
- *   GET  /health           { service: "laya", status: loading|ready|failed|stopping, pid, port, lanes, uptimeS,
- *                            idleS, idleRemainingS, inFlight, sidecar }
+ *   GET  /health           { service: "laya", status: loading|ready|failed|stopping, pid, port, lanes, lanesLoading,
+ *                            uptimeS, idleS, idleRemainingS, maxAgeS, inFlight, sidecar }
  *   GET  /presets          { name: { description, source, state, questions } }
  *   GET  /stats            router statistics (latency estimates, load, per-lane calls / pending)
  *   POST /decide           body: { text?: string, state?: any, preset?: string, questions?: {...}, lane?: string, deadlineMs?: number,
@@ -54,10 +58,13 @@ const { values: args } = parseArgs({
     calibration: { type: "string" },
     cors: { type: "boolean", default: false },
     idle: { type: "string" },
+    "max-age": { type: "string", default: process.env.LAYA_MAX_AGE ?? "0" },
     sidecar: { type: "boolean", default: false },
+    "in-process": { type: "boolean", default: false },
   },
 });
 const idleMs = parseDuration(args.idle ?? (args.sidecar ? process.env.LAYA_IDLE ?? "5m" : "0"));
+const maxAgeMs = parseDuration(args["max-age"]);
 const SAMPLING_PAUSE_MS = 10_000;
 const log = (m) => console.log(`[serve${args.sidecar ? ":sidecar" : ""} ${process.pid}] ${new Date().toISOString().slice(11, 19)} ${m}`);
 process.title = args.sidecar ? "laya-sidecar" : "laya-serve";
@@ -100,6 +107,16 @@ function onIdle() {
   if (inFlight > 0 || Date.now() < lastRequestAt + idleMs) return armTimers();
   log(`idle for ${Math.round(idleMs / 1000)} s with nothing in flight; exiting`);
   shutdown("idle", 0);
+}
+
+/** --max-age: recycle the process once it is this old (in-flight calls finish; new callers spawn a fresh one). */
+if (maxAgeMs > 0) {
+  const t = setTimeout(() => {
+    if (shuttingDown) return;
+    log(`max age ${Math.round(maxAgeMs / 1000)} s reached; recycling`);
+    shutdown("max-age", 0);
+  }, maxAgeMs);
+  t.unref(); // the server socket keeps the process alive; this must not
 }
 
 async function shutdown(reason, code = 0) {
@@ -197,13 +214,20 @@ async function decide(body) {
   else throw Object.assign(new Error("provide text (string) or state (any JSON)"), { status: 400 });
   const opts = { calibration: body.calibration?.temperature_by_options ? { temperature_by_options: body.calibration.temperature_by_options, file: body.calibration.file ?? "request" } : await calibrationFor(presetName) };
   if (body.lane) {
-    if (!router.lanes.has(body.lane)) throw Object.assign(new Error(`lane ${body.lane} not loaded; have ${[...router.lanes.keys()].join(", ")}`), { status: 400 });
+    if (!router.lanes.has(body.lane)) {
+      if (router.pendingLanes.includes(body.lane)) throw Object.assign(new Error(`lane ${body.lane} is still loading`), { status: 503, retryAfterMs: 500 });
+      throw Object.assign(new Error(`lane ${body.lane} not loaded; have ${[...router.lanes.keys()].join(", ")}`), { status: 400 });
+    }
     opts.lane = body.lane;
   }
   if (body.deadlineMs) opts.deadlineMs = Number(body.deadlineMs);
   const r = await router.decide(state, questions, opts);
   return { answers: r.answers, usage: r.usage, routing: r.routing, state, questions, preset: body.questions ? null : presetName, calibration: opts.calibration?.file ?? null };
 }
+
+const CONFIGURED_LANES = args.lanes.split(",");
+/** Lanes in the configured order (they register in completion order), then any others. */
+const laneList = () => (router ? [...CONFIGURED_LANES.filter((l) => router.lanes.has(l)), ...[...router.lanes.keys()].filter((l) => !CONFIGURED_LANES.includes(l))] : []);
 
 const health = () => ({
   service: "laya",
@@ -213,10 +237,13 @@ const health = () => ({
   pid: process.pid,
   port: Number(args.port),
   sidecar: args.sidecar,
-  lanes: router ? [...router.lanes.keys()] : [],
+  lanes: laneList(),
+  lanesLoading: router ? router.pendingLanes : CONFIGURED_LANES,
+  workers: !args["in-process"],
   uptimeS: Math.round((Date.now() - started) / 1000),
   idleS: idleMs ? Math.round(idleMs / 1000) : 0,
   idleRemainingS: idleRemainingS(),
+  maxAgeS: maxAgeMs ? Math.round(maxAgeMs / 1000) : 0,
   inFlight,
   sampling: !!router?.sampling,
 });
@@ -270,7 +297,7 @@ const server = createServer(async (req, res) => {
   } catch (e) {
     const statusCode = e.status ?? 500;
     if (statusCode === 500) log(`error: ${e.stack ?? e}`);
-    return json(res, statusCode, { error: e.message ?? String(e) });
+    return json(res, statusCode, { error: e.message ?? String(e), ...(e.retryAfterMs ? { retryAfterMs: e.retryAfterMs } : {}) });
   }
 });
 server.keepAliveTimeout = 5_000;
@@ -285,15 +312,28 @@ server.on("error", (e) => {
 });
 
 server.listen(Number(args.port), args.host, async () => {
-  log(`listening on http://${args.host}:${args.port} (v${VERSION}${idleMs ? `, idle exit after ${Math.round(idleMs / 1000)} s` : ", no idle exit"}); loading lanes ${args.lanes} ...`);
+  log(`listening on http://${args.host}:${args.port} (v${VERSION}${idleMs ? `, idle exit after ${Math.round(idleMs / 1000)} s` : ", no idle exit"}${maxAgeMs ? `, max age ${Math.round(maxAgeMs / 1000)} s` : ""}); loading lanes ${args.lanes} ...`);
   armTimers();
   try {
-    router = await LayaRouter.create({ lanes: args.lanes.split(","), log: (m) => log(`  ${m}`) });
     PRESETS = await loadPresets();
-    await router.warmup({ state: PRESETS[DEFAULT_PRESET].state("Please turn off the lights in the living room now"), sizes: [3, 5] });
+    const warmupState = PRESETS[DEFAULT_PRESET].state("Please turn off the lights in the living room now");
+    // serve as soon as the first lane is probed and warmed; the others join while we answer requests
+    router = await LayaRouter.create({
+      lanes: CONFIGURED_LANES,
+      workers: !args["in-process"],
+      warmup: { state: warmupState, sizes: [3, 5] },
+      waitFor: "first",
+      onLaneReady: (lane, info) => {
+        if (status === "ready") log(`lane ${lane} joined after ${((Date.now() - started) / 1000).toFixed(1)} s (load ${(info.loadMs / 1000).toFixed(1)} s, warm-up ${Object.values(info.warmup ?? {}).map((v) => v.ms.toFixed(0)).join("/")} ms)`);
+      },
+      log: (m) => log(`  ${m}`),
+    });
     status = "ready";
     touch();
-    log(`ready in ${((Date.now() - started) / 1000).toFixed(1)} s; lanes: ${[...router.lanes.keys()].join(", ")}; presets: ${Object.keys(PRESETS).join(", ")} (${PRESETS_DIR})`);
+    log(`ready in ${((Date.now() - started) / 1000).toFixed(1)} s with ${laneList().join(", ")}${router.pendingLanes.length ? ` (still loading: ${router.pendingLanes.join(", ")})` : ""}; presets: ${Object.keys(PRESETS).join(", ")} (${PRESETS_DIR})`);
+    router.ready.then(() => {
+      if (CONFIGURED_LANES.length > 1) log(`all lanes ready in ${((Date.now() - started) / 1000).toFixed(1)} s: ${laneList().join(", ")}`);
+    }).catch(() => {});
   } catch (e) {
     status = "failed";
     loadError = String(e?.message ?? e).split("\n")[0];
@@ -337,12 +377,18 @@ const $ = (id) => document.getElementById(id);
 let presets = {};
 async function init() {
   presets = await (await fetch('/presets')).json();
+  const curPreset = $('preset').value, curLane = $('lane').value;
+  $('preset').innerHTML = '';
   for (const [k, p] of Object.entries(presets)) { const o = document.createElement('option'); o.value = k; o.textContent = k; $('preset').append(o); }
+  if (presets[curPreset]) $('preset').value = curPreset;
   const h = await (await fetch('/health')).json();
+  $('lane').innerHTML = '<option value="">auto</option>';
   for (const l of h.lanes) { const o = document.createElement('option'); o.value = l; o.textContent = l; $('lane').append(o); }
+  if (h.lanes.includes(curLane)) $('lane').value = curLane;
   $('preset').onchange = () => { $('desc').textContent = presets[$('preset').value].description; };
   $('preset').onchange();
   if (h.status !== 'ready') { $('status').textContent = 'model ' + h.status + ' ...'; setTimeout(init, 1000); }
+  else if (h.lanesLoading && h.lanesLoading.length) { $('status').textContent = 'lanes still loading: ' + h.lanesLoading.join(', '); setTimeout(init, 1000); }
 }
 const pct = (p) => Math.round(p * 100) + '%';
 const bar = (p) => '<span class="bar" style="width:' + Math.round(p * 120) + 'px"></span>';

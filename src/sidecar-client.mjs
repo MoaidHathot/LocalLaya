@@ -106,7 +106,7 @@ export async function logTail(port = DEFAULT_PORT, lines = 12) {
  * Start serve.mjs as a detached background process (own console session, hidden window, stdout+stderr
  * appended to .laya/sidecar-<port>.log). Returns the ChildProcess; the caller must not wait on it.
  */
-export async function spawnSidecar({ port = DEFAULT_PORT, idle = DEFAULT_IDLE, lanes, calibration, nodeArgs = [] } = {}) {
+export async function spawnSidecar({ port = DEFAULT_PORT, idle = DEFAULT_IDLE, maxAge, lanes, calibration, nodeArgs = [] } = {}) {
   await mkdir(LOG_DIR, { recursive: true });
   const logFile = logFileFor(port);
   try {
@@ -116,6 +116,7 @@ export async function spawnSidecar({ port = DEFAULT_PORT, idle = DEFAULT_IDLE, l
   }
   const fh = await open(logFile, "a");
   const argv = [...nodeArgs, path.join(PROJECT_ROOT, "serve.mjs"), "--sidecar", "--port", String(port), "--idle", String(idle)];
+  if (maxAge) argv.push("--max-age", String(maxAge));
   if (lanes) argv.push("--lanes", lanes);
   if (calibration) argv.push("--calibration", calibration);
   const child = spawn(process.execPath, argv, {
@@ -158,10 +159,26 @@ export async function waitReady({ port = DEFAULT_PORT, host = "127.0.0.1", timeo
 }
 
 /**
+ * "ready" means the first lane serves; the others join in the background (/health.lanesLoading). Wait until
+ * every configured lane is loaded or dropped. Returns the health object.
+ */
+export async function waitAllLanes({ port = DEFAULT_PORT, host = "127.0.0.1", timeoutMs = 120_000, intervalMs = 250 } = {}) {
+  const t0 = Date.now();
+  for (;;) {
+    const d = await discover({ port, host });
+    if (d.state === "ready" && !d.health.lanesLoading?.length) return d.health;
+    if (d.state === "failed") throw new SidecarError("LOAD_FAILED", `sidecar failed to load: ${d.health?.error ?? "unknown"}\n${await logTail(port)}`);
+    if (d.state === "none" || d.state === "foreign") throw new SidecarError(d.state === "none" ? "GONE" : "FOREIGN_PORT", `no Laya sidecar on port ${port} any more`);
+    if (Date.now() - t0 > timeoutMs) throw new SidecarError("TIMEOUT", `lanes ${d.health?.lanesLoading?.join(", ")} still loading after ${Math.round(timeoutMs / 1000)} s`);
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
+/**
  * Make sure a ready sidecar is listening: reuse a running one, wait for a loading one, or spawn a new one.
  * @returns {Promise<{health:object, spawned:boolean}>}
  */
-export async function ensureSidecar({ port = DEFAULT_PORT, host = "127.0.0.1", idle = DEFAULT_IDLE, lanes, calibration, timeoutMs, onProgress } = {}) {
+export async function ensureSidecar({ port = DEFAULT_PORT, host = "127.0.0.1", idle = DEFAULT_IDLE, maxAge, lanes, calibration, timeoutMs, onProgress } = {}) {
   const d = await discover({ port, host });
   if (d.state === "ready") return { health: d.health, spawned: false };
   if (d.state === "foreign") throw new SidecarError("FOREIGN_PORT", `port ${port} is used by something that is not the Laya sidecar; set LAYA_PORT / --port to a free port`);
@@ -174,7 +191,7 @@ export async function ensureSidecar({ port = DEFAULT_PORT, host = "127.0.0.1", i
     for (let i = 0; i < 40 && (await discover({ port, host })).state !== "none"; i++) await new Promise((r) => setTimeout(r, 100));
   }
   onProgress?.("spawning", 0);
-  const child = await spawnSidecar({ port, idle, lanes, calibration });
+  const child = await spawnSidecar({ port, idle, maxAge, lanes, calibration });
   const health = await waitReady({ port, host, timeoutMs, child, onProgress });
   return { health, spawned: true, pid: health.pid };
 }

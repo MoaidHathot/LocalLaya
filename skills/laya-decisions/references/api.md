@@ -36,7 +36,7 @@ Base URL `http://127.0.0.1:8787` (or `--port` / `LAYA_PORT`). JSON everywhere.
 
 | method + path | purpose |
 |---|---|
-| `GET /health` | `{ service: "laya", version, status: loading\|ready\|failed\|stopping, pid, port, sidecar, lanes, uptimeS, idleS, idleRemainingS, inFlight, sampling }` |
+| `GET /health` | `{ service: "laya", version, status: loading\|ready\|failed\|stopping, pid, port, sidecar, lanes, lanesLoading, workers, uptimeS, idleS, idleRemainingS, maxAgeS, inFlight, sampling }` |
 | `GET /presets` | `{ <name>: { description, source: built-in\|file, state (template with "$TEXT"), questions } }` |
 | `GET /stats` | router statistics: per-lane calls / pending / EMA latencies, queue depth + predicted wait, external CPU/GPU load, GPU state |
 | `POST /decide` | body below -> `{ answers, usage, routing, state, questions, preset, calibration }`; 503 `{ error: "loading" }` while the model loads (retry after `retryAfterMs`) |
@@ -84,16 +84,21 @@ Errors: 400 with `{ error }` for bad input (unknown preset, invalid questions, m
 - `routing.ms` is inference time on the chosen lane; `queueMs` time spent waiting behind other callers. Calls
   are served one at a time (one queue for all lanes): throughput is ~20 calls/s for 3 questions on the GPU
   lane whatever the number of parallel callers; parallel callers only wait longer. Batch questions into one
-  call rather than calling in parallel.
+  call rather than calling in parallel. The lane is chosen when the call reaches the front of the queue;
+  `routing.provisionalLane` appears when that differed from the lane expected at enqueue time (e.g. the GPU
+  lane joined during start-up).
 
 ## Lifecycle of the sidecar
 
-- Started by `ask.mjs --sidecar` / `--start` as `node serve.mjs --sidecar --idle <dur>`, detached, hidden
-  window, log appended to `.laya/sidecar-<port>.log` in the project.
-- Binds the port before loading; racing launchers -> one instance (loser exits 3). Callers during the load
-  wait for `status: ready` (about 4-6 s with the GPU + CPU lanes).
-- Exits on its own after `idle` without `/decide` or `/touch` calls, with nothing in flight. RAM and VRAM are
-  released; the next call spawns a new one.
+- Started by `ask.mjs --sidecar` / `--start` as `node serve.mjs --sidecar --idle <dur> [--max-age <dur>]`,
+  detached, hidden window, log appended to `.laya/sidecar-<port>.log` in the project.
+- Binds the port before loading; racing launchers -> one instance (loser exits 3). Lanes load in parallel in
+  worker threads; `status: ready` comes as soon as the first lane is probed and warmed (~2.5 s after spawn),
+  the other lane joins ~1 s later (`/health.lanesLoading`). Callers during the load wait for `ready`; a
+  `/decide` that forces a lane still loading gets `503 { retryAfterMs }` (the CLI client retries).
+- Exits on its own after `idle` without `/decide` or `/touch` calls, with nothing in flight, and at `maxAge`
+  if set. RAM and VRAM are released; the next call spawns a new one.
+- Inferences run in worker threads: `/health`, `/stats` and new requests are answered while a call runs.
 - Background load sampling (`nvidia-smi`, CPU) pauses after 10 s idle and resumes on the next request.
 - Presets and calibration files are re-read when they change on disk.
 - `/health` from a foreign service (no `service: "laya"`) is never stopped; the CLI falls back to in-process.
@@ -106,6 +111,7 @@ Errors: 400 with `{ error }` for bad input (unknown preset, invalid questions, m
 | `LAYA_SIDECAR=1` | `ask.mjs` uses the sidecar by default (`--local` overrides) |
 | `LAYA_PORT` | sidecar port (default 8787) |
 | `LAYA_IDLE` | default idle exit (default `5m`) |
+| `LAYA_MAX_AGE` | default max age before the sidecar recycles itself (default never) |
 | `LAYA_LANES` | default lanes for `serve.mjs` (default `webgpu:fp16,cpu:8`) |
 | `LAYA_CACHE` | model cache directory (default `<project>/models`) |
 | `LAYA_PCORE_LOGICAL` | number of logical P-core processors for CPU pinning (default 16) |

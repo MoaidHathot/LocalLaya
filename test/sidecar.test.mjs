@@ -6,8 +6,9 @@
  * Uses port 8797 and short idle timeouts so it never touches a sidecar you may have running on 8787.
  * Scenarios: spawn on first use / fast second call / two launchers racing -> exactly one process /
  * idle exit frees the process and VRAM / hard kill recovery / --stop / --local / REPL over the sidecar with
- * keep-alive / 8 parallel calls spread over both lanes with zero errors / preset + calibration edits picked
- * up live / foreign service on the port detected.
+ * keep-alive / 8 parallel calls on one queue with zero errors / preset + calibration edits picked up live /
+ * foreign service on the port detected / ready as soon as the first lane serves, forced call on a lane still
+ * loading waits and succeeds / --max-age recycling.
  */
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -17,7 +18,7 @@ import { mkdtemp, readFile, rm, writeFile, copyFile, utimes } from "node:fs/prom
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { discover, ensureSidecar, decide, stop, waitReady, spawnSidecar, PROJECT_ROOT, logFileFor } from "../src/sidecar-client.mjs";
+import { discover, ensureSidecar, decide, stop, waitReady, waitAllLanes, spawnSidecar, PROJECT_ROOT, logFileFor } from "../src/sidecar-client.mjs";
 import { queryGpu } from "../src/metrics.mjs";
 
 const PORT = 8797;
@@ -122,6 +123,7 @@ test("two launchers racing produce exactly one sidecar (port = mutex, loser exit
 });
 
 test("8 parallel callers: zero errors, one queue, no spill to the CPU lane", async () => {
+  await waitAllLanes({ port: PORT }); // steady state: the start-up window (lanes joining) has its own test below
   const bodies = Array.from({ length: 8 }, (_, i) => ({ preset: "smart-home", text: `Set the ${["kitchen", "bedroom", "office", "porch", "garage", "hall", "living room", "bathroom"][i]} lights to ${20 + i * 10} percent` }));
   const t0 = Date.now();
   const results = await Promise.all(bodies.map((b) => decide(b, { port: PORT })));
@@ -241,17 +243,86 @@ test("foreign service on the port: detected, never stopped, CLI falls back to in
 });
 
 test("--start makes it ready and prints connection info; a foreground serve on the same port exits with 3", async () => {
-  const s = await ask(["--start", "--idle", "30s"]);
-  const info = JSON.parse(s.stdout);
-  assert.equal(info.url, `http://127.0.0.1:${PORT}`);
-  assert.ok(info.spawned);
-  assert.deepEqual(info.lanes, ["webgpu:fp16", "cpu:8"]);
-  const again = JSON.parse((await ask(["--start"])).stdout);
-  assert.equal(again.spawned, false);
-  assert.equal(again.pid, info.pid);
-  // a second server on the same port must not load anything
-  const p = spawn(node, ["serve.mjs", "--port", String(PORT)], { cwd: PROJECT_ROOT, stdio: ["ignore", "pipe", "pipe"] });
-  const code = await new Promise((r) => p.once("exit", r));
-  assert.equal(code, 3);
-  await stop({ port: PORT });
+  try {
+    const s = await ask(["--start", "--idle", "30s"]);
+    const info = JSON.parse(s.stdout);
+    assert.equal(info.url, `http://127.0.0.1:${PORT}`);
+    assert.ok(info.spawned);
+    assert.deepEqual(info.lanes, ["webgpu:fp16", "cpu:8"], "--start reports every lane, in the configured order, once all are loaded");
+    const again = JSON.parse((await ask(["--start"])).stdout);
+    assert.equal(again.spawned, false);
+    assert.equal(again.pid, info.pid);
+    // a second server on the same port must not load anything
+    const p = spawn(node, ["serve.mjs", "--port", String(PORT)], { cwd: PROJECT_ROOT, stdio: ["ignore", "pipe", "pipe"] });
+    const code = await new Promise((r) => p.once("exit", r));
+    assert.equal(code, 3);
+  } finally {
+    await stop({ port: PORT }).catch(() => {});
+  }
+});
+
+test("ready as soon as the first lane serves; a call forced onto a lane still loading waits and succeeds", async () => {
+  assert.equal((await discover({ port: PORT })).state, "none");
+  try {
+    const t0 = Date.now();
+    const child = await spawnSidecar({ port: PORT, idle: "1m" });
+    const h = await waitReady({ port: PORT, child });
+    const readyMs = Date.now() - t0;
+    assert.ok(h.lanes.length >= 1);
+    assert.equal(h.lanes.length + h.lanesLoading.length, 2, `lanes ${h.lanes} + loading ${h.lanesLoading}`);
+    assert.equal(h.workers, true);
+    // the forced lane may still be loading: the server answers 503 + retryAfterMs and the client retries
+    const r = await decide({ preset: "smart-home", text: "Turn off the living room lights", lane: "cpu:8" }, { port: PORT });
+    assert.equal(r.routing.lane, "cpu:8");
+    assert.equal(r.answers.intent.choice, "control_device");
+    const all = await waitAllLanes({ port: PORT });
+    assert.deepEqual(all.lanes, ["webgpu:fp16", "cpu:8"], "configured order, whatever the load order was");
+    assert.deepEqual(all.lanesLoading, []);
+    const allMs = Date.now() - t0;
+    const log = await readFile(logFileFor(PORT), "utf8");
+    const tail = log.slice(log.lastIndexOf("listening on"));
+    assert.match(tail, /ready in [\d.]+ s with /);
+    assert.match(tail, /all lanes ready in [\d.]+ s: webgpu:fp16, cpu:8/);
+    console.log(`      ready with ${h.lanes.join(",")} after ${readyMs} ms${h.lanesLoading.length ? ` (${h.lanesLoading.join(",")} still loading)` : ""}; all lanes after ${allMs} ms`);
+    // a lane that does not exist is a 400, not a retry loop
+    await assert.rejects(decide({ preset: "smart-home", text: "x", lane: "cpu:99" }, { port: PORT }), (e) => e.code === "BAD_REQUEST" && /not loaded/.test(e.message));
+    // a burst right after start-up: lanes are bound when a call reaches the front of the queue, so calls queued
+    // while only one lane served move to the GPU lane once it has joined instead of piling onto the CPU
+    await stop({ port: PORT });
+    const child2 = await spawnSidecar({ port: PORT, idle: "1m" });
+    const h2 = await waitReady({ port: PORT, child: child2 });
+    const tb = Date.now();
+    const burst = await Promise.all(Array.from({ length: 8 }, (_, i) => decide({ preset: "smart-home", text: `Set the lights to ${10 + i * 10} percent` }, { port: PORT })));
+    const burstMs = Date.now() - tb;
+    const lanes = burst.map((b) => b.routing.lane);
+    console.log(`      8-call burst right after start (${h2.lanes.join(",")} ready, ${h2.lanesLoading.join(",") || "nothing"} loading): ${burstMs} ms on ${[...new Set(lanes)].join(" + ")}${burst.some((b) => b.routing.provisionalLane) ? ", some calls re-bound to a lane that joined" : ""}`);
+    assert.ok(burst.every((b) => b.answers.intent), "every call answered");
+    assert.ok(burstMs < 5000, `burst took ${burstMs} ms (all on the CPU lane would take ~8 s)`);
+    assert.ok(lanes.includes("webgpu:fp16"), `the GPU lane took part: ${lanes.join(", ")}`);
+  } finally {
+    await stop({ port: PORT }).catch(() => {});
+  }
+});
+
+test("--max-age: the sidecar recycles itself once it is old enough", async () => {
+  assert.equal((await discover({ port: PORT })).state, "none");
+  try {
+    const child = await spawnSidecar({ port: PORT, idle: "2m", maxAge: "8s", lanes: "cpu:8" });
+    const h = await waitReady({ port: PORT, child });
+    assert.equal(h.maxAgeS, 8);
+    assert.equal(h.idleS, 120);
+    assert.deepEqual(h.lanes, ["cpu:8"]);
+    const gone = await waitGone(PORT, 20_000);
+    assert.ok(gone, "sidecar exited at its max age although idle exit was still 2 minutes away");
+    await sleep(500);
+    assert.ok(!alive(h.pid), "process is gone");
+    const log = await readFile(logFileFor(PORT), "utf8");
+    assert.match(log, /max age 8 s reached; recycling/);
+    // the next caller simply spawns a fresh one
+    const a = await ask(["--sidecar", "--idle", "1m", "--json", "Turn on the TV"]);
+    assert.match(a.stderr, /starting one/);
+    assert.notEqual((await discover({ port: PORT })).health.pid, h.pid);
+  } finally {
+    await stop({ port: PORT }).catch(() => {});
+  }
 });

@@ -1,4 +1,4 @@
-# Session log - 2026-09-23: throughput, the one-thread truth, and the queue fix
+# Session log - 2026-09-23: throughput, the one-thread truth, the queue fix, worker lanes
 
 Chronological record. The living status is `docs/STATUS.md`; this file is the "what happened and why" trail.
 
@@ -66,6 +66,46 @@ Raw JSON in `results/throughput-*.json` (ignored), summaries in `results/through
 - Also measured: GPU latency vs gap between calls: 48 ms back-to-back, 58-66 with 50 ms gaps, 54-81 with
   100 ms, 75-96 with 200 ms - the clock governor reacts within tenths of a second.
 
+## Phase 5 - commit, then the next STATUS items: worker lanes, early serving, late binding, max-age, CI
+
+User: "commit, and go ahead with the next items in docs/status.md; add tests, verify everything, fix bugs."
+Items 1-3 (real labels, fine-tuning, multilingual) need data or hours of GPU; 7 (DirectML retest) needs a
+newer `onnxruntime-node` that npm cannot fetch here. Done: 4 (first-lane serving, `--max-age`), 5 (worker
+lanes), 6 (`cpu:8` default), 9 (GitHub Actions, `bench-all` defaults).
+
+- **Worker lanes** (`src/lane.mjs`, `src/lane-worker.mjs`): one handle for in-thread and worker sessions
+  (`systemOne(state, questions, temps)`, `close()`, `onDeath`); the router talks to `L.session`, never to
+  `Laya` directly. Workers unref'd while idle. `test/router.test.mjs`: identical answers, main-thread stall
+  1.1 s -> 18 ms, round trip 306 vs 294 ms (noise), two lanes ready in 2.2 s instead of 3.3-3.6.
+- **Bug found by the first death test**: `worker.terminate()` while ORT runs on that thread kills the whole
+  process (`0xC0000409`). Consequences: `close()` asks the worker to release and exit itself and only
+  terminates an idle worker; the worker handles messages in order so `close` never releases a session under a
+  run; `router.close()` drains the FIFO first. The tests inject failures instead (a rejecting `systemOne`;
+  terminating an *idle* worker) and cover retry, quarantine, dead-lane exclusion and forced-lane errors.
+- **Early serving** (`waitFor: "first"`, `warmup`, `onLaneReady`, `router.ready`, `pendingLanes`;
+  `/health.lanesLoading`, 503 + `retryAfterMs` for a forced lane still loading, `waitAllLanes()` in the
+  client, `--start` waits for every lane). First call 5.0-6.3 s -> 3.1-4.5 s; ready at 2.6-2.9 s, both lanes at 3.5-3.8 s.
+- **Bug found by the sidecar suite**: an 8-call burst right after start ran on `cpu:8` for 7.6 s while the
+  GPU lane joined after ~1 s and sat idle - lanes were bound at enqueue time. Fix 1: **late binding** - the
+  lane is chosen when the call reaches the front of the queue (`_enqueue(..., rebind)`, provisional lane only
+  for the wait estimates; exploration moved there too). Still 7.6 s: the GPU lane's probe + warm-up were
+  *in the FIFO behind the burst*. Fix 2: probes and warm-ups run outside the FIFO (`_direct`). Result: 6 x 10 q
+  during start-up 1.8 s instead of 5.7 s, 5 of 6 calls re-bound cpu:8 -> webgpu:fp16 (`routing.provisionalLane`).
+  CPU lanes now warm with one call per size (nothing to compile).
+- `--max-age` (`LAYA_MAX_AGE`) recycling; `health.lanes` in configured order; `--in-process` escape hatch for
+  `serve.mjs`, `router-demo.mjs`, `experiments/throughput.mjs`.
+- Test hygiene bugs: a stall ticker cannot observe a stall that ends before its next tick (measure the gap
+  after the await too); a noul question with P ~ 0 cannot be "sharpened" (use `should_execute` ~0.9);
+  early-serving assertions must tolerate the second lane joining during the call; every sidecar test now
+  stops the sidecar in `finally` so one failure does not cascade.
+- **CI**: `.github/workflows/unit-tests.yml` (Ubuntu/Windows x Node 20/22, `ONNXRUNTIME_NODE_INSTALL=skip`).
+  Found on the way: `package-lock.json` resolved URLs pointed at the Microsoft feed proxy, which GitHub cannot
+  reach - rewritten to `registry.npmjs.org` (npm's `replace-registry-host` keeps it working locally). The
+  workflow itself is unverified: no runner here and no `act`.
+- Verification: `npm test` 9/9, `npm run test:router` 7/7 (~35 s), `npm run test:sidecar` 13/13 (~65 s),
+  throughput quick run in worker mode 19.8 calls/s (same as in-process), `npm run router` scenarios unchanged.
+- Not done from item 4: named pipes, Windows service (no need shown); `skills-ref validate` (tool absent).
+
 ## Numbers worth remembering
 
 - `webgpu:fp16` 3 q: 19-21 calls/s back-to-back (57-63 questions/s), 10/s at 53-60 ms, 5/s at 61-85 ms,
@@ -74,3 +114,5 @@ Raw JSON in `results/throughput-*.json` (ignored), summaries in `results/through
 - A CPU call in a GPU burst costs every queued GPU call its full duration; `auto` lost 3x at 8 callers.
 - The JS thread on an E-core: 1.6x slower everything, for minutes at a time.
 - Machine noise: ~18 % CPU busy from other apps at "idle"; `cpu:8` ranged 257-375 ms p50 across runs today.
+- Sidecar first call 3.1-4.5 s (was 5.0-6.3); worker lanes: 18-44 ms main-thread stall during a 1 s CPU inference.
+- `worker.terminate()` under a running ORT inference = process crash 0xC0000409.

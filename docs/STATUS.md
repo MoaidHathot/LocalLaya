@@ -27,6 +27,10 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
 | Per-call execution-provider router (`src/ep-router.mjs`) | Back-to-back traffic: WebGPU 3-5x faster. Sporadic traffic: the GPU drops to 225 MHz between calls and a single question takes ~180 ms vs ~105 ms on CPU. The router predicts per (lane, GPU thermal state at start, question bucket, work) plus the shared queue wait, and picks. |
 | One FIFO queue for all lanes; a burst never spills to the CPU lane (2026-09-23) | `onnxruntime-node` runs `session.run()` synchronously on the JS thread, so inferences never overlap in one process; a CPU call inside a GPU burst stalled every GPU call behind it (49 -> 321-479 ms) and policy `auto` fell to 6.6 calls/s at 8 callers vs 20 GPU-only. Even with lanes in worker threads mixing loses (GPU 1.5x slower while the pinned CPU pool spins; 16 vs 20.6 calls/s). The CPU lane is for sporadic single questions on a cold GPU and for GPU-less machines. |
 | Process restricted to the P-cores on Windows (`pinProcessToPCores`, default in `LayaRouter.create`) | The JS thread tokenises, drives WebGPU and is one of ORT's workers; Windows parks it on an E-core for minutes: whole sessions at 78 ms instead of 49 ms per 3-q GPU call (1.6x), reproducible by forcing the E-cores. Node has no thread-affinity API; PowerShell sets the process mask in ~0.4 s during the model load. |
+| Lanes in worker threads by default (`src/lane.mjs`, `workers: false` for in-thread) (2026-09-23) | `session.run()` blocks the calling thread; in the main thread a 10-q CPU call froze the server for 1.1 s (no /health, no new requests, no idle timer). In a worker: 18 ms stall, identical answers, no measurable round-trip cost (306 vs 294 ms), and two lanes load in 2.2 s instead of 3.3-3.6 s (session creation no longer serialised). The FIFO across lanes stays (mixing loses). Rule: never `terminate()` a worker under a running inference - the process dies with 0xC0000409; workers release their session and exit on request. |
+| Sidecar serves as soon as the first lane is warm; lanes are bound at the front of the queue; probes/warm-ups bypass the FIFO | First call 5.0-6.3 s -> 3.1-4.5 s; ready with one lane at 2.6-2.9 s, both at 3.5-3.8 s. Binding at enqueue time sent a start-up burst to the CPU lane for 7.6 s while the GPU lane sat idle after joining; binding when a call reaches the front lets queued calls move over (6 x 10 q: 1.8 s instead of 5.7 s). Probes/warm-ups in the FIFO delayed the joining lane behind the burst, hence outside. |
+| `--max-age` recycling for the sidecar (default off, `LAYA_MAX_AGE`) | Cheap guard against slow leaks in an always-on instance; exits once nothing is in flight, the next call spawns a fresh one. Named-pipe transport and a Windows service were not done (no need shown yet). |
+| `package-lock.json` resolved URLs point at `registry.npmjs.org` | The lock had the Microsoft feed proxy's URLs, which GitHub Actions cannot reach; npm's `replace-registry-host` maps npmjs URLs to whatever registry is configured locally, so both work. |
 | Calibration = per-bucket temperature refit on labelled data; wording is the accuracy lever | Temperature never changes the arg-max; it fixes over-confidence where errors are spread, not systematic confusions. Wording moved smart-home intent 0.63 -> 0.72 but hurt another question - measure every question. |
 | CLI default stays in-process; `--sidecar` (or `LAYA_SIDECAR=1`) opts into the shared background instance | User choice (2026-09-22). No background process unless asked for. |
 | Sidecar idle exit 5 min; open REPL keeps it alive | User choice. Reload costs ~5 s; holding costs ~2 GB RAM + 0.8 GB VRAM. |
@@ -44,10 +48,16 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
   (`experiments/interference.mjs`: same thread vs child process), worker-thread lanes
   (`experiments/worker-lanes.mjs`). Results in `results/*-summary.md` and README.
 - **Router** (`src/ep-router.mjs`, `router-demo.mjs`): lanes `webgpu[:fp16]`, `cpu[:N][:nopin]`, `cpu:auto`,
-  `dml`; probe with real inference; EMA latency model normalised by estimated work; contention inflation;
-  one FIFO queue for all lanes with `wait + own` predictions and the GPU state expected at start; policies
-  `auto` / `prefer-gpu` / `prefer-cpu` / `min-cpu`, `deadlineMs`, forced lane; quarantine + fallback; per-call
-  calibration; `pauseSampling`/`resumeSampling`; P-core process affinity on Windows.
+  `dml` (default `webgpu,cpu:8`); probe with real inference; EMA latency model normalised by estimated work;
+  contention inflation; one FIFO queue for all lanes with `wait + own` predictions, the GPU state expected at
+  start and the lane bound when the call reaches the front; policies `auto` / `prefer-gpu` / `prefer-cpu` /
+  `min-cpu`, `deadlineMs`, forced lane; quarantine + fallback, dead-lane handling; per-call calibration;
+  `pauseSampling`/`resumeSampling`; P-core process affinity on Windows; `waitFor: "first"` + `warmup` +
+  `onLaneReady` + `router.ready` for early serving; `close()` drains the queue.
+- **Lanes** (`src/lane.mjs`, `src/lane-worker.mjs`): one Laya session per lane in a worker thread (default) or
+  in-thread, same handle (`systemOne(state, questions, temps)`, `close()`, `onDeath`); per-call temperature
+  override applied inside the lane; workers unref'd while idle; ordered message handling so `close` never
+  releases a session under a running inference.
 - **Calibration** (`src/calibration.mjs`, `calibrate.mjs`, `data/`, `calibration/`): raw-logit capture,
   accuracy / NLL / Brier / ECE, reliability tables, per-bucket temperature refit with leave-one-out,
   majority/chance baselines with a verdict per question; generic `--preset --eval` for any domain.
@@ -56,13 +66,19 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
   `$TEXT` state template; `dev-request` worked example with 40 labelled items.
 - **Ask surface** (`ask.mjs`): one-shot CLI, interactive REPL (ad-hoc `/choice` `/noul` `/score`, `/save`),
   `--json`, own `--state`/`--questions`.
-- **Server / sidecar** (`serve.mjs`, `src/sidecar-client.mjs`): `POST /decide`, `/presets`, `/health`,
-  `/stats`, `/touch`, `/shutdown`, browser page; listen-before-load (port = mutex), 503 while loading,
-  idle exit with nothing in flight, sampling pause, presets/calibration re-read by mtime, per-request
-  calibration override. CLI `--sidecar` / `--local` / `--start` / `--status` / `--stop` / `--idle` / `--port`.
+- **Server / sidecar** (`serve.mjs`, `src/sidecar-client.mjs`): `POST /decide`, `/presets`, `/health`
+  (`lanes`, `lanesLoading`, `maxAgeS`, `workers`), `/stats`, `/touch`, `/shutdown`, browser page;
+  listen-before-load (port = mutex), 503 while loading (and for a forced lane still loading, with
+  `retryAfterMs`), ready as soon as the first lane is warm, idle exit with nothing in flight, `--max-age`
+  recycling, sampling pause, presets/calibration re-read by mtime, per-request calibration override,
+  `--in-process` escape hatch. CLI `--sidecar` / `--local` / `--start` (waits for every lane) / `--status` /
+  `--stop` / `--idle` / `--max-age` / `--port`; client `waitAllLanes()`.
 - **Agent skill** (`skills/laya-decisions/`): `SKILL.md`, `references/api.md`, `references/presets.md`,
   `scripts/laya.mjs` (resolves the project via `LAYA_DIR`, runs `ask.mjs --sidecar --json`).
-- **Tests**: `npm test` (9 unit tests), `npm run test:sidecar` (11 lifecycle scenarios, ~1 min, port 8797).
+- **Tests**: `npm test` (9 unit tests, no model; also in GitHub Actions on Ubuntu/Windows x Node 20/22 -
+  `.github/workflows/unit-tests.yml`, not yet seen running on GitHub), `npm run test:router` (7 worker-lane /
+  failover / early-serving scenarios, ~35 s), `npm run test:sidecar` (13 lifecycle scenarios, ~65 s, port
+  8797), `npm run test:all`.
 
 ## Key measurements (this machine; treat as +-20 %)
 
@@ -73,10 +89,12 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
 | `webgpu` fp32 | 30.5 | 53 | 143 | 2 % | 1.1 GiB | +1636 MiB |
 | `webgpu:fp16` | 29.1 | 47 | 122 | 2 % | 0.6 GiB | +832 MiB |
 
-Sporadic 1-question calls (3 s gaps): WebGPU ~180 ms, CPU ~105 ms. Sidecar: first call 5.4 s, later
-calls ~0.2-0.4 s; 8 parallel 5-q calls in 1.4 s on one lane (2.6 s when they were spread over GPU + CPU).
-Accuracy zero-shot: smart-home intent 0.72, should_execute 0.66, target_device 0.77 (65 items); dev-request
-task 0.75, language 0.85 (40 items).
+Sporadic 1-question calls (3 s gaps): WebGPU ~180 ms, CPU ~105 ms. Sidecar: first call 3.1-4.5 s (was 5.0-6.3 s with
+lanes loading one after the other in the main thread), later calls ~0.15-0.4 s; ready with the first lane
+2.6-2.9 s after spawn, both lanes 3.5-3.8 s; 8 parallel 5-q calls in 1.1-1.4 s on one lane (2.6 s when they were
+spread over GPU + CPU). Worker lanes: main-thread stall during a 10-q CPU call 1.1 s -> 18 ms; two lanes load
+in 2.2-2.3 s instead of 3.3-3.6 s. Accuracy zero-shot: smart-home intent 0.72, should_execute 0.66,
+target_device 0.77 (65 items); dev-request task 0.75, language 0.85 (40 items).
 
 Throughput (3 q per call, `results/throughput-*-summary.md`): `webgpu:fp16` 19-21 calls/s back-to-back
 (57-63 questions/s), 10/s sustained at 53-60 ms, 5/s at 61-85 ms, 1/s at 112-143 ms (GPU clocks sag between
@@ -87,7 +105,8 @@ concurrency, identical to `prefer-gpu`.
 
 ## Open items / next steps
 
-Ordered roughly by value.
+Ordered roughly by value. Done on 2026-09-23: sidecar serves from the first lane + `--max-age`, lanes in
+worker threads, `cpu:8` as the default CPU lane, `bench-all` defaults, GitHub Actions for the unit tests.
 
 1. **Real traffic, real labels.** Everything above is measured on hand-written examples. Collect 50+ real
    inputs per preset that matters, label them, run `calibrate.mjs`, act on the verdicts.
@@ -95,23 +114,19 @@ Ordered roughly by value.
    then `export/export_onnx.py` -> load via `modelDir`. Not started.
 3. **Multilingual checkpoint**: only the English root is published as ONNX; export
    `convaiinnovations/laya-multilingual` ourselves if non-English input is needed.
-4. **Sidecar**: serve as soon as the first lane is ready (~1.6 s instead of ~5 s first call); optional
-   `--max-age` recycling; named-pipe transport (no port) if ever needed. Consider a Windows service / Task
-   Scheduler entry for always-on use.
-5. **Lanes in worker threads** (`experiments/worker-lanes.mjs` proves it works: both EPs load in
-   `node:worker_threads`, clean exit). Not for throughput - mixing lanes loses even in parallel - but for the
-   server: today every inference blocks the event loop, so `serve.mjs` cannot accept or parse requests, answer
-   `/health`, or run its idle timer while a 300 ms CPU call runs (main-thread stall 300+ ms vs 20 ms with
-   workers). Worth it if the sidecar is ever shared by several agents at once.
-6. **Router**: `cpu:8` measured equal to `cpu:16` at half the CPU share - consider making it the default
-   CPU lane after another measurement session; token-length feature is an estimate (`estimateWork`). With one
-   FIFO the CPU lane is only chosen for sporadic small calls on a cold GPU; consider whether loading it at all
-   is worth 1.6 GiB RAM on GPU machines (it still covers WebGPU failures).
-7. **DirectML**: re-test with newer `onnxruntime-node` releases (Reshape `node_view` failure, ORT 1.30).
-8. **Unmeasured presets** (`triage`, `guard`, `moderation`, `route`, `sentiment`): label and measure before
+4. **Sidecar, if ever needed**: named-pipe transport (no port); a Windows service / Task Scheduler entry for
+   always-on use (`--idle 0 --max-age 24h`).
+5. **Router**: the CPU lane is only chosen for sporadic small calls on a cold GPU and as a fallback - decide
+   whether loading it is worth 1.6 GiB RAM on GPU machines; token-length feature is an estimate
+   (`estimateWork`); the start-up EMA of a GPU lane warmed while CPU calls run is ~1.5x pessimistic for its
+   first few calls (self-corrects).
+6. **DirectML**: re-test with newer `onnxruntime-node` releases (Reshape `node_view` failure, ORT 1.30) -
+   needs a registry that carries them (npm here goes through a proxy that blocks `registry.npmjs.org`).
+7. **Unmeasured presets** (`triage`, `guard`, `moderation`, `route`, `sentiment`): label and measure before
    relying on them; the `guard` preset answering 100 % on obvious injections says nothing about subtle ones.
-9. **Housekeeping**: `bench-all` default configs, GitHub Actions (unit tests only - no model in CI),
-   `skills-ref validate` on the skill, decide whether to publish the skill separately.
+8. **Housekeeping**: confirm the GitHub Actions run is green after the first push (written blind: no runner
+   here, `npm ci` from `registry.npmjs.org` is blocked on this machine), `skills-ref validate` on the skill
+   (tool not installed here), decide whether to publish the skill separately.
 
 ## Known issues / caveats
 
@@ -119,8 +134,12 @@ Ordered roughly by value.
   far is the JS thread landing on an E-core (whole sessions 1.6x slower on both lanes; fixed by the P-core
   process affinity in `LayaRouter.create`). Residual 1.1-1.3x swings remain from other processes' load (~18 %
   of the machine busy at "idle" here) and thermals. The 5x E-core straggler mode is gone with pinning.
-- Every inference blocks the Node event loop for its duration (`onnxruntime-node` runs synchronously); the HTTP
-  server is unresponsive while a call runs (up to ~1 s for 10 CPU questions). See open item 5.
+- `session.run()` blocks the thread it runs on. With lanes in worker threads (default) the main thread is free;
+  with `--in-process` / `workers: false` the HTTP server is unresponsive while a call runs (up to ~1 s for 10
+  CPU questions). Never `worker.terminate()` a lane with an inference in flight: the process dies with
+  `0xC0000409` (terminating an idle worker is fine).
+- Early serving trades the first second: a call that arrives while only the CPU lane is up runs there
+  (~300 ms for 3 q) rather than waiting ~0.5-1 s for the GPU lane; bursts move over as soon as it joins.
 - GPU latency depends on the gap between calls, not only on long pauses: 48 ms back-to-back, 58-66 ms with
   50 ms gaps, 75-96 ms with 200 ms gaps (3 q). Rates quoted from back-to-back runs are upper bounds.
 - WebGPU EP is marked experimental by ORT; first call after load ~180 ms (shader compile).
@@ -136,6 +155,7 @@ Ordered roughly by value.
 ```powershell
 cd W:\Github\LocalLaya
 npm test                      # 9 unit tests, no model needed
+npm run test:router           # worker lanes, failover, early serving (~35 s, needs model + GPU)
 node ask.mjs --status         # is a sidecar running?
 node ask.mjs --sidecar "..."  # start using it
 npm run test:sidecar          # full lifecycle check (~1 min)

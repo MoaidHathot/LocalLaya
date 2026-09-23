@@ -12,12 +12,13 @@ Everything downloaded lives under this directory (`models/`, `node_modules/`, `.
 | path | what |
 |---|---|
 | `ask.mjs` | ask it things: one-shot CLI or interactive REPL with presets and ad-hoc questions |
-| `serve.mjs` | local HTTP API (`POST /decide`) + browser page; model stays loaded; also the on-demand sidecar (`--idle`, `/health`, `/shutdown`) |
+| `serve.mjs` | local HTTP API (`POST /decide`) + browser page; model stays loaded; also the on-demand sidecar (`--idle`, `--max-age`, `/health`, `/shutdown`); ready as soon as the first lane serves |
 | `src/sidecar-client.mjs` | discover / spawn / wait / call / stop the sidecar; no ONNX import (used by `ask.mjs --sidecar`) |
 | `data/presets.mjs`, `presets/` | built-in question presets (smart-home calibrated; triage, guard, moderation, route, sentiment unmeasured) + your own `presets/<name>.json`; `dev-request` worked example with labelled eval |
 | `poc.mjs` | load once, answer 3 questions in one pass, 10 timed runs, sanity check on contrasting states |
 | `src/laya-client.mjs` | reusable loader: pinned HF revision, project-local cache, SHA256 verification, no network after first download, EP selection, P-core pinning (threads and, on Windows, the process), calibration, `createDecider()` facade |
-| `src/ep-router.mjs` | per-call execution-provider router (`LayaRouter`): probes lanes, predicts latency per (lane, GPU thermal state, question bucket, work), one FIFO queue for all lanes, contention-aware, quarantines failing lanes |
+| `src/ep-router.mjs` | per-call execution-provider router (`LayaRouter`): probes lanes, predicts latency per (lane, GPU thermal state, question bucket, work), one FIFO queue for all lanes with the lane bound at the front of the queue, contention-aware, quarantines failing lanes, serves from the first lane while the others load |
+| `src/lane.mjs`, `src/lane-worker.mjs` | a lane = one Laya session in a worker thread (default) or in this thread, behind one handle: `systemOne(state, questions, temps)`, `close()`, death notification |
 | `router-demo.mjs` | the router under burst / sporadic / batch traffic, deadline and forced-lane calls |
 | `src/calibration.mjs`, `calibrate.mjs` | raw-logit capture, accuracy + NLL / Brier / ECE + reliability tables, per-bucket temperature refit with leave-one-out |
 | `data/smart-home-eval.mjs`, `data/question-variants.mjs` | 65 hand-labelled utterances; three question wordings (v1 original, v2 explicit, v3 best per question) |
@@ -28,7 +29,8 @@ Everything downloaded lives under this directory (`models/`, `node_modules/`, `.
 | `verify-model.mjs` | re-hash the cached bundle against the pinned SHA256 values |
 | `vendor/receptron-laya-0.1.2.tgz` | the exact published npm tarball (see Supply chain) |
 | `skills/laya-decisions/` | Agent Skill (agentskills.io format): `SKILL.md` + `references/` + `scripts/laya.mjs` wrapper; copy the folder into an agent's skills directory and set `LAYA_DIR` |
-| `test/unit.test.mjs`, `test/sidecar.test.mjs` | unit tests (router, latency model, calibration maths, presets, durations); sidecar lifecycle integration tests |
+| `test/unit.test.mjs`, `test/router.test.mjs`, `test/sidecar.test.mjs` | unit tests (router maths, latency model, calibration maths, presets, durations; no model needed - run in CI); router integration tests (worker lanes, failover, early serving; model needed); sidecar lifecycle tests |
+| `.github/workflows/unit-tests.yml` | GitHub Actions: `npm ci` + syntax check + unit tests on Ubuntu / Windows, Node 20 / 22 (no model in CI) |
 
 ## Quick start
 
@@ -37,7 +39,7 @@ npm install                 # deps via the configured registry; @receptron/laya 
 node poc.mjs                # first run downloads the pinned 1.7 GB bundle into models/ and verifies SHA256
 node poc.mjs --ep webgpu    # RTX 4070 through the WebGPU EP
 node router-demo.mjs        # auto CPU / GPU selection per call
-npm test
+npm test                    # unit tests (no model needed); npm run test:router / test:sidecar need the model + GPU
 ```
 
 ## Ask it something
@@ -93,32 +95,40 @@ Each `node ask.mjs "..."` loads the model (~1.6 s, 0.4 GB RAM + 0.8 GB VRAM), an
 calling it at once = ten copies. `serve.mjs` keeps one copy forever, even when nobody calls. The middle ground:
 
 ```powershell
-node ask.mjs --sidecar "Lock the front door"   # first call: starts serve.mjs in the background (~5 s), answers
-node ask.mjs --sidecar "..."                    # every later call: ~0.2-0.4 s, no model load
+node ask.mjs --sidecar "Lock the front door"   # first call: starts serve.mjs in the background (~3-4.5 s), answers
+node ask.mjs --sidecar "..."                    # every later call: ~0.15-0.4 s, no model load
 $env:LAYA_SIDECAR = "1"                         # make --sidecar the default for a shell / orchestration
-node ask.mjs --status | --stop | --start [--idle 10m] [--lanes ...]
+node ask.mjs --status | --stop | --start [--idle 10m] [--max-age 12h] [--lanes ...]
 ```
 
 - The sidecar is `serve.mjs --sidecar --idle 5m`, spawned detached (no window, log in `.laya/sidecar-<port>.log`).
   It exits by itself after 5 minutes without requests (`--idle`, `LAYA_IDLE`; `0` = never), freeing RAM and
   VRAM; the next call starts a fresh one. An open REPL (`node ask.mjs --sidecar`) pings it so it stays warm.
+  `--max-age 12h` (`LAYA_MAX_AGE`) additionally recycles it once it is that old (in-flight calls finish first).
 - The port is the mutex: the sidecar binds `127.0.0.1:8787` (`--port`, `LAYA_PORT`) *before* loading, so
   launchers racing at the same instant produce exactly one instance (the loser exits with code 3 without
   loading); callers arriving during the load wait for `status: ready`. Anything else on the port is
   detected via `/health` (`service: "laya"`) and never touched; the CLI then falls back to in-process.
-- One queue: `onnxruntime-node` runs every inference synchronously on the JS thread, so calls never overlap
-  in one process whatever the lane. 8 parallel callers are served FIFO on the fastest lane (`routing.queueMs`
-  tells you how long a call waited); the router does not spill to the CPU lane under load because a CPU call
-  in the middle of a burst would stall every GPU call behind it (see Results). Presets and calibration tables
-  are re-read when their files change. Background CPU/GPU sampling pauses after 10 s idle.
-- Programs that would rather call HTTP directly: `node ask.mjs --start` prints `{ url, pid, lanes }`; then
-  `POST /decide` (see Ask it something). `/health` shows `idleRemainingS`; `POST /touch` extends it.
+- Lanes live in worker threads and load side by side; the sidecar is ready as soon as the first lane has been
+  probed and warmed (~2.5 s), the other joins while it serves (`/health.lanesLoading`; a call that forces a
+  lane still loading gets a 503 the client retries). The main thread never runs an inference, so `/health`,
+  the idle timer and new requests are served while a 1 s CPU inference runs.
+- One queue: inferences of different lanes never run at the same time - mixing them is a net loss (see
+  Results) - and a call is bound to a lane when it reaches the front of the queue, not when it is queued: 8
+  parallel callers are served FIFO on the fastest lane (`routing.queueMs` tells you how long a call waited),
+  and calls queued during start-up move over to the GPU lane the moment it joins. Presets and calibration
+  tables are re-read when their files change. Background CPU/GPU sampling pauses after 10 s idle.
+- Programs that would rather call HTTP directly: `node ask.mjs --start` prints `{ url, pid, lanes }` once every
+  lane is loaded; then `POST /decide` (see Ask it something). `/health` shows `idleRemainingS`; `POST /touch` extends it.
 - The CLI client uses `node:http`, not `fetch`: on this Node (25.3, Windows) undici crashes the process at exit
   (`0xC0000409`) after a couple of requests - visible only as a wrong exit code.
 
-Measured here: first call 5.4 s (spawn + load + warm-up), second call 184 ms; 8 parallel 5-question calls in
-1.4 s on one lane, zero errors (2.6 s when the router still spread them over GPU + CPU); VRAM 4351 -> 3403 MiB
-after the idle exit. `npm run test:sidecar` runs the 11 lifecycle scenarios (~1 min; uses port 8797).
+Measured here: first call 3.1-4.5 s (spawn + load + warm-up + answer; 5.0-6.3 s when the lanes loaded one after
+the other in the main thread), second call 143-366 ms; ready with the first lane 2.6-2.9 s after spawn, both lanes 3.5-3.8 s;
+8 parallel 5-question calls in 1.1-1.4 s on one lane, zero errors (2.6 s when the router still spread them
+over GPU + CPU; 7.6 s when a start-up burst was bound to the CPU lane before the GPU lane had joined - fixed by
+binding at the front of the queue); VRAM 5688 -> 4807 MiB after the idle exit. `npm run test:sidecar` runs
+the 13 lifecycle scenarios (~1 min; uses port 8797), `npm run test:router` the 7 worker-lane scenarios.
 ## Using it from agents: the skill
 
 `skills/laya-decisions/` is an [Agent Skill](https://agentskills.io): `SKILL.md` tells an agent what Laya
@@ -225,8 +235,8 @@ so batching questions into one call is the lever: 82 questions/s at 10 per call 
 callers in parallel the throughput is the same as with 1; each caller just sees `queueMs` grow (8 x 3 q:
 p50 ~410 ms end to end at 19 calls/s).
 
-Deployment overhead on top: HTTP `serve.mjs` +1-3 ms; `ask.mjs --sidecar` (new CLI process per call) ~165 ms
-per call, so ~6 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1-3 s load every time.
+Deployment overhead on top: HTTP `serve.mjs` +1-3 ms; `ask.mjs --sidecar` (new CLI process per call) ~150 ms
+per call, so ~6 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1.5-2.5 s load every time.
 
 ### Findings that change how you should run it
 
@@ -244,11 +254,11 @@ per call, so ~6 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1
 3. **DirectML** loads the graph but every inference fails in a `Reshape` node (`node_view`, HRESULT 80070057) at
    all graph-optimisation levels; not fixable client-side. WebGPU is the NVIDIA path in `onnxruntime-node` on
    Windows (no CUDA EP is shipped for Windows).
-4. **Inferences never overlap in one process, and mixing lanes under load is a net loss.** `onnxruntime-node`
+4. **Inferences never overlap in one thread, and mixing lanes under load is a net loss.** `onnxruntime-node`
    1.30 runs `session.run()` synchronously on the JS thread (`dist/backend.js`: `setImmediate` + blocking run),
-   so a CPU inference blocks the event loop - and every other lane - for its full duration: webgpu:fp16 3 q
-   went from 49 ms alone to 321-479 ms p50 while `cpu:8` ran in the same thread, and policy `auto` (which
-   spilled queued calls to the CPU) fell from 20 to 6.6 calls/s at 8 parallel callers
+   so a CPU inference blocks the event loop - and every other lane in that thread - for its full duration:
+   webgpu:fp16 3 q went from 49 ms alone to 321-479 ms p50 while `cpu:8` ran in the same thread, and policy
+   `auto` (which spilled queued calls to the CPU) fell from 20 to 6.6 calls/s at 8 parallel callers
    (`experiments/interference.mjs`, `experiments/throughput.mjs`). Putting each lane in a worker thread makes
    them overlap (`experiments/worker-lanes.mjs`), but the 8 spinning P-core threads of the CPU lane still slow
    the GPU lane 1.5x (49 -> 76 ms), so a burst with every 4th call on the CPU runs at 16 calls/s against 20.6
@@ -266,30 +276,51 @@ per call, so ~6 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1
    `LayaRouter.create()` restricts the whole process to the P-cores via PowerShell (`pinProcessToPCores`, ~0.4 s
    in the background during the model load; `pinProcess: false` to opt out, `LAYA_PCORE_LOGICAL` for the
    layout). This is the likely source of the 1.2-1.6x session-to-session swings noted earlier.
+8. **Lanes in worker threads (default since 0.5): same answers, free main thread, parallel loading, one hard
+   rule.** Each lane's session lives in a `node:worker_threads` worker (`src/lane.mjs`); the round trip costs
+   nothing measurable (cpu:8 3 q 306 vs 294 ms, answers identical), the main thread stalls 18 ms instead of
+   1.1 s during a 10-question CPU call, and two lanes load in 2.2-2.3 s instead of 3.3-3.6 s because the
+   synchronous session creation no longer serialises them. The hard rule: never `worker.terminate()` a worker
+   with an inference in flight - ORT is running native code on that thread and the whole process dies with
+   `0xC0000409`. `close()` asks the worker to release the session and exit by itself; an idle worker can be
+   terminated safely (the router marks the lane gone, fails in-flight calls over to another lane and never
+   picks it again - `test/router.test.mjs`).
 
 ## The execution-provider router (`src/ep-router.mjs`)
 
 Lanes: `webgpu`, `webgpu:fp16`, `dml`, `cpu` (16 threads pinned), `cpu:8` (8 pinned), `cpu:24:nopin`, `cpu:auto`.
-Each lane is a separate `Laya` session (RAM: ~1.6 GiB per CPU lane, ~1.1 / 0.6 GiB + VRAM per GPU lane).
+Default `webgpu` + `cpu:8` (`cpu:8` equals `cpu` in latency at half the CPU share). Each lane is a separate
+`Laya` session in its own worker thread (`workers: false` for in-thread sessions); RAM ~1.6 GiB per CPU lane,
+~1.1 / 0.6 GiB + VRAM per GPU lane.
 
 - **Probe**: every lane is loaded and must pass a real inference; DML is dropped here. A lane that throws later is
-  quarantined for 60 s and the call is retried on the next-best lane.
+  quarantined for 60 s and the call is retried on the next-best lane; a lane whose worker exits is marked gone,
+  its in-flight calls fail over, and it is never picked again.
+- **Start-up**: lanes load in parallel; with `waitFor: "first"` (what `serve.mjs` uses) `create()` returns as soon
+  as one lane has been probed and warmed (`warmup: { state, sizes }`), the others join while calls are served
+  (`router.pendingLanes`, `router.ready`, `onLaneReady`). Probes and warm-ups run outside the FIFO so a lane
+  joining late is never stuck behind a burst on the lane that is already serving.
 - **Prediction**: EMA of ms-per-work-unit keyed by (lane, GPU state `hot` < 0.4 s / `warm` < 2 s / `cold`,
   question bucket 1 / 2-3 / 4-6 / 7-10 / 11+), seeded with priors from this machine; work = questions x
   estimated padded sequence length, so short and long states share estimates.
-- **Queue**: one FIFO for all lanes (inferences cannot overlap, finding 4). A call's prediction is
-  `wait + own`: the wait is the predicted remaining time of everything queued (the same for every lane), `own`
-  the lane's latency in the GPU state expected *when it starts* (`hot` if GPU work is queued ahead, never `cold`
-  while anything is queued). `routing.ms` is the inference alone; `routing.queueMs` the wait.
+- **Queue**: one FIFO for all lanes (mixing lanes loses, finding 4). A call's prediction is `wait + own`: the
+  wait is the predicted remaining time of everything queued (the same for every lane), `own` the lane's latency
+  in the GPU state expected *when it starts* (`hot` if GPU work is queued ahead, never `cold` while anything is
+  queued). The lane is bound when the call reaches the front of the queue - lanes that joined, died or got
+  quarantined while it waited count (`routing.provisionalLane` says when that changed the choice; a start-up
+  burst queued on the CPU lane moves to the GPU the moment it joins: 1.8 s instead of 5.7 s for 6 x 10 q).
+  `routing.ms` is the inference alone; `routing.queueMs` the wait.
 - **Contention**: background sampling of other processes' CPU (os.cpus deltas minus own usage) and GPU load
   (nvidia-smi utilisation weighted by SM clock, sampled while we are idle) inflates the affected lane's `own`.
-- **Decision**: `auto` = fastest predicted, with 5 % exploration among lanes within 2x while idle (never under
-  load); `prefer-gpu`, `prefer-cpu`, `min-cpu`; per call `{ lane }` or `{ deadlineMs }` (meet the deadline,
-  queue included, with the least CPU share).
+- **Decision**: `auto` = fastest predicted, with 5 % exploration among lanes within 2x when nothing is queued
+  behind the call; `prefer-gpu`, `prefer-cpu`, `min-cpu`; per call `{ lane }` or `{ deadlineMs }` (meet the
+  deadline, queue included, with the least CPU share).
 - **Process affinity**: on Windows hybrid CPUs the process is restricted to the P-cores (finding 7; `pinProcess: false` to opt out).
+- **Shutdown**: `close()` rejects new calls, lets the queue drain, then releases every session (a worker
+  releases its own session and exits; see finding 8 for why it is never terminated under a running inference).
 
 Measured behaviour (`router-demo.mjs`): bursts -> WebGPU (47-90 ms / 3 q); one question every 3 s -> CPU
-(100-130 ms, WebGPU predicted ~200 cold); 10 questions after a pause -> WebGPU (505 ms vs CPU 1180 predicted).
+(100-130 ms, WebGPU predicted ~200 cold); 10 questions after a pause -> WebGPU (403-505 ms vs CPU ~1100 predicted).
 Warm up with a representative state: estimates depend on state length.
 
 ## Over-confidence, calibration, accuracy (`calibrate.mjs`)

@@ -44,6 +44,7 @@ const { values: args } = parseArgs({
     "rate-gap": { type: "string", default: "2500" }, // idle ms before each open-loop rate (cold GPU); 0 = start warm
     "no-sampling": { type: "boolean", default: false }, // disable the router's background CPU / nvidia-smi sampling
     "no-pin-process": { type: "boolean", default: false }, // leave the process affinity alone (default: P-cores, see pinProcessToPCores)
+    "in-process": { type: "boolean", default: false }, // sessions in this thread instead of worker threads
     quick: { type: "boolean", default: false },
     out: { type: "string" },
   },
@@ -72,9 +73,9 @@ const f2 = (x) => (Number.isFinite(x) ? x.toFixed(2) : "-");
 
 // ---- router -------------------------------------------------------------------------------------------
 const t0 = performance.now();
-const router = await LayaRouter.create({ lanes, sampleLoad: !args["no-sampling"], pinProcess: !args["no-pin-process"], log: (m) => console.log(`  [router] ${m}`) });
+const router = await LayaRouter.create({ lanes, sampleLoad: !args["no-sampling"], pinProcess: !args["no-pin-process"], workers: !args["in-process"], log: (m) => console.log(`  [router] ${m}`) });
 const loaded = [...router.lanes.keys()];
-console.log(`router ready in ${((performance.now() - t0) / 1000).toFixed(1)} s; lanes ${loaded.join(", ")}; ${nQ} question(s) per call`);
+console.log(`router ready in ${((performance.now() - t0) / 1000).toFixed(1)} s; lanes ${loaded.join(", ")} (${args["in-process"] ? "in-process" : "worker threads"}); ${nQ} question(s) per call`);
 const gpuLanes = loaded.filter(isGpuLane);
 const cpuLanes = loaded.filter((l) => !isGpuLane(l));
 const call = (i, o) => router.decide(stateFor(i), questions, o);
@@ -179,6 +180,7 @@ const result = {
   ort: (await import("onnxruntime-node/package.json", { with: { type: "json" } })).default.version,
   machine: { ...cpuInfo(), gpu: (await queryGpu())?.name ?? null },
   lanes: loaded,
+  workers: !args["in-process"],
   processAffinity: router.processAffinity,
   questions: nQ,
   calls: CALLS,
@@ -288,7 +290,7 @@ function markdown(r) {
   const L = [];
   L.push(`# Laya throughput experiment (${r.timestamp})`, "");
   L.push(`Machine: ${r.machine.model} (${r.machine.logical} threads), ${r.machine.totalMemGiB.toFixed(0)} GiB RAM, GPU: ${r.machine.gpu ?? "-"}; Node ${r.node}, onnxruntime-node ${r.ort}`, "");
-  L.push(`Lanes: ${r.lanes.map((l) => `\`${l}\``).join(", ")}. ${r.questions} question(s) per call (~${r.questions * 85} input tokens). Process affinity: ${r.processAffinity?.applied ? `P-cores (${r.processAffinity.mask})` : `not set (${r.processAffinity?.reason ?? "-"})`}. All calls via \`LayaRouter.decide()\`; "total" = wall time seen by the caller incl. the queue, "inference" = \`routing.ms\`.`, "");
+  L.push(`Lanes: ${r.lanes.map((l) => `\`${l}\``).join(", ")} (${r.workers ? "worker threads" : "in-process"}). ${r.questions} question(s) per call (~${r.questions * 85} input tokens). Process affinity: ${r.processAffinity?.applied ? `P-cores (${r.processAffinity.mask})` : `not set (${r.processAffinity?.reason ?? "-"})`}. All calls via \`LayaRouter.decide()\`; "total" = wall time seen by the caller incl. the queue, "inference" = \`routing.ms\`.`, "");
   if (r.scenarios.A) {
     L.push(`## A) Single lane, closed loop (${r.calls} calls, k callers in flight, lane forced)`, "");
     L.push("| lane | k | calls/s | q/s | total p50 (ms) | total p95 | inference p50 | queue p50 | queue max |", "|---|---|---|---|---|---|---|---|---|");

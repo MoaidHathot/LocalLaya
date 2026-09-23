@@ -1,9 +1,10 @@
 /**
  * Demo of the execution-provider router under the traffic patterns that matter for a desktop assistant.
  *
- *   node router-demo.mjs                              # lanes webgpu + cpu, policy auto
- *   node router-demo.mjs --lanes webgpu,cpu:8         # spare the CPU: 8-thread lane instead of the default
+ *   node router-demo.mjs                              # lanes webgpu + cpu:8 (the defaults), policy auto, lanes in worker threads
+ *   node router-demo.mjs --lanes webgpu:fp16,cpu      # fp16 GPU bundle + the 16-thread CPU lane
  *   node router-demo.mjs --lanes webgpu,cpu,dml       # dml is probed and dropped (fails at inference here)
+ *   node router-demo.mjs --in-process                 # sessions in this thread (blocks the event loop per call)
  *   node router-demo.mjs --keepalive 4000             # keep GPU clocks up for 4 s after each GPU call
  *   node router-demo.mjs --policy prefer-gpu
  *   node router-demo.mjs --calibration calibration/smart-home-v3.json
@@ -14,11 +15,12 @@ import { STATE, QUESTIONS_1, QUESTIONS_3, QUESTIONS_10 } from "./src/questions.m
 
 const { values: args } = parseArgs({
   options: {
-    lanes: { type: "string", default: "webgpu,cpu" },
+    lanes: { type: "string", default: "webgpu,cpu:8" },
     policy: { type: "string", default: "auto" },
     keepalive: { type: "string", default: "0" },
     calibration: { type: "string" },
     explore: { type: "string", default: "0.05" },
+    "in-process": { type: "boolean", default: false },
   },
 });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -31,9 +33,10 @@ const router = await LayaRouter.create({
   explore: Number(args.explore),
   gpuKeepAliveMs: Number(args.keepalive),
   calibration: args.calibration,
+  workers: !args["in-process"],
   log: (m) => console.log(`  [router] ${m}`),
 });
-console.log(`router ready in ${((performance.now() - t0) / 1000).toFixed(1)} s with lanes: ${[...router.lanes.keys()].join(", ")}`);
+console.log(`router ready in ${((performance.now() - t0) / 1000).toFixed(1)} s with lanes: ${[...router.lanes.keys()].join(", ")} (${args["in-process"] ? "in-process" : "worker threads"})`);
 
 console.log("\nwarm-up (compiles GPU shaders, primes latency estimates):");
 const w = await router.warmup({ state: STATE }); // use a representative state: latency depends on its length
