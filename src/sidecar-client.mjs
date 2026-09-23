@@ -43,16 +43,18 @@ export function parseDuration(s) {
 export const logFileFor = (port = DEFAULT_PORT) => path.join(LOG_DIR, `sidecar-${port}.log`);
 
 /**
- * Minimal HTTP JSON call on node:http with a fresh connection per request (agent: false).
+ * Minimal HTTP JSON call on node:http. Without `agent` every request opens a fresh connection (agent: false),
+ * which is what the one-shot CLI wants; createClient() passes a keep-alive agent for callers that make many
+ * requests from one process.
  * Not fetch(): on Windows, Node 25's undici can crash the process at exit with
  * "Assertion failed: !(handle->flags & UV_HANDLE_CLOSING) (src\win\async.c)" -> exit code 0xC0000409
  * after a couple of requests; plain node:http has no such handle and also exits ~0.2 s sooner.
  */
-function request(method, pathname, { port = DEFAULT_PORT, host = "127.0.0.1", body, timeoutMs = 5000 } = {}) {
+function request(method, pathname, { port = DEFAULT_PORT, host = "127.0.0.1", body, timeoutMs = 5000, agent = false } = {}) {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? null : JSON.stringify(body);
     const req = http.request(
-      { host, port, path: pathname, method, agent: false, timeout: timeoutMs, headers: payload ? { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } : {} },
+      { host, port, path: pathname, method, agent, timeout: timeoutMs, headers: payload ? { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } : {} },
       (res) => {
         let text = "";
         res.setEncoding("utf8");
@@ -197,10 +199,10 @@ export async function ensureSidecar({ port = DEFAULT_PORT, host = "127.0.0.1", i
 }
 
 /** POST /decide. Retries briefly on 503 (instance still loading / being replaced). */
-export async function decide(body, { port = DEFAULT_PORT, host = "127.0.0.1", timeoutMs = 60_000 } = {}) {
+export async function decide(body, { port = DEFAULT_PORT, host = "127.0.0.1", timeoutMs = 60_000, agent = false } = {}) {
   const t0 = Date.now();
   for (;;) {
-    const res = await request("POST", "/decide", { port, host, body, timeoutMs });
+    const res = await request("POST", "/decide", { port, host, body, timeoutMs, agent });
     const out = res.body ?? { error: `HTTP ${res.status}` };
     if (res.ok) return out;
     if (res.status === 503 && Date.now() - t0 < timeoutMs) {
@@ -209,6 +211,29 @@ export async function decide(body, { port = DEFAULT_PORT, host = "127.0.0.1", ti
     }
     throw new SidecarError(res.status === 400 ? "BAD_REQUEST" : "SERVER_ERROR", out.error ?? `HTTP ${res.status}`, { status: res.status });
   }
+}
+
+/**
+ * A client for many calls from one process: one keep-alive connection to the sidecar (no TCP handshake per
+ * call; measured ~1 ms of HTTP overhead on top of the inference). Does not spawn the sidecar - call
+ * ensureSidecar() first or use demo/laya.mjs, which does both.
+ *   const c = createClient({ port }); await c.decide({ preset, text }); ...; c.close();
+ * close() destroys the pooled socket so the process can exit (the agent is also unref'd - a forgotten close()
+ * does not keep the event loop alive).
+ */
+export function createClient({ port = DEFAULT_PORT, host = "127.0.0.1", timeoutMs = 60_000 } = {}) {
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 10_000 });
+  // http.Agent has no unref(); its sockets are unref'd when idle by Node itself ("agent sockets are unref'd when free")
+  return {
+    port,
+    host,
+    decide: (body) => decide(body, { port, host, timeoutMs, agent }),
+    health: async () => (await request("GET", "/health", { port, host, timeoutMs: 5000, agent })).body,
+    stats: async () => (await request("GET", "/stats", { port, host, timeoutMs: 5000, agent })).body,
+    presets: async () => (await request("GET", "/presets", { port, host, timeoutMs: 5000, agent })).body,
+    touch: async () => (await request("POST", "/touch", { port, host, timeoutMs: 2000, agent })).body,
+    close: () => agent.destroy(),
+  };
 }
 
 export async function status({ port = DEFAULT_PORT, host = "127.0.0.1" } = {}) {

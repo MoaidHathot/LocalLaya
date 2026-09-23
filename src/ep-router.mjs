@@ -491,9 +491,11 @@ export class LayaRouter {
 
   /**
    * Answer `questions` about `state`, choosing the lane automatically.
-   * @param {object} [o] { lane, policy, deadlineMs, calibration }
+   * @param {object} [o] { lane, policy, deadlineMs, calibration, exec }
    *   calibration: a table from calibrate.mjs ({ temperature_by_options }) applied for this call only; without
    *   it the lane's temperatures are the ones it was created with (LayaRouter.create({ calibration }) or shipped).
+   *   exec: execution options passed to the lane, e.g. { graph: false } to skip CUDA graph replay on a cuda lane
+   *   (lanes ignore what they do not understand); reported back in routing.exec.
    * @returns result with an extra `routing` field
    */
   async decide(state, questions, o = {}) {
@@ -526,7 +528,7 @@ export class LayaRouter {
         // Timing and the GPU thermal state are taken when the call actually starts, not when it was queued;
         // nothing else runs between start and completion, so `ms` is the inference alone. The per-call
         // temperature override travels with the call and is applied by the lane right before it runs.
-        const run = await this._enqueue(L, choice.ownMs, (lane) => lane.session.systemOne(state, questions, o.calibration?.temperature_by_options), rebind);
+        const run = await this._enqueue(L, choice.ownMs, (lane) => lane.session.systemOne(state, questions, o.calibration?.temperature_by_options, o.exec), rebind);
         L = run.L;
         L.model.observe(n, run.stateAtStart, run.ms, work);
         L.calls++;

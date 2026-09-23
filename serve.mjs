@@ -28,12 +28,14 @@
  *                            uptimeS, idleS, idleRemainingS, maxAgeS, gpuKeepAliveS, inFlight, sidecar }
  *   GET  /presets          { name: { description, source, state, questions } }
  *   GET  /stats            router statistics (latency estimates, load, per-lane calls / pending)
- *   POST /decide           body: { text?: string, state?: any, preset?: string, questions?: {...}, lane?: string, deadlineMs?: number,
- *                                  calibration?: { temperature_by_options } }
+ *   POST /decide           body: { text?: string, state?: any, preset?: string, questions?: {...}, lane?: string,
+ *                                  policy?: auto|prefer-gpu|prefer-cpu|min-cpu, deadlineMs?: number,
+ *                                  calibration?: { temperature_by_options }, exec?: { graph?: boolean } }
  *                          -> { answers, usage, routing, state, questions, preset, calibration }
  *                          `text` is wrapped by the preset's state builder; `state` is used verbatim;
  *                          `questions` replaces the preset's question set; `calibration` overrides the per-preset
- *                          table for this call. Resets the idle timer.
+ *                          table for this call; `lane` / `policy` / `deadlineMs` / `exec` override the router's
+ *                          choices for this call (src/decide-core.mjs, src/ep-router.mjs). Resets the idle timer.
  *   POST /touch            resets the idle timer without doing work (REPL keep-alive) -> { ok, idleRemainingS }
  *   POST /shutdown         graceful stop -> { ok: true }, then the process exits
  *
@@ -41,13 +43,14 @@
  * when their files change, so a long-running instance picks up edits without a restart.
  */
 import { createServer } from "node:http";
-import { access, readFile, stat } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { LayaRouter } from "./src/ep-router.mjs";
 import { loadPresets, DEFAULT_PRESET, describePresets, PRESETS_DIR } from "./data/presets.mjs";
 import { parseDuration } from "./src/sidecar-client.mjs";
+import { CalibrationCache, decideRequest } from "./src/decide-core.mjs";
 
 const PROJECT_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const VERSION = JSON.parse(await readFile(path.join(PROJECT_ROOT, "package.json"), "utf8")).version;
@@ -154,24 +157,6 @@ process.on("unhandledRejection", (e) => {
   shutdown("crash", 1);
 });
 
-// ---- per-preset calibration tables, re-read when the file changes ----------------------------------------------
-const calibrationCache = new Map(); // preset -> { file, mtimeMs, table }
-async function calibrationFor(name) {
-  const file = path.resolve(PROJECT_ROOT, args.calibration ?? `calibration/${name}.json`);
-  let mtimeMs;
-  try {
-    mtimeMs = (await stat(file)).mtimeMs;
-  } catch {
-    calibrationCache.delete(name);
-    return null;
-  }
-  const cached = calibrationCache.get(name);
-  if (cached && cached.file === file && cached.mtimeMs === mtimeMs) return cached.table;
-  const table = { ...JSON.parse(await readFile(file, "utf8")), file: path.relative(PROJECT_ROOT, file).replace(/\\/g, "/") };
-  calibrationCache.set(name, { file, mtimeMs, table });
-  return table;
-}
-
 // ---- http helpers --------------------------------------------------------------------------------------------------
 const json = (res, statusCode, body) => {
   const headers = { "content-type": "application/json; charset=utf-8" };
@@ -195,38 +180,13 @@ const readBody = (req, limit = 1_000_000) =>
     req.on("error", reject);
   });
 
-function validateQuestions(q) {
-  if (!q || typeof q !== "object" || !Object.keys(q).length) throw Object.assign(new Error("questions must be a non-empty object"), { status: 400 });
-  for (const [id, x] of Object.entries(q)) {
-    if (!x || !["choice", "score", "noul"].includes(x.type)) throw Object.assign(new Error(`question ${id}: type must be choice | score | noul`), { status: 400 });
-    if (x.instructions === undefined) throw Object.assign(new Error(`question ${id}: instructions required`), { status: 400 });
-    if (x.type === "choice" && !(Array.isArray(x.criteria) ? x.criteria.length >= 2 : x.criteria && Object.keys(x.criteria).length >= 2)) throw Object.assign(new Error(`question ${id}: choice needs >= 2 criteria`), { status: 400 });
-    if (x.type === "score" && !(Array.isArray(x.criteria) && x.criteria.length >= 2)) throw Object.assign(new Error(`question ${id}: score needs an ordered array of >= 2 levels`), { status: 400 });
-  }
-}
+// per-preset calibration tables (calibration/<preset>.json, re-read on change) or one table for all (--calibration)
+const calibration = new CalibrationCache({ root: PROJECT_ROOT, override: args.calibration ?? null });
 
+/** One request -> one decision; presets are re-read on each call (cheap: mtime-cached in loadPresets). */
 async function decide(body) {
   PRESETS = await loadPresets();
-  const presetName = body.preset ?? DEFAULT_PRESET;
-  const preset = PRESETS[presetName];
-  if (!preset || preset.invalid) throw Object.assign(new Error(preset?.invalid ? `preset ${presetName} is invalid: ${preset.description}` : `unknown preset ${presetName}; have ${Object.keys(PRESETS).join(", ")}`), { status: 400 });
-  const questions = body.questions ?? preset.questions;
-  validateQuestions(questions);
-  let state;
-  if (body.state !== undefined) state = body.state;
-  else if (typeof body.text === "string" && body.text.trim()) state = preset.state(body.text.trim());
-  else throw Object.assign(new Error("provide text (string) or state (any JSON)"), { status: 400 });
-  const opts = { calibration: body.calibration?.temperature_by_options ? { temperature_by_options: body.calibration.temperature_by_options, file: body.calibration.file ?? "request" } : await calibrationFor(presetName) };
-  if (body.lane) {
-    if (!router.lanes.has(body.lane)) {
-      if (router.pendingLanes.includes(body.lane)) throw Object.assign(new Error(`lane ${body.lane} is still loading`), { status: 503, retryAfterMs: 500 });
-      throw Object.assign(new Error(`lane ${body.lane} not loaded; have ${[...router.lanes.keys()].join(", ")}`), { status: 400 });
-    }
-    opts.lane = body.lane;
-  }
-  if (body.deadlineMs) opts.deadlineMs = Number(body.deadlineMs);
-  const r = await router.decide(state, questions, opts);
-  return { answers: r.answers, usage: r.usage, routing: r.routing, state, questions, preset: body.questions ? null : presetName, calibration: opts.calibration?.file ?? null };
+  return decideRequest(router, body, PRESETS, calibration);
 }
 
 const CONFIGURED_LANES = args.lanes.split(",");

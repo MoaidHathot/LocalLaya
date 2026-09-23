@@ -1,0 +1,12 @@
+[
+  "is this valid json {bla: 1}",
+  "Write a function that parses ISO-8601 dates in TypeScript",
+  "Explain what this does: Get-Process | Sort-Object CPU -Descending | Select-Object -First 5",
+  "Why does my Python script say 'RecursionError: maximum recursion depth exceeded'?",
+  "Convert this SQL to use a CTE instead of a subquery: SELECT * FROM orders WHERE customer_id IN (SELECT id FROM customers WHERE country = 'DE')",
+  "Run the unit tests",
+  "Refactor this class to use dependency injection",
+  "Check whether this YAML is well-formed:\nname: x\n  bad: indent",
+  "What is the difference between a process and a thread?",
+  "Add a --verbose flag to the CLI that prints timing information"
+]

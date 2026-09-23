@@ -1,0 +1,7 @@
+[
+  { "state": { "from": "boss@example.com", "subject": "Q3 numbers", "body": "Can you send me the Q3 revenue numbers before the board call at 3pm today?" } },
+  { "state": { "from": "newsletter@shop.example", "subject": "Weekend deals", "body": "Up to 40% off on all outdoor gear this weekend only. Shop now!" } },
+  { "state": { "from": "colleague@example.com", "subject": "Re: standup", "body": "FYI: standup moves to 9:30 starting Monday. No action needed." } },
+  { "state": { "from": "pm@example.com", "subject": "Design review", "body": "Does Thursday 2pm work for the design review, or would you prefer Friday morning?" } },
+  { "state": { "from": "it@example.com", "subject": "Password expiry", "body": "Your password expires in 3 days. Please change it via the portal." } }
+]

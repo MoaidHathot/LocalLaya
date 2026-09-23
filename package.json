@@ -29,7 +29,9 @@
     "test:router": "node --test --test-concurrency=1 test/router.test.mjs",
     "test:cuda": "node --test --test-concurrency=1 test/cuda-lane.test.mjs",
     "test:sidecar": "node --test --test-concurrency=1 test/sidecar.test.mjs",
-    "test:all": "node --test test/unit.test.mjs && node --test --test-concurrency=1 test/router.test.mjs && node --test --test-concurrency=1 test/cuda-lane.test.mjs && node --test --test-concurrency=1 test/sidecar.test.mjs"
+    "test:demo": "node --test --test-concurrency=1 test/demo.test.mjs",
+    "demo": "node demo/run-all.mjs",
+    "test:all": "node --test test/unit.test.mjs && node --test --test-concurrency=1 test/router.test.mjs && node --test --test-concurrency=1 test/cuda-lane.test.mjs && node --test --test-concurrency=1 test/sidecar.test.mjs && node --test --test-concurrency=1 test/demo.test.mjs"
   },
   "dependencies": {
     "@receptron/laya": "file:vendor/receptron-laya-0.1.2.tgz"

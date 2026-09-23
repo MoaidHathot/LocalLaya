@@ -29,6 +29,7 @@ Everything downloaded lives under this directory (`models/`, `node_modules/`, `.
 | `tools/optimize_graph.py` | fp32 export -> optimised fp16 bundle: IsNaN -> Not(Equal), Reshape allowzero, ORT Gelu fusion, fp16 without fp32 islands (no PyTorch); writes `optimize-report.json` |
 | `verify-model.mjs` | re-hash the cached bundle against the pinned SHA256 values |
 | `vendor/receptron-laya-0.1.2.tgz` | the exact published npm tarball (see Supply chain) |
+| `demo/` | use it from your own code today: `laya.mjs` library (modes auto / sidecar / local / http, keep-alive connection), `cli.mjs`, five worked examples with sample data, `npm run demo`; see `demo/README.md` |
 | `skills/laya-decisions/` | Agent Skill (agentskills.io format): `SKILL.md` + `references/` + `scripts/laya.mjs` wrapper; copy the folder into an agent's skills directory and set `LAYA_DIR` |
 | `test/unit.test.mjs`, `test/router.test.mjs`, `test/cuda-lane.test.mjs`, `test/sidecar.test.mjs` | unit tests (router maths, latency model, session options, calibration maths, presets, durations; no model needed - run in CI); router integration tests (worker lanes, failover, early serving); CUDA process-lane tests (fidelity vs WebGPU, failover, close; skipped without the venv); sidecar lifecycle tests |
 | `.github/workflows/unit-tests.yml` | GitHub Actions: `npm ci` + syntax check + unit tests on Ubuntu / Windows, Node 20 / 22 (no model in CI) |

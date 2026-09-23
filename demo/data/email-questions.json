@@ -1,0 +1,14 @@
+{
+  "needs_reply": { "type": "noul", "instructions": "Is the sender asking the recipient a question or requesting an action that needs an answer?" },
+  "category": {
+    "type": "choice",
+    "instructions": "What kind of email is this?",
+    "criteria": {
+      "request": "asks the recipient to do something or answer something",
+      "information": "shares information, no action needed",
+      "scheduling": "meeting times, invitations, calendar changes",
+      "newsletter": "marketing, announcements, automated mail"
+    }
+  },
+  "priority": { "type": "score", "instructions": "How soon does this email need attention?", "criteria": ["whenever", "this week", "today", "right now"] }
+}
