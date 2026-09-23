@@ -100,7 +100,7 @@ Each `node ask.mjs "..."` loads the model (~1.6 s, 0.4 GB RAM + 0.8 GB VRAM), an
 calling it at once = ten copies. `serve.mjs` keeps one copy forever, even when nobody calls. The middle ground:
 
 ```powershell
-node ask.mjs --sidecar "Lock the front door"   # first call: starts serve.mjs in the background (~2.5-4.5 s), answers
+node ask.mjs --sidecar "Lock the front door"   # first call: starts serve.mjs in the background (~2.2-2.5 s), answers
 node ask.mjs --sidecar "..."                    # every later call: ~0.14-0.4 s, no model load
 $env:LAYA_SIDECAR = "1"                         # make --sidecar the default for a shell / orchestration
 node ask.mjs --status | --stop | --start [--idle 10m] [--max-age 12h] [--lanes ...]
@@ -134,9 +134,10 @@ node ask.mjs --status | --stop | --start [--idle 10m] [--max-age 12h] [--lanes .
 - The CLI client uses `node:http`, not `fetch`: on this Node (25.3, Windows) undici crashes the process at exit
   (`0xC0000409`) after a couple of requests - visible only as a wrong exit code.
 
-Measured here: first call 2.5-4.5 s (spawn + load + warm-up + answer; 5.0-6.3 s when the lanes loaded one after
-the other in the main thread), second call 137-366 ms; ready with the first lane 2.4-2.9 s after spawn, all
-lanes 3.5-4.0 s; 8 parallel 5-question calls in **202 ms** on the CUDA lane, zero errors (676 ms on the
+Measured here: first call 2.2-2.5 s (spawn + load + warm-up + answer; 3.1-4.5 s before the CUDA lane became the
+first lane ready, 5.0-6.3 s when the lanes loaded one after the other in the main thread), second call
+120-370 ms; ready with the CUDA lane 2.1-2.4 s after spawn, all lanes 3.9-4.4 s; 8 parallel 5-question calls in
+**200-300 ms** on the CUDA lane, zero errors (676 ms on the
 optimised WebGPU lane, 1.1-1.4 s on the first fp16 bundle, 2.6 s when the router still spread them over GPU +
 CPU; 7.6 s when a start-up burst was bound to the CPU lane before the GPU lane had joined - fixed by binding
 at the front of the queue); VRAM 7077 -> 5090 MiB after the idle exit (three lanes). `npm run test:sidecar`
@@ -148,7 +149,7 @@ runs the 13 lifecycle scenarios (~1 min; uses port 8797), `npm run test:router` 
 decides, when (and when not) to use it, how to call it and how to read probabilities;
 `references/api.md` and `references/presets.md` hold the details; `scripts/laya.mjs` is the entry point: it
 finds this project (via `LAYA_DIR`, or its own location inside the repo) and answers one-shot calls itself over
-HTTP to the sidecar (one Node process, 80-90 ms per call of which ~12 ms is the inference); lifecycle flags,
+HTTP to the sidecar (one Node process, 80-90 ms per call of which 5-23 ms is the inference); lifecycle flags,
 `--local`, `--pretty`, the REPL and any sidecar failure are delegated to `ask.mjs`.
 
 ```powershell
@@ -164,9 +165,9 @@ decide is the call path and the call shape (`results/sidecar-modes-2026-09-23-su
 
 | situation | do this | per decision |
 |---|---|---|
-| a service or agent runtime making many decisions | `node ask.mjs --start` once, then `POST /decide` from a kept HTTP connection | **13-15 ms** |
+| a service or agent runtime making many decisions | `node ask.mjs --start` once, then `POST /decide` from a kept HTTP connection | **7 / 11 / 25 ms** for 1 / 3 / 10 questions (~85 tokens each); the default `smart-home` preset (5 q, ~150 tokens) 23 ms |
 | a shell step / agent tool call now and then | `node scripts/laya.mjs ...` (or `ask.mjs --sidecar`) | 80-90 ms (Node start-up dominates) |
-| several questions about one text | one call with all the questions | 3 q 12 ms, 10 q 24 ms - not 3 / 10 calls |
+| several questions about one text | one call with all the questions | 3 q 11 ms, 10 q 25 ms - not 3 / 10 calls |
 | calls seconds apart (interactive) | keep the default `--gpu-keepalive 30s`; lengthen it if the pauses are longer | ~46 ms median instead of ~174 |
 | calls minutes apart | let it idle-exit (`--idle 5m`, reload 2.5 s) or hold it (`--idle 0 --max-age 24h`, ~3.3 GiB RAM + 2 GiB VRAM) | - |
 | one isolated run, no background process | `node ask.mjs --local` | 2.2-2.5 s |
@@ -390,9 +391,18 @@ per call, so ~7 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1
     **0.858 [0.848, 0.862]**; 1 / 3 / 10 questions **5.0 / 8.6 / 22.9 ms** vs 10.8 / 12.4 / 24.5, dev-request
     18.8 -> 16.0; 0.150 of fp32 time vs 0.213. Fidelity: 134/134 arg-max with the dynamic graph (max |dp| 0.006),
     195/195 on the eval set (0.0055), same accuracy. Throughput 194 / 114 / 45 calls/s for 1 / 3 / 10 questions
-    (was 96 / 66-86 / 41). Costs: +1.4 s start-up (eager buckets), 28-240 MiB VRAM per bucket, and the first
-    burst of a never-seen shape still runs dynamic. Off per call with `exec: { graph: false }`
-    (`--no-graph`), per lane with `serve.mjs --cuda-graph off`; `routing.exec` reports `mode` and `bucket`.
+    (was 96 / 66-86 / 41). Costs: 28-240 MiB VRAM per bucket, and the first burst of a never-seen shape runs
+    dynamic. Buckets are built *after* the lane reports ready, in idle gaps of the request loop, so the lane joins
+    ~1.1 s after spawn (the sidecar is ready with it at 2.1-2.4 s, before WebGPU) - and the shapes real traffic
+    used are remembered in `.laya/cuda-buckets-<port>.json` and built first on the next start, so the second
+    start of a sidecar replays from its first idle second on whatever presets its callers use (nothing to
+    configure). What a build costs a concurrent caller: ORT holds the GIL while it creates a session (~100 ms
+    from the pre-optimised file the lane writes on first use, ~250 ms without), and the capture runs on the
+    serving thread in one-run steps (10-60 ms); the lane reports that wait as `routing.exec.stallMs` and the
+    router leaves it out of its latency estimates (learning it once sent half a burst to WebGPU). Static
+    graphs for new shapes are generated by a low-priority subprocess on the CPUs the lane is not pinned to
+    (5-8 s, one-time per shape per machine). Off per call with `exec: { graph: false }` (`--no-graph`), per
+    lane with `serve.mjs --cuda-graph off`; `routing.exec` reports `mode`, `bucket` and `stallMs`.
 
 ## The execution-provider router (`src/ep-router.mjs`)
 
@@ -425,8 +435,12 @@ its own worker thread (`workers: false` for in-thread sessions) or process; RAM 
 - **Decision**: `auto` = fastest predicted, with 5 % exploration among lanes within 2x when nothing is queued
   behind the call; `prefer-gpu`, `prefer-cpu`, `min-cpu`; per call `{ lane }` or `{ deadlineMs }` (meet the
   deadline, queue included, with the least CPU share); `{ exec: { graph: false } }` runs a CUDA call on the
-  dynamic graph instead of a CUDA Graph replay (finding 12). `routing.exec = { mode, bucket, remoteMs }` says what
-  the process lane did; `router.detailedStats()` adds the lane's buckets, hits and VRAM.
+  dynamic graph instead of a CUDA Graph replay (finding 12). `routing.exec = { mode, bucket, remoteMs, stallMs? }`
+  says what the process lane did; `router.detailedStats()` adds the lane's buckets, hits and VRAM.
+- **External load**: the CPU / GPU load samples inflate a lane's `own` only while fresh (< 10 s); a stale sample
+  (sampling paused while idle, or the one-shot sample at start-up when sampling is off) counts as no load - a
+  one-shot sample that caught the previous process's GPU work once made the router prefer the CPU lane for a
+  whole session.
 - **Process affinity**: on Windows hybrid CPUs the process is restricted to the P-cores (finding 7; `pinProcess: false` to opt out).
 - **Shutdown**: `close()` rejects new calls, lets the queue drain, then releases every session (a worker
   releases its own session and exits; see finding 8 for why it is never terminated under a running inference).
@@ -512,9 +526,12 @@ original is `convaiinnovations/laya` (`pip install laya`, Python 3.10+, torch 2.
 ## Known limits / next steps
 
 - WebGPU EP is marked experimental by ORT; first call ~180 ms; sporadic calls pay GPU clock ramp-up.
-- CUDA Graph buckets follow the traffic: the first burst of a never-seen shape runs on the dynamic graph (1 q
-  10 ms instead of 5), the bucket is ready ~0.5 s later in sporadic traffic, ~1.5 s under continuous load (one
-  call stalls ~250 ms while ORT creates the session). `--graph-buckets` names shapes to prepare before ready.
+- CUDA Graph buckets follow the traffic: the first two calls of a never-seen shape run on the dynamic graph (1 q
+  10 ms instead of 5), the bucket is ready ~1.5 s later in sporadic traffic (the first build waits for a full
+  idle second), under continuous load after a forced build that stalls one call ~100-250 ms plus 4-5 capture
+  steps of 10-60 ms (`routing.exec.stallMs`); shapes are remembered across restarts. A shape without a static
+  graph file yet (not one of the four defaults, never seen on this machine) first costs a 5-8 s background
+  generation. `--graph-buckets` names shapes explicitly; `npm run cuda:setup` pre-generates the defaults' files.
 - `head_max_len` 192 tokens shared by all options of a question; < 20 options recommended; state truncated at 512.
 - English checkpoint only; non-Latin scripts fail confidently (model card).
 - Next: collect real traffic -> labels -> `calibrate.mjs`; iterate wording per question; if accuracy is not

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chooseLane, LatencyModel, LayaRouter, nBucket, thermalState, DEFAULT_PRIORS, estimateWork } from "../src/ep-router.mjs";
+import { chooseLane, LatencyModel, LayaRouter, nBucket, thermalState, DEFAULT_PRIORS, estimateWork, LOAD_STALE_MS } from "../src/ep-router.mjs";
 import { parseDuration, SidecarError } from "../src/sidecar-client.mjs";
 import { bucketKey, fitTemperature, metrics, optionCount, optionLabels, softmax } from "../src/calibration.mjs";
 import { presetFromJson, presetToJson, PRESETS } from "../data/presets.mjs";
@@ -227,10 +227,18 @@ test("router predictions: one queue for all lanes - shared wait, choice by own l
   r.lanes.get("webgpu").model.observe(1, "cold", 180);
   assert.equal(chooseLane(r.predictions(1), { explore: 0 }).lane, "cpu");
   r.lanes.get("webgpu").model.ema = {};
-  // contention inflation applies to the lane's own latency, not to the shared wait
+  // contention inflation applies to the lane's own latency, not to the shared wait - and only while the sample is fresh
   r.lastGpuWorkEnd = performance.now();
   r.inflight = [{ lane: "webgpu", ownMs: 55, startedAt: null }];
   r.load.cpuOthers = 0.5;
+  r.load.cpuSampledAt = Date.now();
   const c = by(r.predictions(3)).cpu;
   assert.ok(Math.abs(c.predictedMs - (55 + idle.cpu.ownMs * 2)) < 1e-9);
+  r.load.cpuSampledAt = Date.now() - LOAD_STALE_MS - 1; // a stale sample (sampling paused, or a one-shot at start-up) is ignored
+  assert.ok(Math.abs(by(r.predictions(3)).cpu.predictedMs - (55 + idle.cpu.ownMs)) < 1e-9);
+  r.load.gpuOthersUtil = 0.5;
+  r.load.sampledAt = Date.now() - LOAD_STALE_MS - 1;
+  assert.ok(Math.abs(by(r.predictions(3)).webgpu.ownMs - idle.webgpu.ownMs) < 1e-9, "stale GPU sample ignored");
+  r.load.sampledAt = Date.now();
+  assert.ok(Math.abs(by(r.predictions(3)).webgpu.ownMs - idle.webgpu.ownMs * 2) < 1e-9, "fresh GPU sample inflates");
 });

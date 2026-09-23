@@ -7,12 +7,13 @@ All commands run in the LocalLaya project directory (or through `scripts/laya.mj
 
 | caller | path | per decision |
 |---|---|---|
-| a long-running process making many decisions | `node ask.mjs --start` once, then `POST /decide` over a kept HTTP connection | **13-15 ms** (12 ms inference) |
+| a long-running process making many decisions | `node ask.mjs --start` once, then `POST /decide` over a kept HTTP connection | **7 / 11 / 25 ms** for 1 / 3 / 10 questions (5 / 9 / 23 ms inference) |
 | a shell step / agent tool call | `node scripts/laya.mjs ...` (fast path: this Node process -> HTTP) | 80-90 ms |
 | the same through `node ask.mjs --sidecar --json` | + preset loading and formatting modules | 87-127 ms |
 | no background process wanted | `node ask.mjs --local` | 2.2-2.5 s (loads the model) |
 
-Batch questions about one state into one call: 1 / 3 / 10 questions cost 9 / 12 / 24 ms on the CUDA lane.
+Batch questions about one state into one call: 1 / 3 / 10 questions cost 5 / 9 / 23 ms on the CUDA lane (the
+default `smart-home` preset, 5 questions over a ~150-token state: 23 ms).
 Parallel callers do not add throughput (one queue; each waits `routing.queueMs`).
 
 ## Wrapper: `scripts/laya.mjs`
@@ -117,8 +118,10 @@ Errors: 400 with `{ error }` for bad input (unknown preset, invalid questions, m
   bucket `[rows, tokens, options]` (1 question ~5 ms, 3 ~9, 10 ~23); `mode: "dynamic"` = the generic graph
   (~10 / 12 / 25 ms) - the first two calls of a never-seen shape, calls above 16 rows / 512 tokens / 32 options
   / rows x tokens > 1536, or `exec: { graph: false }`. Buckets are built from the traffic (a shape seen twice
-  gets one within ~0.5 s in sporadic traffic, ~1.5 s under continuous load); answers agree with the dynamic
-  graph to |dp| < 0.01.
+  gets one within ~1.5 s in sporadic traffic, under continuous load after a forced build that stalls one call
+  ~100-250 ms - `routing.exec.stallMs` reports that wait, and the sidecar remembers the shapes across restarts
+  so a recycled sidecar has them ready from its first idle second); answers agree with the dynamic graph to
+  |dp| < 0.01.
 
 ## Lifecycle of the sidecar
 
@@ -126,7 +129,7 @@ Errors: 400 with `{ error }` for bad input (unknown preset, invalid questions, m
   detached, hidden window, log appended to `.laya/sidecar-<port>.log` in the project.
 - Binds the port before loading; racing launchers -> one instance (loser exits 3). Lanes (default `cuda:fp16`
   in a Python process, `webgpu:fp16` and `cpu:8` in worker threads) load in parallel; `status: ready` comes as
-  soon as the first lane is probed and warmed (~2.4 s after spawn), the others join ~1-1.5 s later
+  soon as the first lane is probed and warmed (the CUDA lane, ~2.1-2.4 s after spawn), the others join ~2 s later
   (`/health.lanesLoading`). Callers during the load wait for `ready`; a
   `/decide` that forces a lane still loading gets `503 { retryAfterMs }` (the CLI client retries).
 - Exits on its own after `idle` without `/decide` or `/touch` calls, with nothing in flight, and at `maxAge`
@@ -150,6 +153,7 @@ Errors: 400 with `{ error }` for bad input (unknown preset, invalid questions, m
 | `LAYA_MAX_AGE` | default max age before the sidecar recycles itself (default never) |
 | `LAYA_GPU_KEEPALIVE` | default GPU keep-alive window of `serve.mjs` (default `30s`; `0` = off) |
 | `LAYA_CUDA_GRAPH` | `off` disables CUDA Graph replay in the CUDA lane of `serve.mjs` (`--cuda-graph off`); default on |
+| `LAYA_CUDA_BUCKETS_FILE` | where `serve.mjs` remembers the shapes its callers used (`--cuda-buckets-file`; default `.laya/cuda-buckets-<port>.json`, `off` = none) |
 | `LAYA_LANES` | default lanes for `serve.mjs` (default `cuda:fp16,webgpu:fp16,cpu:8`; `cuda:fp16` needs the Python venv from `npm run cuda:setup` and is dropped otherwise) |
 | `LAYA_PYTHON` | Python with onnxruntime-gpu for the CUDA lane (default `<project>/.venv/Scripts/python.exe`) |
 | `LAYA_CACHE` | model cache directory (default `<project>/models`) |

@@ -9,6 +9,7 @@
  * on the whole eval set, exec: { graph: false } forces the dynamic graph per call, the bucket grid has the
  * documented edges, 1-question replays are faster than dynamic calls / cudaGraph: false and the lazy path (no
  * eager buckets: dynamic first, a bucket appears after a shape was seen twice and the lane had an idle gap) /
+ * the bucket memory file: shapes real traffic used are written at close and built right after the next start /
  * the router picks CUDA for a hot burst, reports routing.exec, the queue stays FIFO / killing the Python process
  * mid-queue: in-flight calls fail over, the lane is gone, later calls avoid it / close() ends the process / a wrong
  * python path is reported as an unavailable lane, not a crash.
@@ -16,6 +17,9 @@
 import { test, before } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import { readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { promisify } from "node:util";
 import { LayaRouter } from "../src/ep-router.mjs";
 import { openLane, LaneDeadError } from "../src/lane.mjs";
@@ -69,10 +73,16 @@ const newAcc = () => ({ total: 0, agree: 0, maxDiff: 0, maxTie: 0 });
  */
 async function warmShapes(lane, items, timeoutMs = 20_000) {
   for (let pass = 0; pass < 2; pass++) for (const it of items) await lane.systemOne(it.state, it.questions);
+  return settle(() => lane.stats(), timeoutMs);
+}
+
+/** Poll a stats source until no bucket is building / prepared / queued (the lane builds in idle gaps; the first
+ * build waits for 1 s of idleness, so this takes ~1.5 s per bucket at least). Returns the last snapshot. */
+async function settle(stats, timeoutMs = 20_000) {
   const t0 = performance.now();
   for (;;) {
-    const st = await lane.stats();
-    const pending = Object.values(st.buckets).filter((b) => b.state === "building" || b.state === "prepared").length + st.queued.length;
+    const st = await stats();
+    const pending = Object.values(st.buckets).filter((b) => b.state === "building" || b.state === "prepared" || b.state === "capturing").length + st.queued.length;
     if (!pending) return st;
     if (performance.now() - t0 > timeoutMs) throw new Error(`buckets still building after ${timeoutMs} ms: ${JSON.stringify(st.buckets)} queued ${JSON.stringify(st.queued)}`);
     await sleep(200);
@@ -92,6 +102,7 @@ test("cuda lane answers like the webgpu lane (same fp16 bundle) on the whole eva
     assert.equal(cuda.mode, "process");
     assert.ok(cuda.providers.includes("CUDAExecutionProvider"));
     assert.equal(cuda.graph.enabled, true, "CUDA graphs on by default");
+    assert.deepEqual(cuda.graph.eager, ["1x96x8", "3x96x8", "5x96x8", "5x128x8"], "built-in eager defaults without a memory file");
     const qs = VARIANTS.v3;
     const st = await warmShapes(cuda, EVAL_SET.map((ex) => ({ state: stateFor(ex), questions: qs })));
     const built = Object.entries(st.buckets).filter(([, b]) => b.state === "ready").map(([k]) => k);
@@ -209,9 +220,12 @@ test("cudaGraph: false serves dynamically; without eager buckets a shape seen tw
     assert.deepEqual(Object.keys((await lazy.stats()).buckets), [], "no eager buckets");
     assert.equal((await lazy.systemOne(STATE, QUESTIONS_3)).exec.mode, "dynamic", "first sighting");
     assert.equal((await lazy.systemOne(STATE, QUESTIONS_3)).exec.mode, "dynamic", "second sighting schedules the bucket");
-    await sleep(2500); // prepare (~250 ms) waits for a 100 ms gap, the capture (~100 ms) for the next one
-    const st = await lazy.stats();
+    assert.equal((await lazy.stats()).buckets["3x96x8"]?.origin, "lazy", "scheduled from traffic");
+    const t0 = performance.now();
+    const st = await settle(() => lazy.stats()); // the first build waits for 1 s of idleness, then prepare ~250 ms + capture ~100 ms
+    console.log(`      lazy bucket 3x96x8 ready ${((performance.now() - t0) / 1000).toFixed(1)} s after the second sighting (waited ${st.buckets["3x96x8"].waitedMs} ms for the idle gap)`);
     assert.equal(st.buckets["3x96x8"]?.state, "ready", JSON.stringify(st.buckets));
+    assert.ok(st.buckets["3x96x8"].waitedMs >= 900, `the first build waits ~1 s for an idle gap: ${st.buckets["3x96x8"].waitedMs} ms`);
     assert.ok(st.buckets["3x96x8"].checkDelta < 0.25, `checked against the dynamic graph on the real inputs: ${st.buckets["3x96x8"].checkDelta}`);
     const r = await lazy.systemOne(STATE, QUESTIONS_3);
     assert.equal(r.exec.mode, "graph");
@@ -219,6 +233,46 @@ test("cudaGraph: false serves dynamically; without eager buckets a shape seen tw
   } finally {
     await lazy.close();
   }
+});
+
+test("bucket memory file: shapes real traffic used are remembered at close and built right after the next start", async (t) => {
+  if (skipUnlessCuda(t)) return;
+  const file = path.join(os.tmpdir(), `laya-cuda-buckets-test-${process.pid}.json`);
+  await rm(file, { force: true });
+  const first = await openLane("cuda:fp16", { ep: "cuda", modelDir: "models/laya-onnx-fp16", graphBuckets: "", graphBucketsFile: file }, { log: quiet });
+  try {
+    assert.deepEqual(first.graph.eager, [], "explicit empty list: nothing eager");
+    assert.equal(first.graph.remembered, 0);
+    assert.equal(first.graph.bucketsFile, file);
+    for (let i = 0; i < 2; i++) assert.equal((await first.systemOne(STATE, QUESTIONS_10)).exec.mode, "dynamic");
+    const st = await settle(() => first.stats());
+    assert.equal(st.buckets["10x96x8"]?.state, "ready", JSON.stringify(st.buckets));
+    assert.equal(st.buckets["10x96x8"].origin, "lazy");
+    assert.equal((await first.systemOne(STATE, QUESTIONS_10)).exec.mode, "graph");
+  } finally {
+    await first.close();
+  }
+  const saved = JSON.parse(await readFile(file, "utf8"));
+  assert.equal(saved.version, 1);
+  assert.deepEqual(Object.keys(saved.buckets), ["10x96x8"], "only the shape traffic used is remembered, no eager defaults");
+  assert.ok(saved.buckets["10x96x8"].hits >= 1 && typeof saved.buckets["10x96x8"].lastUsed === "string", JSON.stringify(saved));
+  const second = await openLane("cuda:fp16", { ep: "cuda", modelDir: "models/laya-onnx-fp16", graphBucketsFile: file }, { log: quiet });
+  try {
+    assert.deepEqual(second.graph.eager, ["10x96x8"], "the remembered shape replaces the built-in defaults");
+    assert.equal(second.graph.remembered, 1);
+    const st0 = await second.stats();
+    assert.ok(["building", "prepared", "capturing", "ready"].includes(st0.buckets["10x96x8"]?.state) || st0.queued.some((k) => k.join("x") === "10x96x8"), `scheduled right after start: ${JSON.stringify(st0.buckets)} ${JSON.stringify(st0.queued)}`);
+    assert.equal(st0.buckets["10x96x8"]?.origin ?? "eager", "eager");
+    const st = await settle(() => second.stats());
+    assert.equal(st.buckets["10x96x8"].state, "ready");
+    assert.equal((await second.systemOne(STATE, QUESTIONS_10)).exec.mode, "graph", "first real call replays");
+    assert.equal(Object.keys(st.buckets).length, 1, "no other eager buckets");
+  } finally {
+    await second.close();
+  }
+  const again = JSON.parse(await readFile(file, "utf8"));
+  assert.ok(again.buckets["10x96x8"].hits > saved.buckets["10x96x8"].hits, "hits accumulate across runs");
+  await rm(file, { force: true });
 });
 
 test("router: cuda is the default first lane and takes a hot burst with routing.exec; killing the process mid-queue fails over and marks it gone", async (t) => {
@@ -230,8 +284,13 @@ test("router: cuda is the default first lane and takes a hot burst with routing.
     assert.ok(cuda, "cuda lane loaded");
     assert.equal(cuda.session.mode, "process");
     assert.ok(logs.some((m) => /lane cuda:fp16: ready .*cuda graphs on/.test(m)), logs.join(" | "));
+    // the eager buckets are built in idle gaps after the lane is ready (the first one waits ~1 s): a burst right after
+    // start runs on the dynamic graph, so settle first - the warm-up (exec.graph false) must not have built anything
+    const early = await router.detailedStats();
+    assert.equal(early.lanes["cuda:fp16"].process.graph_calls, 0, "probe and warm-up never replay a graph");
+    await settle(async () => (await router.detailedStats()).lanes["cuda:fp16"].process);
     const burst = await Promise.all(Array.from({ length: 6 }, (_, i) => router.decide({ ...STATE, userMessage: `burst ${i}` }, QUESTIONS_3)));
-    assert.ok(burst.every((r) => r.routing.lane === "cuda:fp16"), `hot burst on cuda: ${burst.map((r) => r.routing.lane).join(",")}`);
+    assert.ok(burst.every((r) => r.routing.lane === "cuda:fp16"), `hot burst on cuda: ${burst.map((r) => `${r.routing.lane} (${r.routing.reason})`).join(", ")}; cuda healthy ${cuda.healthy} failures ${cuda.failures} dead ${cuda.dead}; logs: ${logs.join(" | ")}`);
     assert.ok(burst.every((r) => r.answers.intent.choice === "control_device"));
     assert.ok(burst.every((r) => r.routing.exec?.mode === "graph" && Array.isArray(r.routing.exec.bucket)), `routing.exec reports the replay: ${JSON.stringify(burst.map((r) => r.routing.exec))}`);
     assert.ok(burst.every((r) => r.exec === undefined), "exec is moved from the result into routing");

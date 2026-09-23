@@ -45,6 +45,15 @@ def log(msg):
     print(msg, flush=True)
 
 
+def save_atomic(model, path):
+    """Write next to the target and rename: a lane process that loads the file concurrently (or a process that is
+    killed mid-write) never sees a truncated graph."""
+    path = Path(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    onnx.save_model(model, str(tmp))
+    os.replace(tmp, path)
+
+
 def dummy_feeds(n, L, K):
     rng = np.random.default_rng(1)
     return {
@@ -116,6 +125,7 @@ def probe_shapes_cpu(probe, model_path, n, L, K):
     try:
         so = ort.SessionOptions()
         so.log_severity_level = 3
+        so.intra_op_num_threads = 8  # one probe run; the default (every core) only fights whoever else is running
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL  # keep every Shape node observable
         sess = ort.InferenceSession(str(probe_path), so, providers=["CPUExecutionProvider"])
         out_names = [o.name for o in sess.get_outputs()]
@@ -311,10 +321,13 @@ if __name__ == "__main__":
     if args.dynamic:
         dyn_model = onnx.load(str(model_path), load_external_data=False)
         moved = weights_as_inputs(dyn_model)
-        onnx.save_model(dyn_model, str(out_dir / "laya-dynamic-w.onnx"))
+        save_atomic(dyn_model, out_dir / "laya-dynamic-w.onnx")
         log(f"laya-dynamic-w.onnx: dynamic graph, {len(moved)} weights as inputs")
     manifest_path = out_dir / "static-manifest.json"
-    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {"source": str(model_path), "buckets": {}}
+    try:
+        manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {"source": str(model_path), "buckets": {}}
+    except (json.JSONDecodeError, OSError):
+        manifest = {"source": str(model_path), "buckets": {}}  # e.g. two lane processes wrote it at once; it is only a report
     dyn = None
     provider = None
     if args.check:
@@ -332,13 +345,13 @@ if __name__ == "__main__":
     for n, L, K in buckets:
         name = bucket_name(n, L, K)
         model, report = make_static(model_path, n, L, K)
-        onnx.save_model(model, str(out_dir / name))
+        save_atomic(model, out_dir / name)
         report["file"] = name
         report["size_bytes"] = (out_dir / name).stat().st_size
         if args.weights_as_inputs:
             moved = weights_as_inputs(model)
             wname = name.replace(".onnx", "-w.onnx")
-            onnx.save_model(model, str(out_dir / wname))
+            save_atomic(model, out_dir / wname)
             report["weights_file"] = wname
             report["weight_inputs"] = len(moved)
             manifest["weights"] = moved  # identical for every bucket
@@ -350,5 +363,7 @@ if __name__ == "__main__":
     if args.dynamic:
         manifest["dynamic_weights_file"] = "laya-dynamic-w.onnx"
         manifest["weights"] = moved
-    manifest_path.write_text(json.dumps(manifest, indent=2))
+    tmp_manifest = manifest_path.with_name(f"{manifest_path.name}.{os.getpid()}.tmp")
+    tmp_manifest.write_text(json.dumps(manifest, indent=2))
+    os.replace(tmp_manifest, manifest_path)
     log(f"manifest: {manifest_path} ({len(manifest['buckets'])} buckets)")

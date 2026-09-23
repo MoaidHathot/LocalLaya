@@ -47,12 +47,13 @@ router, i.e. they include the stdio hop and Node's tokenising (0.7-1.8 ms), hot 
    (`FINALISE_MAX_DELTA` 0.5 = "broken capture"; real text lands at 0.002-0.015). That happens in idle gaps of the
    request loop (100 ms) or is forced onto the first matching request 0.5 s after the bucket was prepared.
 6. **The GIL**: ORT holds the interpreter lock for the whole `InferenceSession` construction (317 of 340 ms,
-   `experiments/cuda_gil_probe.py`), which freezes the serving thread for that long. The builder therefore waits
-   for a 100 ms gap in the requests before such a step (at most 1 s), the eager buckets (`--graph-buckets`,
-   default `1x96x8,3x96x8,5x96x8,5x128x8`) are prepared and captured **before** the ready line (+1.4 s start-up
-   with the static files cached; `npm run cuda:setup` pre-generates them), lazy buckets are only scheduled for
-   shapes seen twice, and the router's start-up probe / warm-up run with `exec: { graph: false }` so they neither
-   build buckets nor measure a disturbed lane.
+   `experiments/cuda_gil_probe.py`), which freezes the serving thread for that long. Mitigations, in the order
+   they were measured (see "Start-up, memory and stalls" below for the second round): the builder waits for a
+   100 ms gap in the requests before such a step (1 s for the first one, at most 1 s once requests flow), lazy
+   buckets are only scheduled for shapes seen twice, the router's start-up probe / warm-up / keep-alive run with
+   `exec: { graph: false }` so they neither build buckets nor measure a disturbed lane, sessions are created
+   from a pre-optimised file (~100 ms instead of ~250), the capture runs in one-run steps, and the wait a
+   request suffered is reported as `stallMs` and excluded from the router's estimates.
 
 Grid: `L` in 64..512 (10 steps), `n` in 1..16 (10 steps), `K` in 8 / 16 / 32; shapes with `n x L > 1536`
 (`--graph-max-work`) stay dynamic - there the launch overhead is a few percent of the call. Inputs are padded to
@@ -132,26 +133,81 @@ same shape replays. That is the lazy policy's price: a shape must be seen twice 
 
 (in-process timings, no stdio hop). Above ~1300 units of `n x L` the gain is within noise: `--graph-max-work`.
 
+## Start-up, memory and stalls (second round, same evening)
+
+The first integration built the four default buckets *before* the ready line (+1.4 s on the lane's join time;
+the sidecar was ready on WebGPU at ~2.6 s and CUDA joined at 3.4 s), and the defaults were the PoC shapes - the
+default `smart-home` preset through the sidecar lands on `5x160x8`, which nothing pre-built. Changes, each
+measured against the previous state:
+
+- **Eager builds after ready, in idle gaps.** The lane reports ready after the dynamic session plus one warm-up
+  run (1.1-1.3 s alone, 1.7-2.1 s while the two other lanes load) and schedules its eager set. Sidecar: ready
+  with the CUDA lane at **2.1-2.4 s** after spawn (was ~2.6 s on WebGPU), first call answered at 2.2-2.5 s on
+  CUDA (was 2.8-3.1 s on WebGPU incl. its first-shape shader compile). `test/sidecar.test.mjs`: first call
+  3092 -> 2212-2490 ms.
+- **Memory of real traffic** (`--graph-buckets-file`, `serve.mjs` default `.laya/cuda-buckets-<port>.json`):
+  buckets that were hit or built from traffic are written at capture / first hit / close with their hit counts;
+  the next start builds the top 6 by hits instead of the defaults. Second sidecar start on the default preset:
+  the `5x160x8` bucket is captured in the first idle second and every later call replays (23 ms vs 27-32 dynamic
+  under the start-up CPU contention). Preset-agnostic: whatever the callers use gets remembered.
+- **The first build waits for a full idle second** (`PREPARE_FIRST_IDLE_S`), later ones 100 ms, forced after 1 s
+  of continuous requests: the request that made a sidecar start arrives ~40 ms after ready and must not hit a
+  250 ms GIL freeze. Measured: first four calls of a fresh sidecar 26-39 ms round trip (5 q, dynamic, other
+  lanes still loading), no stall.
+- **Pre-optimised session files** (`experiments/cuda_session_create_probe.py`): default optimisation 250-257 ms
+  per session creation; loading the graph ORT saved via `optimized_model_filepath` with `ORT_DISABLE_ALL` 114-120
+  ms (0.2 MB per file, per ORT version). The lane writes the file on a bucket's first creation; `npm run
+  cuda:setup` (`--graphs`, `cuda_lane.py --prepare-buckets`) pre-generates the defaults'. Prepare step 225-300 ->
+  97-140 ms, same fidelity (self-test max |delta| unchanged).
+- **Capture in one-run steps**: the serving thread does one `run_with_iobinding` (10-60 ms; the first run of a
+  new session ~90 ms) per idle tick or per incoming request instead of a 55-230 ms block; the check against the
+  dynamic session is the fifth step.
+- **Static-graph generation in a subprocess** (`static_graph.py`, low priority, on the CPUs the lane is not
+  pinned to = the E-cores here, probe session 8 threads): in-process the 2-3 s of Python/ONNX work plus the
+  probe made every concurrent dynamic call 2-3x slower (p50 18.7, p90 39.6, 37 calls > 40 ms of 594 in 12 s);
+  as a subprocess with inherited affinity 40-50 ms calls remained; with the affinity/priority change **p50
+  17.5, p90 18.6, max 25.7 ms** (stalls excluded) during a 5.6 s generation. One-time per shape per machine.
+- **`stallMs`**: the process reports how long a request waited for something that was not its inference -
+  queue time behind a capture step, capture steps run on its behalf, and any builder GIL hold overlapping it
+  (the hold is recorded *before* the call starts: the serving thread can run before the `finally`). Measured
+  under load: a 307 ms call reported 300.6 (the session creation of a new bucket without a pre-optimised file),
+  a 95 ms call 90.5 (the first capture step). The router observes `ms - stallMs` for its EMA; before that, one
+  stalled call taught the EMA 300+ ms and the late binding moved the rest of an 8-call burst to WebGPU (1527 ms
+  for the burst, two lanes; now 200-300 ms on one lane).
+- **Exit without interpreter teardown** (`os._exit` after the memory file is written; every file write is
+  atomic): `--stop` left the process alive while the builder was mid-generation; destroying sessions under a
+  thread inside ORT hung the exit.
+- **Router bug found on the way**: with `sampleLoad: false` the one-shot `nvidia-smi` sample at `create()`
+  (which caught the previous test's GPU work) inflated the CUDA lane's predictions 2.2x for the router's whole
+  life - every burst went to `cpu:8`, intermittently (1 in ~4 runs). Load samples now count only while fresh
+  (< 10 s, `LOAD_STALE_MS`), and with sampling off the start-up utilisation is not ingested at all. Unit test added.
+
+Kept-connection round trips after this round (sidecar, all lanes loaded, buckets ready): **1 q 6.6 ms, 3 q
+10.8, 10 q 25.1; default preset (5 q, ~150 tokens) 23.3** (p50 of 30; was 13-15 ms for 3 q on the dynamic graph).
+
 ## Costs
 
-- Start-up: lane ready in 2.3-2.6 s instead of 1.0 s (4 eager buckets, static files cached); the first start
-  without the files adds ~1-3 s per bucket for the graph rewriting on the CPU (`npm run cuda:setup` does it).
+- Start-up: the lane is ready in 1.1-1.3 s (dynamic session + one warm-up run); buckets follow in idle gaps,
+  ~0.25 s each with the files cached, plus a 5-8 s subprocess for a shape that has no static file yet
+  (`npm run cuda:setup` generates the defaults').
 - VRAM: 804 MiB weights (shared) + 28-240 MiB per bucket; 5 buckets 464 MiB, 7 buckets 728 MiB
   (`--graph-max-vram-mib 1536`).
-- A lazily built bucket under continuous traffic: one call stalls ~250 ms (session creation holds the GIL),
-  one more waits 50-240 ms for the capture. Under sporadic traffic both usually land in gaps.
+- A bucket built under continuous traffic: one call stalls ~100 ms (session creation holds the GIL; ~250 without
+  the pre-optimised file), 4-5 calls each carry one capture step of 10-60 ms; all reported as `stallMs`. Under
+  sporadic traffic everything lands in gaps.
 - Per-call: padding + in-place device update + sync ~0.1-0.3 ms.
 
 ## Files
 
-`tools/cuda_lane.py` (lane: dynamic session + buckets, `--graph auto|off`, `--graph-buckets`, `--graph-max-*`,
-`--self-test`, ops `stats` / `bucket`, per-call `exec: { graph: false }`), `tools/static_graph.py` (static bucket
-graphs, GatherND -> Reshape, weights as inputs, `--check`), `tools/setup-cuda-lane.mjs --graphs`,
+`tools/cuda_lane.py` (lane: dynamic session + buckets, `--graph auto|off`, `--graph-buckets`,
+`--graph-buckets-file`, `--graph-max-*`, `--self-test`, `--prepare-buckets`, ops `stats` / `bucket`, per-call
+`exec: { graph: false }`, `stallMs`), `tools/static_graph.py` (static bucket graphs, GatherND -> Reshape, weights
+as inputs, `--check`, atomic writes), `tools/setup-cuda-lane.mjs --graphs`,
 `src/lane.mjs` (`ProcessLane.systemOne(state, questions, temps, exec)`, `stats()`, `bucketFor()`, `graph`),
 `src/ep-router.mjs` (`routing.exec`, `detailedStats()`, `cudaGraph` / `graphBuckets` / `graphMax*` options,
 warm-up with `exec: { graph: false }`), `serve.mjs --cuda-graph off` (`LAYA_CUDA_GRAPH`), `ask.mjs --no-graph`,
 `demo/cli.mjs --no-graph`, `experiments/ab.mjs` (`cuda:fp16?graph=false`, settle step), `experiments/throughput.mjs`
 (settle step), probes `experiments/cuda_static_probe.py`, `cuda_capture_attempt.py`, `cuda_capture_bisect.py`,
-`cuda_shared_weights_probe.py`, `cuda_input_race_probe.py`, `cuda_gil_probe.py`; tests `test/cuda-lane.test.mjs`
-(5 scenarios). Summaries: `results/cuda-graph-vs-dynamic-dev-request-summary.md`, `results/cuda-graph-vs-fp32-poc-summary.md`,
+`cuda_shared_weights_probe.py`, `cuda_input_race_probe.py`, `cuda_gil_probe.py`, `cuda_session_create_probe.py`;
+tests `test/cuda-lane.test.mjs` (6 scenarios), `test/unit.test.mjs` (stale load samples). Summaries: `results/cuda-graph-vs-dynamic-dev-request-summary.md`, `results/cuda-graph-vs-fp32-poc-summary.md`,
 `results/throughput-cuda-graph-3q-summary.md`, `results/throughput-cuda-graph-10q-summary.md` (raw JSON next to them, git-ignored).

@@ -15,6 +15,8 @@
  *                                          # CUDA lane at ~50 ms instead of ~200 ms for the next sporadic call; costs 1-4 W meanwhile)
  *   node serve.mjs --cuda-graph off        # cuda lane without CUDA Graph replay (default on: static bucket graphs captured on
  *                                          # demand, ~4 ms less per call; LAYA_CUDA_GRAPH=off); per call: exec: { graph: false }
+ *   node serve.mjs --cuda-buckets-file off # do not remember which shapes the callers used (default .laya/cuda-buckets-<port>.json:
+ *                                          # the next start builds those shapes' CUDA graphs first; LAYA_CUDA_BUCKETS_FILE)
  *   node serve.mjs --in-process            # lanes in this thread instead of worker threads (blocks the server during inference)
  *
  * Lifecycle: the port is bound BEFORE the model loads, so the port doubles as the mutex between racing
@@ -68,6 +70,7 @@ const { values: args } = parseArgs({
     "max-age": { type: "string", default: process.env.LAYA_MAX_AGE ?? "0" },
     "gpu-keepalive": { type: "string", default: process.env.LAYA_GPU_KEEPALIVE ?? "30s" },
     "cuda-graph": { type: "string", default: process.env.LAYA_CUDA_GRAPH ?? "on" },
+    "cuda-buckets-file": { type: "string", default: process.env.LAYA_CUDA_BUCKETS_FILE ?? "" },
     sidecar: { type: "boolean", default: false },
     "in-process": { type: "boolean", default: false },
   },
@@ -76,6 +79,8 @@ const idleMs = parseDuration(args.idle ?? (args.sidecar ? process.env.LAYA_IDLE 
 const maxAgeMs = parseDuration(args["max-age"]);
 const gpuKeepAliveMs = parseDuration(args["gpu-keepalive"]);
 const cudaGraph = !/^(off|0|false|no)$/i.test(args["cuda-graph"]);
+// memory of the shapes real traffic used, per port (the test port keeps its own); "off" = none
+const cudaBucketsFile = /^(off|0|false|no|none)$/i.test(args["cuda-buckets-file"]) ? null : args["cuda-buckets-file"] || path.join(PROJECT_ROOT, ".laya", `cuda-buckets-${args.port}.json`);
 const SAMPLING_PAUSE_MS = 10_000;
 const log = (m) => console.log(`[serve${args.sidecar ? ":sidecar" : ""} ${process.pid}] ${new Date().toISOString().slice(11, 19)} ${m}`);
 process.title = args.sidecar ? "laya-sidecar" : "laya-serve";
@@ -214,6 +219,7 @@ const health = () => ({
   maxAgeS: maxAgeMs ? Math.round(maxAgeMs / 1000) : 0,
   gpuKeepAliveS: gpuKeepAliveMs ? Math.round(gpuKeepAliveMs / 1000) : 0,
   cudaGraph,
+  cudaBucketsFile: cudaBucketsFile ? path.relative(PROJECT_ROOT, cudaBucketsFile).replace(/\\/g, "/") : null,
   inFlight,
   sampling: !!router?.sampling,
 });
@@ -293,6 +299,7 @@ server.listen(Number(args.port), args.host, async () => {
       workers: !args["in-process"],
       gpuKeepAliveMs,
       cudaGraph,
+      graphBucketsFile: cudaBucketsFile,
       warmup: { state: warmupState, sizes: [3, 5] },
       waitFor: "first",
       onLaneReady: (lane, info) => {

@@ -7,8 +7,10 @@
  *   node tools/setup-cuda-lane.mjs --graphs         # only (re)generate the static CUDA-graph bucket files
  *
  * After the install the static-shape graphs for the lane's default eager buckets are generated next to
- * models/laya-onnx-fp16/laya.onnx (tools/static_graph.py, ~1-3 s each on the CPU); tools/cuda_lane.py would
- * otherwise do it on its first start. Skipped when the fp16 bundle is not there yet (`npm run fp16:check`).
+ * models/laya-onnx-fp16/laya.onnx (tools/static_graph.py, ~1-3 s each on the CPU) together with their
+ * pre-optimised variants (tools/cuda_lane.py --prepare-buckets: what ORT would otherwise optimise at every session
+ * creation, halving the ~250 ms a bucket build can stall a call); the lane generates any missing file on demand.
+ * Skipped when the fp16 bundle is not there yet (`npm run fp16:check`).
  *
  * Sources (chosen because they are reachable from networks that block files.pythonhosted.org):
  *   - onnxruntime-gpu: Microsoft's release feed for the CUDA 13 build
@@ -95,6 +97,9 @@ async function buildGraphs() {
   say(`> static graphs for ${args.buckets} in ${dir}`);
   const { stdout } = await run(PY, ["-u", path.join(ROOT, "tools", "static_graph.py"), dir, "--buckets", args.buckets, "--weights-as-inputs", "--dynamic"], { env: { ...process.env, PYTHONUTF8: "1" }, maxBuffer: 16 * 1024 * 1024 });
   for (const l of stdout.trim().split(/\r?\n/)) say(`  ${l}`);
+  say(`> pre-optimised session files (onnxruntime ${(await check()).onnxruntime})`);
+  const prep = await run(PY, ["-u", path.join(ROOT, "tools", "cuda_lane.py"), "--model-dir", dir, "--graph-buckets", args.buckets, "--prepare-buckets"], { env: { ...process.env, PYTHONUTF8: "1" }, maxBuffer: 16 * 1024 * 1024 });
+  for (const l of prep.stderr.trim().split(/\r?\n/).filter((l) => /files ready|FAILED|failed/.test(l))) say(`  ${l.replace(/^\[cuda_lane \d+\] /, "")}`);
 }
 
 if (args.graphs) {

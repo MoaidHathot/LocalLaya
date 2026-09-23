@@ -34,11 +34,11 @@ node scripts/laya.mjs --preset triage "Charged twice. Refund today or I cancel."
   `{ state, answers, usage, routing, backend }`. Progress and warnings go to stderr. Exit code 0 on success,
   1 on error (message on stderr), 2 for an unknown preset or an invalid question set.
 - Cost per call: **~80-90 ms** (Node start-up + HTTP; the inference itself is ~5-10 ms on the CUDA lane). The
-  first call after an idle period takes ~2.5-4.5 s (it starts the sidecar; stderr says `starting one`).
+  first call after an idle period takes ~2.2-2.5 s (it starts the sidecar; stderr says `starting one`).
   The sidecar exits by itself after 5 min without calls.
 - **Making many calls?** Do not spawn a process per decision. Start the sidecar once and call it over HTTP from
-  your own process: `node ask.mjs --start` prints `{ url, pid, lanes }`; then `POST /decide` - **~10 ms per
-  call** with a kept connection. See [references/api.md](references/api.md).
+  your own process: `node ask.mjs --start` prints `{ url, pid, lanes }`; then `POST /decide` - **7-11 ms per
+  call** (1-3 questions) with a kept connection. See [references/api.md](references/api.md).
 - **Several questions about the same text?** Put them in one call (one preset or one `--questions` set): 3
   questions cost ~9 ms, 10 questions ~23 ms - not 3 or 10 separate calls.
 
@@ -73,7 +73,8 @@ see [references/presets.md](references/presets.md) for the format and how to wri
 - `routing.lane` / `routing.ms` say where and how fast it ran (`cuda:fp16` ~9 ms, `webgpu:fp16` ~32 ms,
   `cpu:8` ~270 ms for 3 questions); `routing.queueMs` > 0 means it waited behind other callers. You do not
   choose the lane; the sidecar picks the fastest predicted one per call. On the CUDA lane `routing.exec.mode`
-  is `graph` (a replayed CUDA Graph for a known shape) or `dynamic` (a new or large shape: ~3-5 ms slower).
+  is `graph` (a replayed CUDA Graph for a known shape) or `dynamic` (a new or large shape: ~3-5 ms slower); the
+  sidecar remembers the shapes you use and has them ready from its first idle second after a restart.
 
 ## When to use / not to use
 
@@ -125,7 +126,7 @@ Invoke-RestMethod -Uri http://127.0.0.1:8787/decide -Method Post -ContentType ap
 
 ## Edge cases
 
-- First call after idle: ~2.5-4.5 s and stderr says `starting one`. Subsequent calls are fast. Do not run several
+- First call after idle: ~2.2-2.5 s and stderr says `starting one`. Subsequent calls are fast. Do not run several
   first calls in parallel to "warm it up"; one is enough (racing launchers are handled, but waste ~1 s each).
 - Calls a few seconds apart are slower than back-to-back ones (the GPU drops its clocks between calls): expect
   ~40-50 ms instead of 9 ms, occasionally ~200 ms. The sidecar keeps the GPU awake for 30 s after each call

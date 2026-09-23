@@ -209,7 +209,7 @@ class RemoteSession {
   constructor(lane) {
     this.lane = lane; // the ProcessLane (child, pending map, death handling)
     this.pendingExec = undefined; // per-call execution options for the next run() (set by ProcessLane.systemOne; calls are serialised)
-    this.lastExec = null; // { mode: "graph"|"dynamic", bucket: [n, L, K]|null, remoteMs } of the last run()
+    this.lastExec = null; // { mode: "graph"|"dynamic", bucket: [n, L, K]|null, remoteMs, stallMs? } of the last run()
   }
   async run(feeds) {
     const wire = {};
@@ -220,7 +220,9 @@ class RemoteSession {
     const exec = this.pendingExec;
     this.pendingExec = undefined;
     const res = await this.lane._request(exec ? { feeds: wire, exec } : { feeds: wire });
-    this.lastExec = { mode: res.mode ?? "dynamic", bucket: res.bucket ?? null, remoteMs: res.ms };
+    // stallMs: time the request waited inside the process for a bucket build step (capture run / session creation),
+    // not part of the lane's latency - the router leaves it out of its estimates
+    this.lastExec = { mode: res.mode ?? "dynamic", bucket: res.bucket ?? null, remoteMs: res.ms, ...(res.stallMs ? { stallMs: res.stallMs } : {}) };
     const out = {};
     for (const [name, t] of Object.entries(res.outputs)) {
       const buf = Buffer.from(t.data, "base64");
@@ -273,7 +275,8 @@ class ProcessLane {
   /**
    * @param {object} loadOpts { ep: "cuda", modelDir, deviceId, threads, calibration, python,
    *   cudaGraph (default true: CUDA Graph replay on static bucket graphs, see tools/cuda_lane.py),
-   *   graphBuckets ("1x96x8,3x96x8,..." built eagerly), graphMaxSessions, graphMaxVramMiB, graphMaxWork }
+   *   graphBuckets ("1x96x8,3x96x8,..." built right after start), graphBucketsFile (JSON memory of the shapes real
+   *   traffic used; its top shapes are built right after start), graphMaxEager, graphMaxSessions, graphMaxVramMiB, graphMaxWork }
    */
   static async open(lane, loadOpts, { log = () => {} } = {}) {
     const L = new ProcessLane(lane);
@@ -283,6 +286,8 @@ class ProcessLane {
     if (process.platform === "win32" && PCORE_LOGICAL > 0) argv.push("--affinity", `0-${PCORE_LOGICAL - 1}`);
     if (loadOpts.cudaGraph === false) argv.push("--graph", "off");
     if (loadOpts.graphBuckets !== undefined) argv.push("--graph-buckets", String(loadOpts.graphBuckets));
+    if (loadOpts.graphBucketsFile) argv.push("--graph-buckets-file", path.resolve(PROJECT_ROOT, String(loadOpts.graphBucketsFile)));
+    if (loadOpts.graphMaxEager !== undefined) argv.push("--graph-max-eager", String(loadOpts.graphMaxEager));
     if (loadOpts.graphMaxSessions !== undefined) argv.push("--graph-max-sessions", String(loadOpts.graphMaxSessions));
     if (loadOpts.graphMaxVramMiB !== undefined) argv.push("--graph-max-vram-mib", String(loadOpts.graphMaxVramMiB));
     if (loadOpts.graphMaxWork !== undefined) argv.push("--graph-max-work", String(loadOpts.graphMaxWork));

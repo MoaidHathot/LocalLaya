@@ -205,7 +205,7 @@ for (const s of sessions) {
   if (typeof s.laya.stats !== "function" || !s.laya.graph?.enabled) continue;
   const t0 = performance.now();
   let st = await s.laya.stats();
-  while (Object.values(st.buckets).some((b) => b.state === "building" || b.state === "prepared") || st.queued.length) {
+  while (Object.values(st.buckets).some((b) => b.state === "building" || b.state === "prepared" || b.state === "capturing") || st.queued.length) {
     if (performance.now() - t0 > 30_000) throw new Error(`${s.label}: buckets still building after 30 s: ${JSON.stringify(st.buckets)}`);
     await new Promise((r) => setTimeout(r, 200));
     st = await s.laya.stats();

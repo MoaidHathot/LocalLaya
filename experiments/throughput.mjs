@@ -86,7 +86,7 @@ const settle = async (timeoutMs = 30_000) => {
   const t0 = performance.now();
   for (;;) {
     const st = await router.detailedStats();
-    const pending = Object.values(st.lanes).some((l) => l.process && (Object.values(l.process.buckets).some((b) => b.state === "building" || b.state === "prepared") || l.process.queued.length));
+    const pending = Object.values(st.lanes).some((l) => l.process && (Object.values(l.process.buckets).some((b) => b.state === "building" || b.state === "prepared" || b.state === "capturing") || l.process.queued.length));
     if (!pending || performance.now() - t0 > timeoutMs) return;
     await new Promise((r) => setTimeout(r, 200));
   }

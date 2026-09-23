@@ -96,8 +96,9 @@ better wording or fine-tuning, not temperature.
 ## Latency you pay per preset
 
 The model input is `[CLS] type question: instructions [SEP] [MASK] option0 [MASK] option1 ... [SEP] state [SEP]`
-per question, all questions of a call in one batch. On the CUDA lane a call costs ~9 ms + ~1.5 ms per question
-(3 q 12 ms, 5 q ~15 ms, 10 q 24 ms); on WebGPU ~18 ms + ~6 ms per question; on the CPU ~90 ms per question.
+per question, all questions of a call in one batch. On the CUDA lane a call costs ~3 ms + ~2 ms per question
+at ~85 tokens per row (1 q 5 ms, 3 q 9, 10 q 23) and more for longer rows (the default `smart-home` preset:
+5 q over a ~150-token state 23 ms); on WebGPU ~18 ms + ~6 ms per question; on the CPU ~90 ms per question.
 Longer instructions / option texts and longer states raise this on every call (CPU: 3 q went 236 -> 400 ms for
 77 -> 136 tokens per question). Keep options short; keep the state to what the questions need; do not split
 one text's questions over several calls.

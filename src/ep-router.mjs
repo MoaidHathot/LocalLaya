@@ -38,6 +38,9 @@ export const nBucket = (n) => (n <= 1 ? "1" : n <= 3 ? "2-3" : n <= 6 ? "4-6" : 
 export const thermalState = (msSinceGpuWork) => (msSinceGpuWork < 400 ? "hot" : msSinceGpuWork < 2000 ? "warm" : "cold");
 /** Interval of the GPU keep-alive calls (see LayaRouter#_scheduleKeepAlive): 500 ms keeps the CUDA lane at ~50 ms cold-start, 1000 ms does not. */
 export const KEEP_ALIVE_INTERVAL_MS = 500;
+/** A CPU / GPU load sample older than this no longer inflates predictions (sampling pauses while a sidecar idles, and a
+ * one-shot sample at start-up must not decide the routing minutes later). */
+export const LOAD_STALE_MS = 10_000;
 
 /**
  * Priors (ms per systemOne call). Measured values from this repo's results for 1 / 2-3 / 7-10; the 4-6 and
@@ -195,7 +198,7 @@ export class LayaRouter {
     this.direct = new Set(); // start-up probe / warm-up calls running outside the FIFO (see _direct)
     this.lastGpuWorkEnd = -Infinity;
     this.gpuBusy = 0;
-    this.load = { cpuOthers: 0, gpuOthersUtil: 0, gpuSmClockMHz: null, gpuMemFreeMiB: null, sampledAt: null };
+    this.load = { cpuOthers: 0, gpuOthersUtil: 0, gpuSmClockMHz: null, gpuMemFreeMiB: null, sampledAt: null, cpuSampledAt: null };
     this._timers = [];
     this._keepAliveUntil = 0;
     this.log = opts.log ?? (() => {});
@@ -218,7 +221,9 @@ export class LayaRouter {
    * @param {string} [o.python]                      Python with onnxruntime-gpu for cuda lanes (default LAYA_PYTHON or .venv/Scripts/python.exe)
    * @param {number} [o.deviceId]                    GPU index for cuda / dml lanes (default 0)
    * @param {boolean} [o.cudaGraph=true]             cuda lanes: CUDA Graph replay on static bucket graphs (tools/cuda_lane.py); false = dynamic graph only
-   * @param {string} [o.graphBuckets]                cuda lanes: buckets built eagerly ("1x96x8,3x96x8,..."); the rest come from traffic
+   * @param {string} [o.graphBuckets]                cuda lanes: buckets built right after start ("1x96x8,3x96x8,..."); the rest come from traffic
+   * @param {string} [o.graphBucketsFile]            cuda lanes: JSON memory of the shapes real traffic used (written by the lane); its top
+   *                                                 graphMaxEager shapes (default 6) are built right after start instead of the built-in defaults
    * @param {number} [o.graphMaxSessions]            cuda lanes: LRU bound on captured buckets (default 16)
    * @param {number} [o.graphMaxVramMiB]             cuda lanes: VRAM budget for the buckets' activations (default 1536)
    * @param {number} [o.graphMaxWork]                cuda lanes: rows x length above which calls stay dynamic (default 1536)
@@ -233,7 +238,9 @@ export class LayaRouter {
     // in the background: overlaps with the model loads, done before the first call
     const pinned = r.opts.pinProcess ? pinProcessToPCores({ log: r.log }) : Promise.resolve({ applied: false, reason: "disabled" });
     const gpu = await queryGpu();
-    if (gpu) r._ingestGpu(gpu);
+    // clocks and free VRAM are always useful; the utilisation only when sampling keeps it fresh (a one-shot value
+    // would inflate GPU predictions for the router's whole life - e.g. a test suite's previous run still showing)
+    if (gpu) r._ingestGpu(gpu, { util: r.opts.sampleLoad });
     let firstReady;
     const first = new Promise((resolve) => (firstReady = resolve));
     for (const lane of r.opts.lanes) r.loading.add(lane);
@@ -271,7 +278,7 @@ export class LayaRouter {
     const t0 = performance.now();
     let session = null;
     try {
-      session = await openLane(lane, { ep, threads, pinToPCores: pin, modelDir, calibration: this.opts.calibration, python: this.opts.python, deviceId: this.opts.deviceId, cudaGraph: this.opts.cudaGraph, graphBuckets: this.opts.graphBuckets, graphMaxSessions: this.opts.graphMaxSessions, graphMaxVramMiB: this.opts.graphMaxVramMiB, graphMaxWork: this.opts.graphMaxWork }, { worker: this.opts.workers, log: () => {} });
+      session = await openLane(lane, { ep, threads, pinToPCores: pin, modelDir, calibration: this.opts.calibration, python: this.opts.python, deviceId: this.opts.deviceId, cudaGraph: this.opts.cudaGraph, graphBuckets: this.opts.graphBuckets, graphBucketsFile: this.opts.graphBucketsFile, graphMaxEager: this.opts.graphMaxEager, graphMaxSessions: this.opts.graphMaxSessions, graphMaxVramMiB: this.opts.graphMaxVramMiB, graphMaxWork: this.opts.graphMaxWork }, { worker: this.opts.workers, log: () => {} });
       if (this.closed) throw new Error("router closed while loading");
       const L = { lane, session, model: new LatencyModel(lane), healthy: true, dead: false, failures: 0, quarantinedUntil: 0, calls: 0, pending: 0, loadMs: session.loadMs, probeMs: 0 };
       session.onDeath((cause) => this._laneDied(L, cause));
@@ -391,11 +398,11 @@ export class LayaRouter {
     return report;
   }
 
-  _ingestGpu(g) {
+  _ingestGpu(g, { util = true } = {}) {
     const idleForMs = performance.now() - this.lastGpuWorkEnd;
     // util measured while we were not using the GPU is external load; at idle clocks the compositor's
     // "utilisation" is harmless, so weight it by clock level.
-    if (!this.gpuBusy && idleForMs > 500) {
+    if (util && !this.gpuBusy && idleForMs > 500) {
       const clockFactor = g.smClockMaxMHz ? Math.min(1, g.smClockMHz / g.smClockMaxMHz) : 0.5;
       this.load.gpuOthersUtil = (g.utilPct / 100) * (clockFactor > 0.5 ? 1 : 0.15);
     }
@@ -411,7 +418,10 @@ export class LayaRouter {
     meter.tick();
     const cpuTimer = setInterval(() => {
       const m = meter.tick();
-      if (m) this.load.cpuOthers = m.others;
+      if (m) {
+        this.load.cpuOthers = m.others;
+        this.load.cpuSampledAt = Date.now();
+      }
     }, 1000);
     cpuTimer.unref();
     this._timers.push(cpuTimer);
@@ -445,10 +455,11 @@ export class LayaRouter {
     this._startSampling(!!this._hasGpu);
   }
 
-  /** Contention multiplier for a lane's predicted latency. */
+  /** Contention multiplier for a lane's predicted latency; a sample older than LOAD_STALE_MS counts as no load. */
   _inflation(lane) {
-    if (isGpuLane(lane)) return 1 / Math.max(0.2, 1 - this.load.gpuOthersUtil);
-    return 1 / Math.max(0.15, 1 - this.load.cpuOthers);
+    const now = Date.now();
+    if (isGpuLane(lane)) return 1 / Math.max(0.2, 1 - (this.load.sampledAt && now - this.load.sampledAt < LOAD_STALE_MS ? this.load.gpuOthersUtil : 0));
+    return 1 / Math.max(0.15, 1 - (this.load.cpuSampledAt && now - this.load.cpuSampledAt < LOAD_STALE_MS ? this.load.cpuOthers : 0));
   }
 
   /** Predicted time until the queue is empty: full estimates for queued calls, the remainder for the running one. */
@@ -538,9 +549,12 @@ export class LayaRouter {
         // temperature override travels with the call and is applied by the lane right before it runs.
         const run = await this._enqueue(L, choice.ownMs, (lane) => lane.session.systemOne(state, questions, o.calibration?.temperature_by_options, o.exec), rebind);
         L = run.L;
-        const exec = run.result.exec ?? null; // what the lane did (cuda: { mode: "graph"|"dynamic", bucket, remoteMs })
+        const exec = run.result.exec ?? null; // what the lane did (cuda: { mode: "graph"|"dynamic", bucket, remoteMs, stallMs? })
         if (exec) delete run.result.exec;
-        L.model.observe(n, run.stateAtStart, run.ms, work);
+        // a call that waited for a CUDA-graph build step inside the process (exec.stallMs) is not evidence about the
+        // lane's latency: learning it would send the next calls of a burst to a slower lane (measured: 8 calls 1.5 s
+        // instead of 0.2 s, half of them on webgpu)
+        L.model.observe(n, run.stateAtStart, exec?.stallMs ? Math.max(run.ms - exec.stallMs, exec.remoteMs ?? 1) : run.ms, work);
         L.calls++;
         L.healthy = true;
         L.failures = 0;

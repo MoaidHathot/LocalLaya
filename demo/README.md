@@ -34,7 +34,7 @@ await laya.close();
 
 | mode | what happens | first call | per call |
 |---|---|---|---|
-| `auto` (default) | shared sidecar, spawned if not running; falls back to `local` if the port is foreign or the spawn fails | 2.5-4.5 s once per idle period, then reused by every process | inference + ~1.5 ms (one keep-alive connection) |
+| `auto` (default) | shared sidecar, spawned if not running; falls back to `local` if the port is foreign or the spawn fails | 2.2-2.5 s once per idle period, then reused by every process | inference + ~1.5 ms (one keep-alive connection) |
 | `sidecar` | the sidecar or an error | same | same |
 | `local` | the model in this process (no background process; N processes = N copies) | 2-3 s every process | inference |
 | `http` | a server you started yourself (`url`); never spawns | - | inference + ~1.5 ms |
@@ -53,8 +53,9 @@ on the reference machine (RTX 4070), 3 questions: CUDA ~9 ms (~12 on its dynamic
 
 The CUDA lane replays a captured CUDA Graph for shapes it has seen before (`routing.exec.mode: "graph"`,
 `bucket: [rows, tokens, options]`) and falls back to its generic graph for the first two calls of a new shape
-or for large calls (`mode: "dynamic"`). Answers agree to |dp| < 0.01; the difference is speed (1 question 5 vs
-10 ms).
+or for large calls (`mode: "dynamic"`); it remembers the shapes across restarts, so after the first session your
+presets replay from the sidecar's first idle second. Answers agree to |dp| < 0.01; the difference is speed
+(1 question 5 vs 10 ms). `routing.exec.stallMs`, when present, is time the call waited for a bucket being built.
 
 Overrides, per call: `lane` (`"webgpu:fp16"`, `"cpu:8"`, ...), `policy` (`"prefer-gpu"`, `"prefer-cpu"`, `"min-cpu"`),
 `deadlineMs` (meet it with the least CPU share), `exec: { graph: false }` (cuda lane: skip CUDA-graph replay).

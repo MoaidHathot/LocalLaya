@@ -297,11 +297,39 @@ the rule that every step is measured before the next one is designed.
   threshold is 0.15, the runtime "broken capture" threshold 0.5; `nvidia-smi` for VRAM deltas was replaced by
   `cudaMemGetInfo` (the 5 ms subprocess call sat inside the capture window).
 
+## Phase 12 - "anything to do about the CLI shape?" -> start-up, memory, stalls
+
+The question was about the default preset's shape (`5x160x8`) not being among the eager buckets, so a fresh
+sidecar answered its first calls on the dynamic graph. The answer became a second pass over how buckets come
+to exist (`results/cuda-graph-2026-09-23-summary.md`, "Start-up, memory and stalls"):
+
+- Eager buckets are built *after* the ready line, in idle gaps: the CUDA lane is now the first lane ready
+  (sidecar ready 2.1-2.4 s, first call 2.2-2.5 s; was WebGPU at ~2.6 s / 2.8-3.1 s). The lane warms its
+  dynamic session once before ready so the first real call does not pay the ~180 ms cuDNN/kernel-load cost.
+- The shapes real traffic used are remembered per port (`.laya/cuda-buckets-<port>.json`, hits accumulate) and
+  built first on the next start - preset-agnostic; the built-in defaults only matter for a first start ever.
+- Every stall the build path could inflict on a caller was measured and either removed or accounted for: first
+  build waits a full idle second (the spawn-on-demand call arrives 40 ms after ready); session creation from a
+  pre-optimised file (250 -> 100 ms, `experiments/cuda_session_create_probe.py`); capture in one-run steps
+  (10-60 ms) instead of a 55-230 ms block; static-graph generation in a low-priority subprocess on the E-cores
+  (in-process it made every concurrent call 2-3x slower for 7 s); `stallMs` in the response so the router's
+  EMA never learns a stall (one stalled call had sent half a burst to WebGPU: 1527 ms for 8 calls, now 200-300).
+- Two bugs found by the tests along the way: (1) the router's one-shot GPU load sample at `create()` was never
+  refreshed with `sampleLoad: false` and, having caught the previous test's GPU work, inflated the CUDA lane 2.2x
+  for the whole router life - every burst on `cpu:8`, 1 in ~4 runs; fixed with a 10 s staleness rule
+  (`LOAD_STALE_MS`) and no utilisation ingest when sampling is off, unit-tested; (2) `--stop` left the Python
+  process alive while the builder was mid-generation - the exit now skips the interpreter teardown
+  (`os._exit`; all file writes atomic).
+- Kept connection after this round: 1 / 3 / 10 q = 6.6 / 10.8 / 25.1 ms, default preset 23.3 (was 13-15 for 3 q).
+- Tests: 6 CUDA-lane scenarios (bucket memory round trip added), `test:all` green; docs, skill 1.2, api.md,
+  presets.md, demo README updated to the new numbers.
+
 ## Numbers worth remembering (2026-09-21/23, before the graph optimisation where GPU numbers are given)
 
-- CUDA lane end state (2026-09-23 evening): 1 / 3 / 10 q = 5.0 / 8.6 / 22.9 ms round trip with graph replay,
-  10.8 / 12.4 / 24.5 dynamic; 114 calls/s for 3 q. ORT holds the GIL for a session build (~320 ms); a capture is
-  owned by the thread that ran it; other threads' CUDA calls during a global-mode capture = error 900.
+- CUDA lane end state (2026-09-23 night): 1 / 3 / 10 q = 5.0 / 8.6 / 22.9 ms round trip with graph replay,
+  10.8 / 12.4 / 24.5 dynamic; 114 calls/s for 3 q; kept HTTP connection 6.6 / 10.8 / 25.1 ms; sidecar first call
+  2.2-2.5 s. ORT holds the GIL for a session build (~250 ms, ~100 from a pre-optimised file); a capture is owned
+  by the thread that ran it; other threads' CUDA calls during a global-mode capture = error 900.
 - `webgpu:fp16` 3 q: 19-21 calls/s back-to-back (57-63 questions/s), 10/s at 53-60 ms, 5/s at 61-85 ms,
   1/s at 112-143 ms, 1 per 3 s at 172-257 ms. `cpu:8`: 2.5-3.8 calls/s, saturates above ~3/s.
 - Concurrency never adds throughput; 8 callers each wait ~410 ms at 19 calls/s.
