@@ -170,8 +170,30 @@ export async function pinProcessToPCores({ log = () => {}, pLogical = PCORE_LOGI
  *        the same process is busy, waits for threads that share cores with it (see experiments/interference.mjs).
  * - `affinity`: explicit ORT affinity string (threads-1 entries, 1-based logical processor ids), overrides
  *        the P-core layout from `pinToPCores`.
+ * - `webgpuOptions`: WebGPU EP provider options the 1.30 Node binding forwards (js/node/src/session_options_helper.cc):
+ *        preferredLayout "NCHW"|"NHWC", validationMode "disabled"|"wgpuOnly"|"basic"|"full",
+ *        storageBufferCacheMode / uniformBufferCacheMode / queryResolveBufferCacheMode / defaultBufferCacheMode
+ *        "disabled"|"lazyRelease"|"simple"|"bucket", enableRobustness (boolean), forceCpuNodeNames (string[]).
+ *        Anything else is rejected by the binding ("unrecognized option"), including enableGraphCapture.
+ *        Measured on this machine: see results/webgpu-options-*.md.
  */
-export function buildSessionConfig(ep = "cpu", { threads, deviceId = 0, logSeverityLevel, optLevel, pinToPCores = false, affinity } = {}) {
+export const WEBGPU_OPTION_KEYS = ["preferredLayout", "validationMode", "storageBufferCacheMode", "uniformBufferCacheMode", "queryResolveBufferCacheMode", "defaultBufferCacheMode", "enableRobustness", "forceCpuNodeNames"];
+
+/** Parse "k=v,k2=v2" (bench / experiments CLI) into a webgpuOptions object; booleans and string arrays typed. */
+export function parseWebgpuOptions(spec) {
+  const out = {};
+  for (const part of String(spec ?? "").split(",").map((s) => s.trim()).filter(Boolean)) {
+    const eq = part.indexOf("=");
+    if (eq < 0) throw new Error(`webgpu option "${part}" must be key=value`);
+    const k = part.slice(0, eq).trim();
+    const v = part.slice(eq + 1).trim();
+    if (!WEBGPU_OPTION_KEYS.includes(k)) throw new Error(`unknown WebGPU EP option "${k}" (known: ${WEBGPU_OPTION_KEYS.join(", ")})`);
+    out[k] = k === "enableRobustness" ? /^(1|true|yes|on)$/i.test(v) : k === "forceCpuNodeNames" ? v.split(";").map((s) => s.trim()).filter(Boolean) : v;
+  }
+  return out;
+}
+
+export function buildSessionConfig(ep = "cpu", { threads, deviceId = 0, logSeverityLevel, optLevel, pinToPCores = false, affinity, webgpuOptions } = {}) {
   if (!SUPPORTED_EPS.includes(ep)) throw new Error(`unsupported ep "${ep}" (Windows x64 options: ${SUPPORTED_EPS.join(", ")})`);
   const sessionOptions = {};
   if (logSeverityLevel !== undefined) sessionOptions.logSeverityLevel = logSeverityLevel;
@@ -189,7 +211,9 @@ export function buildSessionConfig(ep = "cpu", { threads, deviceId = 0, logSever
     sessionOptions.enableMemPattern = false;
     sessionOptions.executionMode = "sequential";
   } else {
-    executionProviders = ["webgpu"];
+    const opts = Object.fromEntries(Object.entries(webgpuOptions ?? {}).filter(([, v]) => v !== undefined));
+    for (const k of Object.keys(opts)) if (!WEBGPU_OPTION_KEYS.includes(k)) throw new Error(`unknown WebGPU EP option "${k}" (known: ${WEBGPU_OPTION_KEYS.join(", ")})`);
+    executionProviders = [Object.keys(opts).length ? { name: "webgpu", ...opts } : "webgpu"];
   }
   return { executionProviders, sessionOptions };
 }
@@ -201,6 +225,7 @@ export function buildSessionConfig(ep = "cpu", { threads, deviceId = 0, logSever
  * @param {"cpu"|"dml"|"webgpu"} [opts.ep="cpu"]
  * @param {number} [opts.threads]           intra-op threads (cpu: the compute pool; webgpu/dml: the CPU-side pool)
  * @param {string} [opts.affinity]          explicit ORT affinity string for the intra-op pool (see buildSessionConfig)
+ * @param {object} [opts.webgpuOptions]     WebGPU EP provider options (see buildSessionConfig / WEBGPU_OPTION_KEYS)
  * @param {number} [opts.deviceId=0]        GPU adapter index (dml only)
  * @param {number} [opts.logSeverityLevel]  0 verbose .. 4 fatal (ORT default 2 = warning)
  * @param {string} [opts.modelDir]           load this bundle directory instead of the pinned download (no verification)

@@ -4,6 +4,31 @@ import { chooseLane, LatencyModel, LayaRouter, nBucket, thermalState, DEFAULT_PR
 import { parseDuration, SidecarError } from "../src/sidecar-client.mjs";
 import { bucketKey, fitTemperature, metrics, optionCount, optionLabels, softmax } from "../src/calibration.mjs";
 import { presetFromJson, presetToJson, PRESETS } from "../data/presets.mjs";
+import { buildSessionConfig, parseWebgpuOptions, pCoreAffinity } from "../src/laya-client.mjs";
+
+test("buildSessionConfig: EP selection, thread pinning, WebGPU provider options", () => {
+  // cpu: pinned pool = 16 threads with an affinity string of 15 entries (the caller is the 16th)
+  const cpu = buildSessionConfig("cpu", { pinToPCores: true });
+  assert.deepEqual(cpu.executionProviders, ["cpu"]);
+  assert.equal(cpu.sessionOptions.intraOpNumThreads, 16);
+  assert.equal(cpu.sessionOptions.extra.session.intra_op_thread_affinities.split(";").length, 15);
+  assert.equal(pCoreAffinity(8, 16), "1;3;5;7;9;11;13"); // 7 workers on distinct physical cores, 1-based ids
+  // cpu:8 unpinned: no affinity
+  assert.equal(buildSessionConfig("cpu", { threads: 8 }).sessionOptions.extra, undefined);
+  // webgpu without options stays the plain string form (what the library used before)
+  assert.deepEqual(buildSessionConfig("webgpu").executionProviders, ["webgpu"]);
+  // webgpu with options: object form with the options inline, undefined values dropped
+  const w = buildSessionConfig("webgpu", { webgpuOptions: { validationMode: "disabled", storageBufferCacheMode: "bucket", enableRobustness: false, preferredLayout: undefined } });
+  assert.deepEqual(w.executionProviders, [{ name: "webgpu", validationMode: "disabled", storageBufferCacheMode: "bucket", enableRobustness: false }]);
+  // unknown keys are rejected here rather than by the native binding at session creation
+  assert.throws(() => buildSessionConfig("webgpu", { webgpuOptions: { enableGraphCapture: true } }), /unknown WebGPU EP option "enableGraphCapture"/);
+  assert.throws(() => buildSessionConfig("nope"), /unsupported ep/);
+  // the CLI spec form
+  assert.deepEqual(parseWebgpuOptions("validationMode=disabled, enableRobustness=false,forceCpuNodeNames=a;b"), { validationMode: "disabled", enableRobustness: false, forceCpuNodeNames: ["a", "b"] });
+  assert.deepEqual(parseWebgpuOptions(""), {});
+  assert.throws(() => parseWebgpuOptions("bogus=1"), /unknown WebGPU EP option/);
+  assert.throws(() => parseWebgpuOptions("novalue"), /key=value/);
+});
 
 test("nBucket and thermalState boundaries", () => {
   assert.equal(nBucket(1), "1");
