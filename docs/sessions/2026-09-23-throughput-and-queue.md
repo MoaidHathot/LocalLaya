@@ -229,6 +229,18 @@ interleaved against the previous one and against the fp32 reference for fidelity
 - Tests: router keep-alive (interval, target lane, window, not started by CPU calls); sidecar suite + wrapper
   fast path (JSON shape, inline args, exit codes, delegation, not slower than `ask.mjs`): 14 scenarios.
 
+## Phase 10 - "is the ~9 ms per request or only the first time?"
+
+Measured instead of asserted (`experiments/cuda_graph_probe.py`): batch-1 latency = **6.0 ms + 21.6 us per
+token** (r2 0.992; 1 x 32 tokens 7.0 ms, 1 x 500 17.1 ms), ~1400 CUDA kernel launches per forward pass at
+~4 us each - so the floor is per request, every request, and ~80 % of a 1-question call. First-time costs are
+separate (session 1.0-1.2 s, first inference ~200 ms) and absorbed by the lane warm-up. CUDA Graph capture,
+which would replay those launches as one, **fails on this graph** in onnxruntime-gpu 1.30 (CUDA error 700
+during the capture run, context dead afterwards) - the dynamic-shape plumbing inside the captured stream. So
+"CUDA graph capture" moved from "needs shape buckets" to "needs a static-shape graph per bucket first"
+(STATUS item 7), and coalescing (STATUS item 6, now with a full explanation) attacks the same 6 ms from the
+other side without any ORT feature - but only for concurrent traffic.
+
 ## Numbers worth remembering (2026-09-21/23, before the graph optimisation where GPU numbers are given)
 
 - `webgpu:fp16` 3 q: 19-21 calls/s back-to-back (57-63 questions/s), 10/s at 53-60 ms, 5/s at 61-85 ms,

@@ -355,9 +355,13 @@ per call, so ~7 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1
     reachable where PyPI's file host is not (`npm run cuda:setup`, pinned versions, ~1.6 GiB). `tools/cuda_lane.py`
     holds one CUDA session and answers over stdio; `src/lane.mjs` presents it behind the same handle as the
     worker lanes, with a `RemoteSession` implementing the two methods `@receptron/laya` calls, so nothing of
-    the sequence logic is duplicated. The CUDA EP is launch-bound at ~9-12 ms for this graph and almost flat in
-    batch size: 8.9 / 12.1 / 24.1 ms for 1 / 3 / 10 questions vs 21 / 32 / 83 on WebGPU (stdio round trip +
-    tokenising 0.7-1.8 ms of that; 2 CPU-side threads on the P-cores - the unpinned default measured 20 ms).
+    the sequence logic is duplicated. The CUDA EP is launch-bound: every call costs **6.0 ms + 21.6 us per
+    token** (`experiments/cuda_graph_probe.py`) because ORT issues ~1400 CUDA kernels per forward pass at
+    ~4 us each - paid on every call, not only the first - so it is almost flat in batch size: 8.9 / 12.1 /
+    24.1 ms for 1 / 3 / 10 questions vs 21 / 32 / 83 on WebGPU (stdio round trip + tokenising 0.7-1.8 ms of
+    that; 2 CPU-side threads on the P-cores - the unpinned default measured 20 ms). CUDA Graph capture, the
+    standard fix for the floor, fails on this graph in ORT 1.30 (illegal memory access during capture); it
+    needs a static-shape graph per bucket first (`docs/STATUS.md`).
     Paired ratio to fp32 (`experiments/ab.mjs`): **0.131 [0.130, 0.132]** vs 0.429 for WebGPU on PoC +
     smart-home (3.3x), 0.140 vs 0.423 on dev-request (3.0x); arg-max agreement with fp32 134/134 and 119/120,
     195/195 with the WebGPU lane over the full eval set (max |dp| 0.035), same accuracy. Throughput 66 calls/s

@@ -54,10 +54,28 @@ first, at ~2.4 s after spawn).
 RSS: Python process ~1.0 GiB; VRAM: +~830 MiB for the fp16 weights + ~400 MiB CUDA context. The three default
 lanes together hold ~2 GiB VRAM (freed on idle exit). Disk: the venv grows by ~1.6 GiB of CUDA / cuDNN wheels.
 
-## Not done / next
+## Where the per-call time goes (`experiments/cuda_graph_probe.py`, same session config as the lane)
 
-- CUDA Graph capture (`--cuda-graph` in `tools/cuda_lane.py`, `enable_cuda_graph`) would remove most of the
-  ~9 ms launch floor but needs fixed input shapes: pad `[n, L]` to shape buckets and keep one capture per
-  bucket. Not started.
-- The same lane mechanism would carry a TensorRT EP session (`onnxruntime-gpu` ships it) - engine build time
-  per shape makes it unattractive for variable-length inputs without the same bucketing.
+| shape | `session.run` p50 |
+|---|---|
+| 1 x 32 tokens | 7.0 ms |
+| 1 x 85 | 7.7 |
+| 1 x 160 | 9.5 |
+| 1 x 320 | 12.3 |
+| 1 x 500 | 17.1 |
+| 3 x 85 | 10.8 |
+| 10 x 95 | 23.5 |
+| 10 x 200 | 47.6 |
+
+Batch-1 fit: **6.0 ms + 21.6 us per token** (r2 0.992). The 6 ms is paid on **every** call: ORT issues ~1400
+CUDA kernels per forward pass (profiler: 1554 kernel entries per run, 1391 on the CUDA EP, 163 CPU shape
+plumbing / memcpy), ~4 us each, with the GPU mostly idle in between. It is not a first-call cost - those are
+separate and one-time: session creation 1.0-1.2 s, first inference ~200 ms (cuDNN heuristics, arena), and
+they are absorbed by the lane's probe and warm-up. This is also why extra rows are almost free (coalescing).
+
+CUDA Graph capture (`enable_cuda_graph`, `tools/cuda_lane.py --cuda-graph`) would replay the launch sequence
+with one call and leave ~2-3 ms, but **on this graph it fails in onnxruntime-gpu 1.30.0**: "CUDA failure 700:
+an illegal memory access was encountered" in `cuda_graph.cc` during the capture run, after which the CUDA
+context is unusable. Likely the dynamic-shape plumbing and host<->device copies inside the captured stream. It
+needs a static-shape graph per shape bucket first - see `docs/STATUS.md`, CUDA lane next steps. The same
+prerequisite applies to a TensorRT EP session.

@@ -29,7 +29,7 @@ ap.add_argument("--model-dir", required=True)
 ap.add_argument("--device", type=int, default=0)
 ap.add_argument("--threads", type=int, default=2, help="intra-op threads for the few CPU-side nodes")
 ap.add_argument("--affinity", default="", help="logical CPUs for this process, e.g. 0-15 (Windows hybrid CPUs: the P-cores)")
-ap.add_argument("--cuda-graph", action="store_true", help="enable_cuda_graph (needs fixed input shapes; off by default)")
+ap.add_argument("--cuda-graph", action="store_true", help="enable_cuda_graph. Currently FAILS on this graph (CUDA error 700 during capture, onnxruntime-gpu 1.30): needs a static-shape graph per bucket first - see docs/STATUS.md")
 ap.add_argument("--log-level", type=int, default=3)
 args = ap.parse_args()
 

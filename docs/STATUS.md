@@ -52,7 +52,8 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
   concurrency, fp16 fidelity; throughput matrix (`experiments/throughput.mjs`: lanes x closed-loop concurrency
   x open-loop arrival rate, policy auto vs prefer-gpu, cross-lane interference), interference mechanism
   (`experiments/interference.mjs`: same thread vs child process), worker-thread lanes
-  (`experiments/worker-lanes.mjs`). Results in `results/*-summary.md` and README.
+  (`experiments/worker-lanes.mjs`), CUDA per-call floor + graph-capture probe (`experiments/cuda_graph_probe.py`,
+  Python). Results in `results/*-summary.md` and README.
 - **Router** (`src/ep-router.mjs`, `router-demo.mjs`): lanes `webgpu[:fp16]`, `cpu[:N][:nopin]`, `cpu:auto`,
   `dml` (default `webgpu,cpu:8`); probe with real inference; EMA latency model normalised by estimated work;
   contention inflation; one FIFO queue for all lanes with `wait + own` predictions, the GPU state expected at
@@ -140,22 +141,52 @@ skill wrapper fast path, call-path decision guide (README "Choosing how to call 
 5. **Router**: the CPU lane is only chosen for sporadic small calls on a cold GPU and as a fallback - decide
    whether loading it is worth 1.6 GiB RAM on GPU machines; token-length feature is an estimate
    (`estimateWork`); the start-up EMA of a GPU lane warmed while CPU calls run is ~1.5x pessimistic for its
-   first few calls (self-corrects). The `cuda` priors' warm/cold rows are assumed from WebGPU's clock behaviour,
-   not measured (`experiments/sporadic.mjs` has no cuda mode yet).
-6. **Coalescing concurrent requests into one forward pass** (measured upper bound, not built): on the CUDA lane
-   8 sequential 1-question calls take 75 ms, the same 8 rows as one batch 21 ms (3.6x). Needs `systemMany` on
-   the lane handle (collate rows of several requests, one `session.run`, split, per-item temperatures) and
-   router support (gather the queued calls bound to the same lane at the front of the FIFO). The vendored
-   library's `systemOne` is one state per call, so collate/split would be reimplemented against its sequence
-   builder (`dist/sequence.js`, not exported - copy or deep import). Only pays off with several concurrent
-   callers sending small calls; decide from real traffic.
-7. **CUDA lane, next steps**: CUDA Graph capture (`enable_cuda_graph`, `tools/cuda_lane.py --cuda-graph`) would
-   remove most of the ~9 ms launch floor but needs fixed input shapes -> pad `[n, L]` to shape buckets, one
-   capture per bucket. A TensorRT EP session would ride the same lane mechanism but needs the same bucketing.
-   For machines with a CUDA 12 driver: `node tools/setup-cuda-lane.mjs --cuda 12` (PyPI wheels; pinned but
-   untested here, PyPI's file host is blocked on this network). The remaining sporadic slow mode (4/20 calls
-   ~200 ms with keep-alive) is the GPU's power management; user-side levers are the NVIDIA "prefer maximum
-   performance" setting or a locked clock (`nvidia-smi -lgc`, admin) - not something this project should set.
+   first few calls (self-corrects). The `cuda` cold priors are the measured medians of a bimodal distribution
+   (`experiments/sporadic.mjs --ep cuda --fp16`); the keep-alive makes them pessimistic in practice.
+6. **Coalescing concurrent requests into one forward pass** (measured upper bound, not built).
+   *What:* when a call reaches the front of the FIFO, take every other call already queued for the same lane,
+   run all their question rows as **one** `session.run`, split the logits back per request.
+   *Why it works:* a CUDA-lane call costs **6.0 ms + 21.6 us per token** whatever the number of rows
+   (`experiments/cuda_graph_probe.py`): the 6 ms is ~1400 kernel launches, paid per call, not per row. Eight
+   1-question requests served one by one = 8 x 6 ms of launches; as one batch = 1 x 6 ms. Measured: 8 x (1 q)
+   sequential **75 ms**, the same 8 rows in one pass **21 ms** (3.6x). The gain shrinks with bigger calls
+   (a 10-question call is already 75 % arithmetic) and is zero for a single caller.
+   *Design:* `systemMany(items)` on the lane handle (`src/lane.mjs`) that collates the rows of several
+   `(state, questions, temps)` items into one `[n, L]` / `[n, K]` batch - padded to the longest sequence and
+   widest option set, as `systemOne` already does within one call - runs it, and splits the answers; per-item
+   temperature tables are applied per row (softmax is per row, so per-request calibration overrides stay
+   correct); `usage.input_tokens` per item; `routing.coalesced = n`. The vendored library's `systemOne` is one
+   state per call and its sequence builder (`dist/sequence.js`) is not exported, so the collate / split is
+   re-implemented against a copy (or deep import) of it - ~150 lines, plus a fidelity test against
+   `systemOne` per item. Router: in `_enqueue`, when a call starts, gather the `inflight` entries that are queued
+   (not started) and re-bind to the same lane, up to a cap (rows x tokens <= e.g. 64 x 512 so a long state
+   does not pad everyone). No caller is delayed: only calls that were already waiting join, and each of them
+   would otherwise run after the current one.
+   *Limits:* different lanes cannot coalesce; a request with a `lane` override or `deadlineMs` runs alone;
+   mixed long / short states waste padding (cap); the coalesced call's `ms` is shared, so `routing.ms`
+   becomes "batch ms" and the EMA needs the per-row share (batch ms / n, work-normalised).
+   *When it pays:* several concurrent callers sending small calls (agents in parallel, a service fan-out).
+   The sidecar's 8-caller burst today: 8 x 12 ms = ~100 ms end to end for the last caller; coalesced ~25 ms.
+   *Decide from real traffic:* `routing.queueMs > 0` on a meaningful share of calls is the signal.
+7. **CUDA lane: the per-call floor, and why CUDA Graph capture is not a quick win.** Measured
+   (`experiments/cuda_graph_probe.py`): every `session.run` costs **6.0 ms + 21.6 us/token** on this graph -
+   1 x 32 tokens 7.0 ms, 1 x 500 tokens 17.1 ms - because ORT issues ~1400 CUDA kernels per forward pass
+   (one per graph node) at ~4 us each; the GPU is mostly idle between them. This is paid on *every* call
+   (the one-time costs are separate: session 1.0-1.2 s, first inference ~200 ms cuDNN/arena, absorbed by the
+   lane warm-up). CUDA Graph capture (`enable_cuda_graph`, replay the recorded launches with one call) is
+   the standard fix and would leave ~2-3 ms per call - but on this graph as exported it **fails in ORT 1.30
+   with "CUDA failure 700: illegal memory access" during the capture run** and kills the CUDA context. The
+   dynamic-shape plumbing (Shape -> Slice -> Concat on the CPU, host<->device copies, data-dependent ops)
+   inside the captured stream is the likely reason. Prerequisite work: a static-shape variant of the graph
+   per shape bucket (fixed `[n, L]`, shape plumbing constant-folded away by `tools/optimize_graph.py`), one
+   session + capture per bucket in `tools/cuda_lane.py`, padding requests to the bucket. Same prerequisite
+   for a TensorRT EP session (fused engines, far fewer kernels). Estimate 1-2 days incl. fidelity checks;
+   the payoff is ~2x on small calls for every caller, so it ranks above coalescing unless traffic is
+   concurrent. For machines with a CUDA 12 driver: `node tools/setup-cuda-lane.mjs --cuda 12` (PyPI wheels;
+   pinned but untested here, PyPI's file host is blocked on this network). The remaining sporadic slow mode
+   (4/20 calls ~200 ms with keep-alive) is the GPU's power management; user-side levers are the NVIDIA
+   "prefer maximum performance" setting or a locked clock (`nvidia-smi -lgc`, admin) - not something this
+   project should set.
 8. **DirectML**: works on the optimised graph (`allowzero` fix) and is the fastest EP for a single question
    (18-19 ms) but 6-10x slower than WebGPU for batch > 1 on a fixed shape - cause unknown (not shape
    recompilation). Not a lane. Worth a look only if single-question traffic dominates somewhere.
