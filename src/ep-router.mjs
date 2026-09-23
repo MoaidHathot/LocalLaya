@@ -36,6 +36,8 @@ export const nBucket = (n) => (n <= 1 ? "1" : n <= 3 ? "2-3" : n <= 6 ? "4-6" : 
 
 /** GPU thermal state from the time since this process last finished GPU work. */
 export const thermalState = (msSinceGpuWork) => (msSinceGpuWork < 400 ? "hot" : msSinceGpuWork < 2000 ? "warm" : "cold");
+/** Interval of the GPU keep-alive calls (see LayaRouter#_scheduleKeepAlive): 500 ms keeps the CUDA lane at ~50 ms cold-start, 1000 ms does not. */
+export const KEEP_ALIVE_INTERVAL_MS = 500;
 
 /**
  * Priors (ms per systemOne call). Measured values from this repo's results for 1 / 2-3 / 7-10; the 4-6 and
@@ -60,9 +62,10 @@ export const DEFAULT_PRIORS = {
   },
   // DirectML runs the optimised graph (allowzero=0) but is 6-10x slower than WebGPU for batch > 1 (measured 2026-09-23)
   dml: { share: 0.03, ms: { hot: { "1": 19, "2-3": 217, "4-6": 240, "7-10": 264, "11+": 330 }, warm: { "1": 50, "2-3": 250, "4-6": 280, "7-10": 300, "11+": 380 }, cold: { "1": 110, "2-3": 320, "4-6": 350, "7-10": 380, "11+": 470 } } },
-  // CUDA EP in a Python process (tools/cuda_lane.py): launch-bound at ~20 ms, almost flat in batch size (measured 2026-09-23,
-  // in-process session; the stdio round trip adds ~1 ms); cold-clock penalty assumed like WebGPU
-  cuda: { share: 0.03, ms: { hot: { "1": 22, "2-3": 23, "4-6": 25, "7-10": 28, "11+": 36 }, warm: { "1": 50, "2-3": 55, "4-6": 60, "7-10": 70, "11+": 90 }, cold: { "1": 105, "2-3": 115, "4-6": 125, "7-10": 140, "11+": 170 } } },
+  // CUDA EP in a Python process (tools/cuda_lane.py): launch-bound, almost flat in batch size (hot 9 / 12 / 24 ms for
+  // 1 / 3 / 10 q). Cold is bimodal without keep-alive (experiments/sporadic.mjs --ep cuda: 3 s gap 50-300 ms, p50 130-215)
+  // and ~45-55 ms with the keep-alive on; the priors below are the no-keep-alive medians, the EMA learns the rest.
+  cuda: { share: 0.03, ms: { hot: { "1": 10, "2-3": 13, "4-6": 18, "7-10": 25, "11+": 34 }, warm: { "1": 35, "2-3": 45, "4-6": 55, "7-10": 65, "11+": 85 }, cold: { "1": 150, "2-3": 170, "4-6": 190, "7-10": 210, "11+": 250 } } },
 };
 
 export const isGpuLane = (lane) => lane.startsWith("webgpu") || lane.startsWith("dml") || lane.startsWith("cuda");
@@ -208,7 +211,7 @@ export class LayaRouter {
    * @param {number} [o.explore=0.05]                exploration probability (auto policy, idle only)
    * @param {string|object} [o.calibration]          applied to every lane (see loadLaya)
    * @param {boolean} [o.sampleLoad=true]            background CPU / nvidia-smi sampling for contention
-   * @param {number} [o.gpuKeepAliveMs=0]            after a GPU call keep the GPU clocks up for this long with tiny dummy calls
+   * @param {number} [o.gpuKeepAliveMs=0]            after a GPU call keep the GPU awake for this long with a tiny call every 500 ms (serve.mjs: 30 s)
    * @param {number} [o.minGpuFreeMiB=2200]          skip GPU lanes when less VRAM than this is free
    * @param {boolean} [o.pinProcess=true]            Windows hybrid CPUs: restrict the process to the P-cores (see pinProcessToPCores)
    * @param {boolean} [o.workers=true]               run each lane's session in a worker thread (lane.mjs); false = in this thread
@@ -533,7 +536,7 @@ export class LayaRouter {
         const routing = { lane: L.lane, ms: run.ms, queueMs: run.queueMs, n, work, gpuState: run.stateAtStart, predictedMs: choice.predictedMs, ownMs: choice.ownMs, waitMs: choice.waitMs ?? 0, pendingAtChoice: choice.pending ?? 0, reason: choice.reason, explored: !!choice.explored, ...(L.lane !== provisionalLane ? { provisionalLane } : {}), alternatives: alternatives.filter((c) => c.lane !== L.lane).map((c) => ({ lane: c.lane, predictedMs: c.predictedMs })), load: { cpuOthers: this.load.cpuOthers, gpuOthersUtil: this.load.gpuOthersUtil } };
         this.history.push(routing);
         if (this.history.length > 1000) this.history.shift();
-        if (gpu && this.opts.gpuKeepAliveMs > 0) this._scheduleKeepAlive();
+        if (gpu && this.opts.gpuKeepAliveMs > 0) this._scheduleKeepAlive(L);
         return { ...run.result, routing };
       } catch (e) {
         L = (e?.lane && this.lanes.get(e.lane)) || L; // the lane the call actually ran on (rebind may have moved it)
@@ -547,27 +550,34 @@ export class LayaRouter {
     throw new Error(`all lanes failed for this call (tried ${tried.join(", ")})`);
   }
 
-  /** Keep the GPU clocks up after real GPU work by issuing tiny calls until gpuKeepAliveMs has elapsed. */
-  _scheduleKeepAlive() {
+  /**
+   * Keep the GPU awake after real GPU work by issuing a tiny call every KEEP_ALIVE_INTERVAL_MS on the GPU lane
+   * that served last, until gpuKeepAliveMs have passed since the last real call. Measured 2026-09-23 on the CUDA
+   * lane (results/sidecar-modes-2026-09-23-summary.md): a 3-question call after a 3 s pause takes ~200 ms cold
+   * (bimodal 50-300) and ~45-55 ms with keep-alive, for 1-4 W of GPU power while the keep-alive runs; a 1 s
+   * interval no longer helps. On the WebGPU lane the same trick did not help (2026-09-21).
+   */
+  _scheduleKeepAlive(lane) {
     this._keepAliveUntil = performance.now() + this.opts.gpuKeepAliveMs;
+    if (lane) this._keepAliveLane = lane;
     if (this._keepAliveTimer) return;
-    const gpuLane = [...this.lanes.values()].find((L) => isGpuLane(L.lane) && L.healthy);
-    if (!gpuLane) return;
     const tick = async () => {
       this._keepAliveTimer = null;
       if (performance.now() >= this._keepAliveUntil || this.closed) return;
+      const L = this._keepAliveLane && this._keepAliveLane.healthy && !this._keepAliveLane.dead ? this._keepAliveLane : [...this.lanes.values()].find((x) => isGpuLane(x.lane) && x.healthy && !x.dead);
+      if (!L) return;
       if (!this.inflight.length) {
         try {
-          await this._enqueue(gpuLane, 30, () => gpuLane.session.systemOne("x", { k: { type: "noul", instructions: "keep-alive" } }));
+          await this._enqueue(L, 30, () => L.session.systemOne("x", { k: { type: "noul", instructions: "keep-alive" } }));
           this.keepAliveCalls = (this.keepAliveCalls ?? 0) + 1;
         } catch {
           /* ignore */
         }
       }
-      this._keepAliveTimer = setTimeout(tick, 250);
+      this._keepAliveTimer = setTimeout(tick, KEEP_ALIVE_INTERVAL_MS);
       this._keepAliveTimer.unref();
     };
-    this._keepAliveTimer = setTimeout(tick, 250);
+    this._keepAliveTimer = setTimeout(tick, KEEP_ALIVE_INTERVAL_MS);
     this._keepAliveTimer.unref();
   }
 

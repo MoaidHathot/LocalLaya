@@ -11,6 +11,8 @@
  *   node serve.mjs --calibration calibration/smart-home-v3.json   # one table for every preset (default: per preset,
  *                                                                 # calibration/<preset>.json when present)
  *   node serve.mjs --cors                  # allow browser pages from other origins to call the API (off by default)
+ *   node serve.mjs --gpu-keepalive 0       # no GPU keep-alive (default 30s: after each call a tiny GPU call every 500 ms keeps the
+ *                                          # CUDA lane at ~50 ms instead of ~200 ms for the next sporadic call; costs 1-4 W meanwhile)
  *   node serve.mjs --in-process            # lanes in this thread instead of worker threads (blocks the server during inference)
  *
  * Lifecycle: the port is bound BEFORE the model loads, so the port doubles as the mutex between racing
@@ -23,7 +25,7 @@
  * Endpoints (all JSON):
  *   GET  /                 browser UI
  *   GET  /health           { service: "laya", status: loading|ready|failed|stopping, pid, port, lanes, lanesLoading,
- *                            uptimeS, idleS, idleRemainingS, maxAgeS, inFlight, sidecar }
+ *                            uptimeS, idleS, idleRemainingS, maxAgeS, gpuKeepAliveS, inFlight, sidecar }
  *   GET  /presets          { name: { description, source, state, questions } }
  *   GET  /stats            router statistics (latency estimates, load, per-lane calls / pending)
  *   POST /decide           body: { text?: string, state?: any, preset?: string, questions?: {...}, lane?: string, deadlineMs?: number,
@@ -59,12 +61,14 @@ const { values: args } = parseArgs({
     cors: { type: "boolean", default: false },
     idle: { type: "string" },
     "max-age": { type: "string", default: process.env.LAYA_MAX_AGE ?? "0" },
+    "gpu-keepalive": { type: "string", default: process.env.LAYA_GPU_KEEPALIVE ?? "30s" },
     sidecar: { type: "boolean", default: false },
     "in-process": { type: "boolean", default: false },
   },
 });
 const idleMs = parseDuration(args.idle ?? (args.sidecar ? process.env.LAYA_IDLE ?? "5m" : "0"));
 const maxAgeMs = parseDuration(args["max-age"]);
+const gpuKeepAliveMs = parseDuration(args["gpu-keepalive"]);
 const SAMPLING_PAUSE_MS = 10_000;
 const log = (m) => console.log(`[serve${args.sidecar ? ":sidecar" : ""} ${process.pid}] ${new Date().toISOString().slice(11, 19)} ${m}`);
 process.title = args.sidecar ? "laya-sidecar" : "laya-serve";
@@ -244,6 +248,7 @@ const health = () => ({
   idleS: idleMs ? Math.round(idleMs / 1000) : 0,
   idleRemainingS: idleRemainingS(),
   maxAgeS: maxAgeMs ? Math.round(maxAgeMs / 1000) : 0,
+  gpuKeepAliveS: gpuKeepAliveMs ? Math.round(gpuKeepAliveMs / 1000) : 0,
   inFlight,
   sampling: !!router?.sampling,
 });
@@ -321,6 +326,7 @@ server.listen(Number(args.port), args.host, async () => {
     router = await LayaRouter.create({
       lanes: CONFIGURED_LANES,
       workers: !args["in-process"],
+      gpuKeepAliveMs,
       warmup: { state: warmupState, sizes: [3, 5] },
       waitFor: "first",
       onLaneReady: (lane, info) => {

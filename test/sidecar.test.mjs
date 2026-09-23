@@ -7,8 +7,8 @@
  * Scenarios: spawn on first use / fast second call / two launchers racing -> exactly one process /
  * idle exit frees the process and VRAM / hard kill recovery / --stop / --local / REPL over the sidecar with
  * keep-alive / 8 parallel calls on one queue with zero errors / preset + calibration edits picked up live /
- * foreign service on the port detected / ready as soon as the first lane serves, forced call on a lane still
- * loading waits and succeeds / --max-age recycling.
+ * skill wrapper fast path / foreign service on the port detected / ready as soon as the first lane serves,
+ * forced call on a lane still loading waits and succeeds / --max-age recycling.
  */
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -189,6 +189,46 @@ test("REPL over the sidecar: commands work, keep-alive keeps it warm", async () 
   assert.match(out.stdout, /via sidecar/);
   assert.match(out.stdout, /cpu:8 .* via sidecar/);
   assert.match(out.stderr, /sidecar :8797 pid/);
+});
+
+test("skill wrapper: fast path answers over HTTP in one Node process, inline JSON args, ask.mjs exit codes, delegation", async () => {
+  const wrapper = (args, opts = {}) => run(node, ["skills/laya-decisions/scripts/laya.mjs", "--port", String(PORT), ...args], { cwd: PROJECT_ROOT, timeout: 120_000, ...opts });
+  // one-shot with a preset: same JSON shape as ask.mjs --json, answered by the sidecar
+  const t0 = Date.now();
+  const a = await wrapper(["--preset", "triage", "Charged twice. Refund today or I cancel."]);
+  const wrapperMs = Date.now() - t0;
+  const r = JSON.parse(a.stdout);
+  assert.equal(r.backend, "remote");
+  assert.equal(r.answers.department.choice, "billing");
+  assert.deepEqual(Object.keys(r).sort(), ["answers", "backend", "routing", "state", "usage"]);
+  assert.deepEqual(r.state, { message: "Charged twice. Refund today or I cancel." });
+  assert.doesNotMatch(a.stderr, /starting one/, "the running sidecar was reused");
+  // inline JSON for --state and --questions (the SKILL.md example)
+  const b = await wrapper(["--state", '{"email":"Meeting moved to 3pm, can you make it?"}', "--questions", '{"needs_reply":{"type":"noul","instructions":"Does this message require a reply from the recipient?"}}']);
+  const rb = JSON.parse(b.stdout);
+  assert.deepEqual(Object.keys(rb.answers), ["needs_reply"]);
+  assert.equal(rb.answers.needs_reply.type, "noul");
+  assert.deepEqual(rb.state, { email: "Meeting moved to 3pm, can you make it?" });
+  // ask.mjs exit codes: 2 for an unknown preset / invalid questions, message on stderr, nothing on stdout
+  for (const args of [["--preset", "nope", "x"], ["--questions", '{"q":{"type":"bogus"}}', "x"]]) {
+    const e = await wrapper(args).then(() => null, (err) => err);
+    assert.ok(e, `expected a non-zero exit for ${args.join(" ")}`);
+    assert.equal(e.code, 2);
+    assert.equal(e.stdout, "");
+    assert.match(e.stderr, /^error: /);
+  }
+  // lifecycle and --pretty are delegated to ask.mjs
+  const st = await wrapper(["--status"]);
+  assert.match(st.stdout, /sidecar ready on 127\.0\.0\.1:8797/);
+  const p = await wrapper(["--pretty", "--no-color", "Turn on the TV"]);
+  assert.match(p.stdout, /intent\s+control_device/);
+  assert.throws(() => JSON.parse(p.stdout), "pretty output is not JSON");
+  // the fast path is not slower than going through ask.mjs (one Node process instead of two)
+  const t1 = Date.now();
+  await ask(["--sidecar", "--json", "--preset", "triage", "Charged twice. Refund today or I cancel."]);
+  const askMs = Date.now() - t1;
+  console.log(`      wrapper fast path ${wrapperMs} ms vs ask.mjs --sidecar ${askMs} ms (inference ~${r.routing.ms.toFixed(0)} ms of that)`);
+  assert.ok(wrapperMs < askMs * 1.5 + 100, `wrapper ${wrapperMs} ms should not be slower than ask.mjs ${askMs} ms`);
 });
 
 test("hard kill: the next call notices and respawns", async () => {

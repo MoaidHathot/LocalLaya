@@ -200,6 +200,35 @@ Day total for the GPU lane (3 questions, 8 parallel callers): 2576 ms -> 1381 (q
 202 ms (CUDA); single call 47 ms -> 12 ms; throughput 19-21 -> 66-86 calls/s. Every step measured
 interleaved against the previous one and against the fp32 reference for fidelity.
 
+## Phase 9 - "update the skills; what is the most optimised sidecar setup, and when to call what?"
+
+- Measured the call paths first (results/sidecar-modes-2026-09-23-summary.md): persistent HTTP client 13-15 ms;
+  PowerShell `Invoke-RestMethod` 31; `ask.mjs --sidecar` 87-127; the skill wrapper spawned a *second* Node
+  process: 130-165 ms for a 12 ms inference. Bare Node start-up is 37 ms, so a shell call cannot go below ~70.
+- Wrapper fast path: `scripts/laya.mjs` now imports the project's `sidecar-client.mjs` and answers one-shot calls
+  itself (80-90 ms); lifecycle / `--local` / `--pretty` / REPL / sidecar failures are delegated to `ask.mjs`.
+  Found on the way: SKILL.md's inline `--questions '{...}'` example never worked (`ask.mjs` read it as a file
+  path) - fixed in `ask.mjs` (inline JSON or file for `--state` and `--questions`) and covered by a test.
+- Sporadic traffic per lane (`sporadic.mjs` gained `--ep cuda` via `openLane` and a `--router` mode): the CUDA
+  lane is **bimodal** after a pause (3 q after 3 s: ~50 or ~200-300 ms, p50 68-217), worse in its slow mode than
+  WebGPU (156) and the CPU (~270 flat); for a cold single question CPU (~105) / WebGPU (~101) beat CUDA's median.
+  `DEFAULT_PRIORS.cuda` cold rows were assumed too optimistic (105/115) -> set to the measured medians.
+- GPU keep-alive: a first router-level comparison (n = 8) said 217 -> 61 ms; a first sidecar comparison (n = 6)
+  said no effect; `/stats` proved the keep-alive was running. Settled with n = 20 per arm, arms alternated,
+  through the sidecar: **p50 174 -> 46 ms, slow calls 12/20 -> 4/20**. Power 26 -> 27-30 W while active
+  (SM clock 345 -> 555-690 MHz; the driver stays awake, the clocks stay low). Interval 500 ms (250: max 135,
+  500: max 60, 1000: no effect). Default in `serve.mjs`: `--gpu-keepalive 30s` (`LAYA_GPU_KEEPALIVE`), REPL
+  the same; the keep-alive targets the GPU lane that served last (was: first GPU lane in map order).
+  Lesson written down: with a bimodal distribution, n = 6-8 comparisons point wherever the coin lands.
+- Coalescing bound measured (not built): 8 x 1 q sequential 75 ms vs 8 rows in one pass 21 ms on CUDA (3.6x).
+  Recorded as open item 6 with the design cost; depends on the traffic having concurrent small callers.
+- Skill updated (SKILL.md 1.1, api.md, presets.md): call-path costs, batching, lanes incl. cuda, keep-alive,
+  the corrected inline-JSON example (and a note that the ad-hoc question in it is not usable as written -
+  0.03 for a text that needs a reply), an HTTP example for many calls. README: "Choosing how to call it"
+  decision table; STATUS: decisions, "How to call it", caveat on the bimodal cold CUDA lane.
+- Tests: router keep-alive (interval, target lane, window, not started by CPU calls); sidecar suite + wrapper
+  fast path (JSON shape, inline args, exit codes, delegation, not slower than `ask.mjs`): 14 scenarios.
+
 ## Numbers worth remembering (2026-09-21/23, before the graph optimisation where GPU numbers are given)
 
 - `webgpu:fp16` 3 q: 19-21 calls/s back-to-back (57-63 questions/s), 10/s at 53-60 ms, 5/s at 61-85 ms,

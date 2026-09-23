@@ -107,6 +107,10 @@ node ask.mjs --status | --stop | --start [--idle 10m] [--max-age 12h] [--lanes .
   It exits by itself after 5 minutes without requests (`--idle`, `LAYA_IDLE`; `0` = never), freeing RAM and
   VRAM; the next call starts a fresh one. An open REPL (`node ask.mjs --sidecar`) pings it so it stays warm.
   `--max-age 12h` (`LAYA_MAX_AGE`) additionally recycles it once it is that old (in-flight calls finish first).
+- GPU keep-alive (`--gpu-keepalive`, `LAYA_GPU_KEEPALIVE`, default 30 s): for that long after each call a tiny
+  GPU call every 500 ms keeps the GPU awake, because a call that arrives a few seconds after the previous one
+  otherwise pays the GPU's idle-clock ramp (CUDA lane, 3 questions every 3 s, n = 20 per arm: median 174 -> 46 ms,
+  slow calls > 120 ms 12/20 -> 4/20) for 1-4 W meanwhile; off when the sidecar is idle. `0` disables it.
 - The port is the mutex: the sidecar binds `127.0.0.1:8787` (`--port`, `LAYA_PORT`) *before* loading, so
   launchers racing at the same instant produce exactly one instance (the loser exits with code 3 without
   loading); callers arriving during the load wait for `status: ready`. Anything else on the port is
@@ -139,13 +143,36 @@ runs the 13 lifecycle scenarios (~1 min; uses port 8797), `npm run test:router` 
 
 `skills/laya-decisions/` is an [Agent Skill](https://agentskills.io): `SKILL.md` tells an agent what Laya
 decides, when (and when not) to use it, how to call it and how to read probabilities;
-`references/api.md` and `references/presets.md` hold the details; `scripts/laya.mjs` is a wrapper that finds
-this project (via `LAYA_DIR`, or its own location inside the repo) and runs `ask.mjs --sidecar --json ...`.
+`references/api.md` and `references/presets.md` hold the details; `scripts/laya.mjs` is the entry point: it
+finds this project (via `LAYA_DIR`, or its own location inside the repo) and answers one-shot calls itself over
+HTTP to the sidecar (one Node process, 80-90 ms per call of which ~12 ms is the inference); lifecycle flags,
+`--local`, `--pretty`, the REPL and any sidecar failure are delegated to `ask.mjs`.
 
 ```powershell
 node skills/laya-decisions/scripts/laya.mjs --preset dev-request "is this valid json {bla: 1}"
 # from anywhere: $env:LAYA_DIR = "W:\Github\LocalLaya"; node <skills-dir>\laya-decisions\scripts\laya.mjs ...
 ```
+
+### Choosing how to call it
+
+Which *lane* runs a call is the router's job (`routing.lane` / `routing.reason`); with the CUDA lane present it
+is CUDA for everything except a cold single question, where CPU and WebGPU tie with it. What the caller does
+decide is the call path and the call shape (`results/sidecar-modes-2026-09-23-summary.md`):
+
+| situation | do this | per decision |
+|---|---|---|
+| a service or agent runtime making many decisions | `node ask.mjs --start` once, then `POST /decide` from a kept HTTP connection | **13-15 ms** |
+| a shell step / agent tool call now and then | `node scripts/laya.mjs ...` (or `ask.mjs --sidecar`) | 80-90 ms (Node start-up dominates) |
+| several questions about one text | one call with all the questions | 3 q 12 ms, 10 q 24 ms - not 3 / 10 calls |
+| calls seconds apart (interactive) | keep the default `--gpu-keepalive 30s`; lengthen it if the pauses are longer | ~46 ms median instead of ~174 |
+| calls minutes apart | let it idle-exit (`--idle 5m`, reload 2.5 s) or hold it (`--idle 0 --max-age 24h`, ~3.3 GiB RAM + 2 GiB VRAM) | - |
+| one isolated run, no background process | `node ask.mjs --local` | 2.2-2.5 s |
+| RAM over fallback | `LAYA_LANES=cuda:fp16,webgpu:fp16` drops the 1.6 GiB CPU lane | same speed on a GPU machine |
+| a hard latency budget | `deadlineMs` in the request | `routing.reason` says what was chosen and why |
+
+Not built, measured as an upper bound: coalescing several concurrent small requests into one forward pass
+would serve 8 concurrent single-question callers in 21 ms instead of 75 (3.6x) on the CUDA lane - relevant
+only for that traffic pattern (see `docs/STATUS.md`, open items).
 ## Your own domain (custom presets)
 
 The output you get is always *the preset's questions answered about your text*. Asking the smart-home preset

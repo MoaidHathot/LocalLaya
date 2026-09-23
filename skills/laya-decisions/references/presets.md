@@ -86,8 +86,27 @@ better wording or fine-tuning, not temperature.
 
 ## Iteration loop
 
-1. Write the preset; try a dozen inputs with `node ask.mjs --preset <name> "..."` (the sidecar makes this cheap).
+1. Write the preset; try a dozen inputs with `node ask.mjs --sidecar --preset <name> "..."` (the sidecar makes
+   this cheap: ~90 ms per try).
 2. Label 30-60 real inputs; run `calibrate.mjs`; read the verdicts and the confident mistakes.
 3. Reword or drop failing questions (one at a time), re-run.
 4. If a question stays weak and matters: replace it with code where possible, or fine-tune (PyTorch, the
    original repo's notebook) and re-export the ONNX bundle.
+
+## Latency you pay per preset
+
+The model input is `[CLS] type question: instructions [SEP] [MASK] option0 [MASK] option1 ... [SEP] state [SEP]`
+per question, all questions of a call in one batch. On the CUDA lane a call costs ~9 ms + ~1.5 ms per question
+(3 q 12 ms, 5 q ~15 ms, 10 q 24 ms); on WebGPU ~18 ms + ~6 ms per question; on the CPU ~90 ms per question.
+Longer instructions / option texts and longer states raise this on every call (CPU: 3 q went 236 -> 400 ms for
+77 -> 136 tokens per question). Keep options short; keep the state to what the questions need; do not split
+one text's questions over several calls.
+
+Fidelity of the fast lanes is checked against the fp32 reference on your own eval set:
+
+```powershell
+node experiments/ab.mjs --variant fp32=webgpu --variant fp16=webgpu:fp16 --variant cuda=cuda:fp16 --preset <name> --workload preset
+```
+
+(arg-max agreement, max |delta probability|, accuracy per variant; the shipped presets agree 134/134 and
+118-119/120 with fp32).

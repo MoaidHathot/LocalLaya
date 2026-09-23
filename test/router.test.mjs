@@ -230,6 +230,33 @@ test("a lane that fails to load is dropped; when every lane fails create() rejec
   await assert.rejects(LayaRouter.create({ lanes: ["nope:4"], sampleLoad: false, log: quiet }), /no lane could be loaded/);
 });
 
+test("GPU keep-alive: tiny calls every 500 ms on the GPU lane that served last, only within the window, never while calls are queued", async () => {
+  const router = await LayaRouter.create({ lanes: LANES, sampleLoad: false, explore: 0, gpuKeepAliveMs: 1800, warmup: { state: STATE, sizes: [3] }, log: quiet });
+  try {
+    const gpu = [...router.lanes.values()].find((L) => L.lane.startsWith("webgpu"));
+    assert.equal(router.stats().keepAliveCalls, 0, "no keep-alive before the first real call");
+    const r = await router.decide(STATE, QUESTIONS_3, { lane: gpu.lane });
+    assert.equal(r.routing.lane, gpu.lane);
+    const callsBefore = gpu.calls;
+    await sleep(1300);
+    const k1 = router.stats().keepAliveCalls;
+    assert.ok(k1 >= 1 && k1 <= 3, `expected 1-3 keep-alive calls in 1.3 s at a 500 ms interval, got ${k1}`);
+    assert.equal(router._keepAliveLane, gpu, "keep-alive targets the lane of the last real GPU call");
+    assert.equal(gpu.calls, callsBefore, "keep-alive calls are not counted as served calls");
+    assert.equal(router.stats().gpuState, "hot", "the keep-alive counts as GPU work for the thermal state");
+    await sleep(1500); // past the 1.8 s window
+    const k2 = router.stats().keepAliveCalls;
+    await sleep(700);
+    assert.equal(router.stats().keepAliveCalls, k2, "keep-alive stops after the window");
+    // a CPU call does not (re)start it; a queued call blocks it
+    await router.decide(STATE, QUESTIONS_3, { lane: "cpu:8" });
+    await sleep(600);
+    assert.equal(router.stats().keepAliveCalls, k2, "a CPU call does not start the GPU keep-alive");
+  } finally {
+    await router.close();
+  }
+});
+
 test("close() ends the worker threads", async () => {
   const router = await LayaRouter.create({ lanes: LANES, sampleLoad: false, log: quiet });
   const sessions = [...router.lanes.values()].map((L) => L.session);
