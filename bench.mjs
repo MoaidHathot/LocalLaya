@@ -6,7 +6,7 @@
  *   node bench.mjs --ep dml                     # DirectML on the RTX 4070
  *   node bench.mjs --ep webgpu --verbose        # ORT info-level logs (shows CPU-fallback node partitioning)
  *   node bench.mjs --ep cpu --pin                # 16 threads pinned to the P-cores (stable latency on hybrid CPUs)
- *   node bench.mjs --ep webgpu --fp16            # half-precision bundle from tools/convert_fp16.py
+ *   node bench.mjs --ep webgpu --fp16            # optimised half-precision bundle from tools/optimize_graph.py
  *   node bench.mjs --ep dml --out results/x.json
  *
  * Runs in its own process so RSS / GPU-memory deltas are attributable to one configuration.

@@ -244,7 +244,7 @@ export async function loadLaya(opts = {}) {
   let source;
   let modelDir = MODEL_DIR;
   if (opts.modelDir) {
-    // Explicit bundle (e.g. models/laya-onnx-fp16 from tools/convert_fp16.py): no download, no hash check.
+    // Explicit bundle (e.g. models/laya-onnx-fp16 from tools/optimize_graph.py): no download, no hash check.
     modelDir = path.resolve(PROJECT_ROOT, opts.modelDir);
     laya = await Laya.load({ modelDir, executionProviders, sessionOptions });
     source = "custom";

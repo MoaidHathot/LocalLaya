@@ -22,7 +22,10 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
 | Vendored npm tarball (`vendor/receptron-laya-0.1.2.tgz`) | npm on this machine routes through `packagefeedproxy.microsoft.io`, which returns 404 for `@receptron/laya` (the only package we need that it lacks); `registry.npmjs.org` fails at TLS. Everything else - `onnxruntime-node` (all 181 versions incl. nightlies), `@huggingface/tokenizers` - is served by the proxy; GitHub, jsDelivr, unpkg, Hugging Face and PyPI are reachable. Fetched from jsDelivr, SHA256-verified against an independent unpkg copy (23/23 files), `dist/` audited against GitHub source. |
 | Model pinned to HF commit `68f27dfe5a27a54fb2b1fefc432f43f972e90868`, SHA256-verified, cached in `models/` | The library follows `main` and only compares byte sizes. After the first download loading is offline (`modelDir`). |
 | GPU path = WebGPU EP; DirectML abandoned | `onnxruntime-node` does not build the CUDA EP for Windows at all (README matrix, `install-metadata.js` `requirements['win32/x64'] = []`, no CUDA symbols in the win32 binding) - a build gap, not a download gap. DML loads the graph but every inference fails in a `Reshape` node at all optimisation levels (same class as ORT issue #27118: DML + int64 indices in transformer graphs, closed stale). WebGPU works and matches CPU answers. |
-| fp16 bundle (`models/laya-onnx-fp16`) as the GPU default lane | Built with ORT's transformer float16 pass (onnxconverter-common left a broken Cast). 195/195 arg-max agreement, max delta p 0.034; half the VRAM (830 MiB) and RSS, 5-13 % faster. |
+| fp16 bundle (`models/laya-onnx-fp16`) as the GPU default lane, built by `tools/optimize_graph.py` (2026-09-23) | The ORT profiler showed the export's 28 `IsNaN` NaN guards running on the CPU (WebGPU EP has no IsNaN): 28 GPU->CPU round trips per call, plus 196 Cast dispatches from the first converter's fp32 islands. Exact rewrites (`IsNaN` -> `Not(Equal(x,x))`, Reshape `allowzero` cleared, ORT Gelu fusion) + fp16 without islands: 2101 -> 1753 nodes, **1.87-2.13x faster** than the previous fp16 bundle (paired, interleaved, CI [0.448, 0.457] of fp32 time), arg-max agreement with fp32 134/134 + 118/120 = identical to before, same accuracy. Attention / RoPE / SkipLayerNorm patterns do not match this export - not hand-written (agreed stop point). Previous bundle kept as `models/laya-onnx-fp16-v1` for A/B. |
+| DirectML: fixed but not a lane | The failure was `Reshape(allowzero=1)` + `-1` (torch.export emits it for every `view`); clearing the attribute makes DML run on 1.30.0 and the nightly. 18-19 ms for 1 question (fastest EP) but 6-10x slower than WebGPU for batch > 1 even on a fixed shape (3 q 217 ms). Priors updated; not in the default lanes. |
+| The CPU lane keeps the pinned, hash-verified HF fp32 bundle | The same graph clean-up gives nothing on the CPU EP (1.030 [0.953, 1.058]; IsNaN is native there), fp16 on the CPU EP is not faster either. |
+| Gains are only claimed from `experiments/ab.mjs` | Variants in one process, interleaved rounds, paired ratio with bootstrap 95 % CI, fidelity vs a reference on any preset's eval set. Noise floor 1.000 [0.997, 1.001]. Sequential single runs on this machine swing 1.1-1.3x and cannot resolve a 5 % effect. |
 | CPU lanes pin 16 (or 8) intra-op threads to the P-cores | ORT's default 24-thread pool spans E-cores; Windows scheduling makes 3 questions take 215 ms or 1200 ms (p95 > 1.1 s in half the sessions). Pinning: p95 284-350 ms for ~10 % cost. `cpu:8` pinned equals `cpu:16` pinned at half the CPU share. |
 | Per-call execution-provider router (`src/ep-router.mjs`) | Back-to-back traffic: WebGPU 3-5x faster. Sporadic traffic: the GPU drops to 225 MHz between calls and a single question takes ~180 ms vs ~105 ms on CPU. The router predicts per (lane, GPU thermal state at start, question bucket, work) plus the shared queue wait, and picks. |
 | One FIFO queue for all lanes; a burst never spills to the CPU lane (2026-09-23) | `onnxruntime-node` runs `session.run()` synchronously on the JS thread, so inferences never overlap in one process; a CPU call inside a GPU burst stalled every GPU call behind it (49 -> 321-479 ms) and policy `auto` fell to 6.6 calls/s at 8 callers vs 20 GPU-only. Even with lanes in worker threads mixing loses (GPU 1.5x slower while the pinned CPU pool spins; 16 vs 20.6 calls/s). The CPU lane is for sporadic single questions on a cold GPU and for GPU-less machines. |
@@ -86,22 +89,25 @@ Toolchain: Node 25.3 (>= 20 required), npm 11.4, Python 3.12 + uv (only for the 
 |---|---|---|---|---|---|---|
 | `cpu` (16 pinned) | 115 ms | 276 | 911 | 49 % | 1.6-1.8 GiB | 0 |
 | `cpu:8` (8 pinned) | 113 | 272 | 921 | 24 % | 1.6-1.8 GiB | 0 |
-| `webgpu` fp32 | 30.5 | 53 | 143 | 2 % | 1.1 GiB | +1636 MiB |
-| `webgpu:fp16` | 29.1 | 47 | 122 | 2 % | 0.6 GiB | +832 MiB |
+| `webgpu` fp32 (HF export as is) | 30.5 | 53 | 143 | 2 % | 1.1 GiB | +1636 MiB |
+| `webgpu:fp16` first converter (2026-09-21) | 29.1 | 47 | 122 | 2 % | 0.6 GiB | +832 MiB |
+| **`webgpu:fp16` optimised graph (2026-09-23, current)** | **21.1** | **32.0** | **83.1** | 2 % | 0.6 GiB | +832 MiB |
+| `dml` optimised graph (not a lane) | 18-19 | 217 | 264 | | | |
 
-Sporadic 1-question calls (3 s gaps): WebGPU ~180 ms, CPU ~105 ms. Sidecar: first call 3.1-4.5 s (was 5.0-6.3 s with
-lanes loading one after the other in the main thread), later calls ~0.15-0.4 s; ready with the first lane
-2.6-2.9 s after spawn, both lanes 3.5-3.8 s; 8 parallel 5-q calls in 1.1-1.4 s on one lane (2.6 s when they were
-spread over GPU + CPU). Worker lanes: main-thread stall during a 10-q CPU call 1.1 s -> 18 ms; two lanes load
-in 2.2-2.3 s instead of 3.3-3.6 s. Accuracy zero-shot: smart-home intent 0.72, should_execute 0.66,
-target_device 0.77 (65 items); dev-request task 0.75, language 0.85 (40 items).
+Sporadic 1-question calls (3 s gaps): WebGPU ~101 ms (was ~180), CPU ~105 ms. Sidecar: first call 3.1-4.5 s
+(was 5.0-6.3 s with lanes loading one after the other in the main thread), later calls ~0.15-0.4 s; ready with
+the first lane 2.6-2.9 s after spawn, both lanes 3.5-3.8 s; 8 parallel 5-q calls in 0.7 s on one lane (1.1-1.4 s
+before the graph optimisation, 2.6 s when they were spread over GPU + CPU). Worker lanes: main-thread stall
+during a 10-q CPU call 1.1 s -> 18 ms; two lanes load in 2.2-2.3 s instead of 3.3-3.6 s. Accuracy zero-shot:
+smart-home intent 0.72, should_execute 0.66, target_device 0.77 (65 items); dev-request task 0.75, language
+0.85 (40 items) - unchanged by fp16 or the graph optimisation.
 
-Throughput (3 q per call, `results/throughput-*-summary.md`): `webgpu:fp16` 19-21 calls/s back-to-back
-(57-63 questions/s), 10/s sustained at 53-60 ms, 5/s at 61-85 ms, 1/s at 112-143 ms (GPU clocks sag between
-calls); `cpu:8` 2.5-3.8 calls/s, saturates above ~3/s. Concurrency adds nothing (one FIFO): 8 callers = same
-calls/s, each waits ~410 ms. 1 q per call ~1.6x the calls/s of 3 q, 10 q ~0.4x - batch questions per call.
-Policy `auto` before the queue fix: 10.2 calls/s at 4 callers and 6.6 at 8 (p95 1.5 s); after: 19-20 at every
-concurrency, identical to `prefer-gpu`.
+Throughput (3 q per call, `results/throughput-*-summary.md`, optimised bundle): `webgpu:fp16` 30-31 calls/s
+back-to-back (91-93 questions/s; was 19-21), 20/s offered served at 33 ms p50 (was 110-146 with a queue), 10/s
+at 35 ms, 5/s at 70 ms (GPU clocks sag between calls), 1 per 3 s at 156 ms; `cpu:8` 2.5-3.8 calls/s, saturates
+above ~3/s. Concurrency adds nothing (one FIFO): 8 callers = same calls/s, each waits ~130 ms. 1 q per call
+~1.5x the calls/s of 3 q, 10 q ~0.4x - batch questions per call. Policy `auto` before the queue fix: 10.2
+calls/s at 4 callers and 6.6 at 8 (p95 1.5 s); after: equal to `prefer-gpu` at every concurrency.
 
 ## Open items / next steps
 
@@ -143,9 +149,13 @@ worker threads, `cpu:8` as the default CPU lane, `bench-all` defaults, GitHub Ac
   `0xC0000409` (terminating an idle worker is fine).
 - Early serving trades the first second: a call that arrives while only the CPU lane is up runs there
   (~300 ms for 3 q) rather than waiting ~0.5-1 s for the GPU lane; bursts move over as soon as it joins.
-- GPU latency depends on the gap between calls, not only on long pauses: 48 ms back-to-back, 58-66 ms with
-  50 ms gaps, 75-96 ms with 200 ms gaps (3 q). Rates quoted from back-to-back runs are upper bounds.
-- WebGPU EP is marked experimental by ORT; first call after load ~180 ms (shader compile).
+- GPU latency depends on the gap between calls, not only on long pauses (optimised bundle, 3 q): 32 ms
+  back-to-back and with 250 ms gaps, 81 ms after 1 s, 156 ms after 3 s. Rates quoted from back-to-back runs
+  are upper bounds.
+- WebGPU EP is marked experimental by ORT; first call after load ~130-180 ms (shader compile).
+- Several ORT sessions in one process slow each other's small calls (5 WebGPU sessions: 1 q 35-37 ms instead
+  of 21-28; 3 pinned CPU sessions: 1 q 500+ ms) - only relevant to `experiments/ab.mjs`, whose comparisons are
+  interleaved and therefore unaffected; production has one session per lane per process.
 - `confidence` in answers is 1 - normalised entropy, not P(correct); gate on `probabilities[choice]` / `noul`.
 - Base checkpoints are "a fast base to specialise, not a zero-shot engine" (model card): expect mediocre
   zero-shot accuracy, systematic confusions (device *questions* vs device *commands*), English only.
@@ -157,13 +167,15 @@ worker threads, `cpu:8` as the default CPU lane, `bench-all` defaults, GitHub Ac
 
 ```powershell
 cd W:\Github\LocalLaya
-npm test                      # 9 unit tests, no model needed
+npm test                      # 10 unit tests, no model needed
 npm run test:router           # worker lanes, failover, early serving (~35 s, needs model + GPU)
 node ask.mjs --status         # is a sidecar running?
 node ask.mjs --sidecar "..."  # start using it
 npm run test:sidecar          # full lifecycle check (~1 min)
+npm run fp16:check            # fp16 bundle vs fp32 reference: speed (paired CI) + fidelity; add --preset <yours>
 ```
 
-Models are in `models/` (ignored by git, 2.4 GB). If missing, `node poc.mjs` re-downloads and verifies the
-pinned fp32 bundle; `npm run fp16:convert` rebuilds the fp16 bundle (needs `.venv`: `uv venv .venv` +
+Models are in `models/` (ignored by git, 3.2 GB incl. the previous fp16 bundle `laya-onnx-fp16-v1`). If
+missing, `node poc.mjs` re-downloads and verifies the pinned fp32 bundle; `npm run fp16:convert` rebuilds the
+optimised fp16 bundle with `tools/optimize_graph.py` (needs `.venv`: `uv venv .venv` +
 `uv pip install --python .venv/Scripts/python.exe onnx onnxruntime`).

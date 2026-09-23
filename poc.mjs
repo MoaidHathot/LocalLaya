@@ -3,7 +3,7 @@
  *
  *   node poc.mjs                         # CPU, 16 threads pinned to P-cores (stable); --nopin for ORT defaults
  *   node poc.mjs --ep webgpu             # NVIDIA GPU via the WebGPU EP (3-5x faster back-to-back)
- *   node poc.mjs --ep webgpu --fp16      # half-precision bundle (tools/convert_fp16.py): half the VRAM
+ *   node poc.mjs --ep webgpu --fp16      # optimised half-precision bundle (tools/optimize_graph.py): half the VRAM
  *   node poc.mjs --ep dml                # DirectML: loads, but fails at inference on this graph (ORT 1.30)
  *   node poc.mjs --calibration calibration/smart-home-v3.json   # refit temperatures for this domain
  *   node poc.mjs --runs 10               # timed runs after warm-up (default 10)

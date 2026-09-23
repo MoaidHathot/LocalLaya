@@ -24,8 +24,8 @@ Everything downloaded lives under this directory (`models/`, `node_modules/`, `.
 | `data/smart-home-eval.mjs`, `data/question-variants.mjs` | 65 hand-labelled utterances; three question wordings (v1 original, v2 explicit, v3 best per question) |
 | `calibration/*.json` | fitted temperature tables (`loadLaya({ calibration })`) |
 | `bench.mjs`, `bench-all.mjs`, `src/metrics.mjs` | latency matrix (EP x 1/3/10 questions) with process CPU / RSS / GPU util / VRAM / power sampling |
-| `experiments/*.mjs` | shape sensitivity + concurrency, sporadic-vs-burst latency, length sweep, fp16 fidelity, throughput matrix (lanes x concurrency x arrival rate), cross-lane interference, worker-thread lanes |
-| `tools/convert_fp16.py` | fp32 -> fp16 bundle conversion (ORT's transformer float16 pass; no PyTorch) |
+| `experiments/*.mjs` | `ab.mjs`: interleaved A/B of lane variants (speed with paired CI + fidelity vs a reference, any preset's eval set); shape sensitivity + concurrency, sporadic-vs-burst latency, length sweep, throughput matrix (lanes x concurrency x arrival rate), cross-lane interference, worker-thread lanes |
+| `tools/optimize_graph.py` | fp32 export -> optimised fp16 bundle: IsNaN -> Not(Equal), Reshape allowzero, ORT Gelu fusion, fp16 without fp32 islands (no PyTorch); writes `optimize-report.json` |
 | `verify-model.mjs` | re-hash the cached bundle against the pinned SHA256 values |
 | `vendor/receptron-laya-0.1.2.tgz` | the exact published npm tarball (see Supply chain) |
 | `skills/laya-decisions/` | Agent Skill (agentskills.io format): `SKILL.md` + `references/` + `scripts/laya.mjs` wrapper; copy the folder into an agent's skills directory and set `LAYA_DIR` |
@@ -207,33 +207,36 @@ Latency of one `systemOne` call, p50 ms, 20 runs back-to-back after warm-up:
 | `cpu` = 16 threads pinned to P-cores | 115 | 276 | 911 | 49 % | 1.6-1.8 GiB | 0 | - |
 | `cpu:8` pinned (1 thread / physical P-core) | 113 | 272 | 921 | 24 % | 1.6-1.8 GiB | 0 | - |
 | `cpu:auto` ORT default (24 threads, unpinned) | 101 | 248 | 809 | 74 % | 1.6-1.8 GiB | 0 | - |
-| `webgpu` fp32 | 30.5 | 53 | 143 | 2 % | 1.1 GiB | +1636 MiB | 42-161 W |
-| `webgpu:fp16` | 29.1 | 47 | 122 | 2 % | 0.6 GiB | +832 MiB | 53-144 W |
-| `dml` (DirectML) | fails | fails | fails | | | | |
+| `webgpu` fp32 (pinned HF export as is) | 30.5 | 53 | 143 | 2 % | 1.1 GiB | +1636 MiB | 42-161 W |
+| `webgpu:fp16`, first converter (2026-09-21) | 29.1 | 47 | 122 | 2 % | 0.6 GiB | +832 MiB | 53-144 W |
+| **`webgpu:fp16`, optimised graph (2026-09-23, current)** | **21.1** | **32.0** | **83.1** | 2 % | 0.6 GiB | +832 MiB | 38-166 W |
+| `dml` (DirectML), optimised graph | 18-19 | 217 | 264 | | | | batch > 1 pathological, not a lane |
 
 Model-card reference on a Tesla T4 (PyTorch): 39.5 ms (1 q), 158.6 ms (10 q). All lanes return identical
-answers to 4 decimals (fp16: max |delta p| 0.034, 195/195 arg-max agreement on the eval set).
+answers to 4 decimals (fp16 vs fp32: 134/134 + 118/120 arg-max agreement over the smart-home and dev-request
+eval sets, max |delta p| 0.05, same accuracy; the two flips are near-ties, see finding 10).
 
 ### Throughput (`experiments/throughput.mjs`, `results/throughput-*-summary.md`)
 
 Laya is not generative, so the unit is one call (state + N questions, one forward pass), not tokens.
 Throughput = 1 / latency: inferences never overlap in one process (see finding 4), so more callers only
-lengthen the queue. Sustained rates, 3 questions per call (~255 tokens), through `LayaRouter.decide()`:
+lengthen the queue. Sustained rates, 3 questions per call (~255 tokens), through `LayaRouter.decide()`, with
+the optimised fp16 bundle (the 2026-09-21 numbers in brackets):
 
 | lane | calls/s | questions/s | per minute | latency at that rate |
 |---|---|---|---|---|
-| `webgpu:fp16`, back-to-back | 19-21 | 57-63 | ~1200 | 48-54 ms |
-| `webgpu:fp16`, 10 calls/s offered | 10 | 30 | 600 | 53-60 ms |
-| `webgpu:fp16`, 5 calls/s offered | 5 | 15 | 300 | 61-85 ms (GPU clocks sag between calls) |
-| `webgpu:fp16`, 1 call/s offered | 1 | 3 | 60 | 112-143 ms |
-| `webgpu:fp16`, 1 call / 3 s | 0.33 | 1 | 20 | 172-257 ms (cold) |
+| `webgpu:fp16`, back-to-back | **30-31** (19-21) | 91-93 | ~1800 | 32-33 ms |
+| `webgpu:fp16`, 20 calls/s offered | 20 (queued) | 60 | 1200 | 33 ms (110-146 with a queue) |
+| `webgpu:fp16`, 10 calls/s offered | 10 | 30 | 600 | 35 ms (53-60) |
+| `webgpu:fp16`, 5 calls/s offered | 5 | 15 | 300 | 70 ms (GPU clocks sag between calls) |
+| `webgpu:fp16`, 1 call / 3 s | 0.33 | 1 | 20 | 156 ms cold (172-257) |
 | `cpu:8`, back-to-back | 2.5-3.8 | 7-11 | 150-230 | 260-375 ms |
 | `cpu:8`, anything above ~3 calls/s | saturates | | | queue grows without bound |
 
-1 question per call runs ~1.6x more calls/s than 3 questions (30-34/s hot GPU), 10 questions ~0.4x (7-8/s),
-so batching questions into one call is the lever: 82 questions/s at 10 per call vs 34 at 1 per call. With 8
-callers in parallel the throughput is the same as with 1; each caller just sees `queueMs` grow (8 x 3 q:
-p50 ~410 ms end to end at 19 calls/s).
+1 question per call runs ~1.5x more calls/s than 3 questions (~47/s hot GPU), 10 questions ~0.4x (12/s),
+so batching questions into one call is the lever: ~120 questions/s at 10 per call vs ~47 at 1 per call. With
+8 callers in parallel the throughput is the same as with 1; each caller just sees `queueMs` grow (8 x 3 q:
+p50 ~130 ms end to end at 31 calls/s).
 
 Deployment overhead on top: HTTP `serve.mjs` +1-3 ms; `ask.mjs --sidecar` (new CLI process per call) ~150 ms
 per call, so ~6 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1.5-2.5 s load every time.
@@ -246,14 +249,17 @@ per call, so ~6 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1
    Pinning the pool to the P-cores (`session.intra_op_thread_affinities`, exposed via `sessionOptions.extra`)
    costs ~10 % in the good case and removes the slow mode: p95 284-350 ms across all sessions.
    `pinToPCores: true` is the default for the router's CPU lanes; override the P-core count with `LAYA_PCORE_LOGICAL`.
-2. **GPU idle clocks.** Between sporadic calls the RTX 4070 drops to ~225 MHz. Back-to-back a 3-question call
-   is 48 ms on WebGPU; with 50 ms gaps 58-66 ms, 100 ms gaps 54-81, 200 ms gaps 75-96; after a 1 s pause 91-140;
-   after a 3 s pause ~170-235. A single question after a 3 s pause: WebGPU ~180 ms vs CPU ~105 ms. The CPU is
-   insensitive to gaps. This is the case for the router. A keep-alive (tiny GPU calls every 250 ms) was tried
-   and does not help; left off.
-3. **DirectML** loads the graph but every inference fails in a `Reshape` node (`node_view`, HRESULT 80070057) at
-   all graph-optimisation levels; not fixable client-side. WebGPU is the NVIDIA path in `onnxruntime-node` on
-   Windows (no CUDA EP is shipped for Windows).
+2. **GPU idle clocks.** Between sporadic calls the RTX 4070 drops to ~225 MHz. With the optimised bundle a
+   3-question call is 32 ms back-to-back and with 250 ms gaps, 81 ms after a 1 s pause, ~156 ms after 3 s; a
+   single question after 3 s ~101 ms (before the graph optimisation: 48 / 91-140 / 170-235 / ~180). The CPU is
+   insensitive to gaps (1 q ~105 ms), so a cold single question is now a tie the router settles from its EMA.
+   A keep-alive (tiny GPU calls every 250 ms) was tried and does not help; left off.
+3. **DirectML** failed on the exported graph in a `Reshape` node (`node_view`, HRESULT 80070057) at all
+   graph-optimisation levels, on 1.30.0 and the 1.31 nightly. Cause: torch.export emits `Reshape(allowzero=1)`
+   for every `view` and DML rejects that together with a `-1`; `tools/optimize_graph.py` clears the attribute
+   (exact: no shape here contains a 0) and DML runs. It is the fastest EP for a single question (18-19 ms) but
+   6-10x slower than WebGPU for batch > 1 even on a fixed shape (3 q 217 ms), so it is not a default lane.
+   WebGPU is the NVIDIA path in `onnxruntime-node` on Windows (no CUDA EP is built for Windows).
 4. **Inferences never overlap in one thread, and mixing lanes under load is a net loss.** `onnxruntime-node`
    1.30 runs `session.run()` synchronously on the JS thread (`dist/backend.js`: `setImmediate` + blocking run),
    so a CPU inference blocks the event loop - and every other lane in that thread - for its full duration:
@@ -267,8 +273,9 @@ per call, so ~6 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1
    recompilation on WebGPU beyond the first call (~180 ms); unseen sequence lengths run at normal speed.
 5. **Latency scales with tokens**: CPU 3 q goes 236 -> 400 ms for 77 -> 136 tokens per question. Longer option
    descriptions (see v2 wording) cost latency on every call.
-6. **fp16 bundle**: half the VRAM and RSS, 0.8 s load, 5-13 % faster; fidelity fine on this domain
-   (validate on yours: `node experiments/fp16-fidelity.mjs`). Build: `.venv/Scripts/python tools/convert_fp16.py <fp32 dir> models/laya-onnx-fp16`.
+6. **fp16 bundle**: half the VRAM and RSS, 0.8 s load; built by `tools/optimize_graph.py` (finding 10) with
+   `npm run fp16:convert`, validated against the fp32 reference with `npm run fp16:check` (`experiments/ab.mjs`;
+   add `--preset <yours>` to validate on your own eval set).
 7. **The JS thread's core matters (1.6x).** It tokenises, drives the WebGPU dispatch and is one of ORT's
    intra-op workers (the pool is threads-1 pinned workers plus the caller). Windows parks it on an E-core for
    minutes at a time: whole sessions ran webgpu:fp16 3 q at 78 ms instead of 49 and `cpu:8` ~1.3x slower, and
@@ -285,16 +292,26 @@ per call, so ~6 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1
    `0xC0000409`. `close()` asks the worker to release the session and exit by itself; an idle worker can be
    terminated safely (the router marks the lane gone, fails in-flight calls over to another lane and never
    picks it again - `test/router.test.mjs`).
-9. **Where the time goes: dispatch overhead, not arithmetic.** 99 % of a `webgpu:fp16` call is inside
-   `session.run` (tokenising, padding and softmax take 0.3-1.9 ms). P-core pinned: 27.8 / 50.9 / 139.8 ms
-   for 83 / 236 / 775 tokens, i.e. **~14 ms fixed + 0.16 ms per token** - 5-10 % of the RTX 4070's fp16
-   tensor throughput. The exported graph has **2101 nodes** (286 Slice, 262 Mul, 182 MatMul, 158 Transpose,
-   32 Softmax; only `LayerNormalization` arrives fused), so each call is ~2000 small GPU dispatches. That is
-   also why fp16 bought only 5-13 %. Consequences: graph-level fusion (fewer dispatches) is the lever, a
-   faster EP helps only once the graph is fused, and nothing downloadable changes this: the installed
-   `onnxruntime-node` 1.30.0 is the newest release, and its Windows build simply has no CUDA EP (see
-   `docs/STATUS.md` decisions). WebGPU graph capture exists in the ORT DLL but the 1.30.0 Node binding
-   rejects the option.
+9. **Where the time went: GPU->CPU round trips and Cast dispatches, not arithmetic.** 99 % of a `webgpu:fp16`
+   call is inside `session.run` (tokenising, padding and softmax take 0.3-1.9 ms), and the ORT profiler showed
+   what that was: the exported graph has 28 `IsNaN` nodes (the sdpa NaN guard after every attention softmax)
+   that the WebGPU EP does not implement, so each call did **28 GPU->CPU copies + 28 copies back** - 28 pipeline
+   drains - plus **196 `Cast` dispatches** from the first fp16 converter's fp32 islands (LayerNorm, Softmax).
+   The arithmetic itself was 5-10 % of the RTX 4070's fp16 throughput. ORT's runtime fusions change nothing on
+   this torch.export graph, and nothing downloadable helps: `onnxruntime-node` 1.30.0 is the newest release
+   and its Windows build has no CUDA EP (see `docs/STATUS.md` decisions); WebGPU graph capture exists in the
+   DLL but the Node binding rejects the option; all eight forwardable WebGPU EP options are within +-0.5 %
+   (`results/webgpu-options-2026-09-23-summary.md`).
+10. **Optimised graph (`tools/optimize_graph.py`, current `webgpu:fp16` bundle): 1.9-2.1x, same answers.**
+    Exact rewrites - `IsNaN(x)` -> `Not(Equal(x, x))`, `Reshape allowzero=1` -> default, ORT's Gelu fusion
+    (the only transformer pattern that matches this export; attention / RoPE / SkipLayerNorm do not) - and fp16
+    without fp32 islands: 2101 -> 1753 nodes, 2 `MemcpyToHost` per call instead of 30. Measured with
+    `experiments/ab.mjs` (interleaved, paired, bootstrap CI, against the fp32 reference): 0.453 [0.448, 0.457] of
+    fp32 time on the PoC + smart-home workload vs 0.846 for the previous bundle (**1.87x**), 0.430 vs 0.916 on
+    dev-request (**2.13x**); arg-max agreement with fp32 134/134 and 118/120 - identical to the previous fp16
+    bundle, the two flips being near-ties (0.426 vs 0.419) - and identical accuracy. The same clean-up does
+    nothing for the CPU lane (1.03 [0.95, 1.06]), which keeps the pinned, hash-verified HF bundle. Details:
+    `results/graph-opt-2026-09-23-summary.md`.
 
 ## The execution-provider router (`src/ep-router.mjs`)
 
@@ -329,8 +346,9 @@ Default `webgpu` + `cpu:8` (`cpu:8` equals `cpu` in latency at half the CPU shar
 - **Shutdown**: `close()` rejects new calls, lets the queue drain, then releases every session (a worker
   releases its own session and exits; see finding 8 for why it is never terminated under a running inference).
 
-Measured behaviour (`router-demo.mjs`): bursts -> WebGPU (47-90 ms / 3 q); one question every 3 s -> CPU
-(100-130 ms, WebGPU predicted ~200 cold); 10 questions after a pause -> WebGPU (403-505 ms vs CPU ~1100 predicted).
+Measured behaviour (`router-demo.mjs`): bursts -> WebGPU (32-50 ms / 3 q); one question every 3 s -> whichever of
+CPU (~105 ms) and cold WebGPU (~101 ms) the EMA currently rates lower; 10 questions after a pause -> WebGPU
+(~300-400 ms vs CPU ~1100 predicted).
 Warm up with a representative state: estimates depend on state length.
 
 ## Over-confidence, calibration, accuracy (`calibrate.mjs`)

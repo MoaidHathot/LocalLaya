@@ -57,7 +57,7 @@ test("LatencyModel: prior, EMA update, neighbour scaling, work normalisation", (
   // unseen bucket in the same state: prior scaled by observed/prior ratio of a seen bucket
   const p = m.predict(10, "hot");
   assert.equal(p.source, "ema-scaled(from 2-3)");
-  assert.ok(Math.abs(p.ms - (53 / 55) * 136) < 1e-9);
+  assert.ok(Math.abs(p.ms - (53 / DEFAULT_PRIORS.webgpu.ms.hot["2-3"]) * DEFAULT_PRIORS.webgpu.ms.hot["7-10"]) < 1e-9);
   // cpu lanes ignore the thermal state
   const c = new LatencyModel("cpu");
   c.observe(1, "cold", 100);
@@ -215,11 +215,18 @@ test("router predictions: one queue for all lanes - shared wait, choice by own l
   const w = by(r.predictions(1));
   assert.equal(w.webgpu.state, "warm");
   assert.ok(Math.abs(w.webgpu.predictedMs - (260 + DEFAULT_PRIORS.webgpu.ms.warm["1"])) < 1e-9);
-  // idle and cold: the cold prior applies and the CPU wins a single question (sporadic traffic)
+  // idle and cold: the cold prior applies; whichever lane's prior is lower wins (with the optimised fp16 bundle a
+  // cold single question is a near tie, ~105 ms GPU vs ~110 ms CPU - the EMA decides in practice)
   r.inflight = [];
   const cold = r.predictions(1);
   assert.equal(by(cold).webgpu.state, "cold");
-  assert.equal(chooseLane(cold, { explore: 0 }).lane, "cpu");
+  assert.ok(Math.abs(by(cold).webgpu.predictedMs - DEFAULT_PRIORS.webgpu.ms.cold["1"]) < 1e-9);
+  const expected = DEFAULT_PRIORS.webgpu.ms.cold["1"] <= DEFAULT_PRIORS.cpu.ms.any["1"] ? "webgpu" : "cpu";
+  assert.equal(chooseLane(cold, { explore: 0 }).lane, expected);
+  // a genuinely cold and slow GPU (as measured before the graph optimisation: ~180 ms) loses to the CPU
+  r.lanes.get("webgpu").model.observe(1, "cold", 180);
+  assert.equal(chooseLane(r.predictions(1), { explore: 0 }).lane, "cpu");
+  r.lanes.get("webgpu").model.ema = {};
   // contention inflation applies to the lane's own latency, not to the shared wait
   r.lastGpuWorkEnd = performance.now();
   r.inflight = [{ lane: "webgpu", ownMs: 55, startedAt: null }];

@@ -41,6 +41,8 @@ export const thermalState = (msSinceGpuWork) => (msSinceGpuWork < 400 ? "hot" : 
  * Priors (ms per systemOne call). Measured values from this repo's results for 1 / 2-3 / 7-10; the 4-6 and
  * 11+ entries are interpolations. They only matter until the EMA has seen a few real calls.
  * "share" = fraction of the machine's CPU the lane occupies while running (used by deadline / min-cpu).
+ * GPU numbers are for the optimised fp16 bundle (tools/optimize_graph.py, 2026-09-23): hot 21 / 32 / 83 ms,
+ * after a 1 s pause ~50 / 81, after 3 s ~101 / 156 (experiments/sporadic.mjs --fp16).
  */
 export const DEFAULT_PRIORS = {
   // "cpu" = 16 intra-op threads pinned to the P-cores (stable: no 5x slow mode from E-core stragglers)
@@ -51,16 +53,17 @@ export const DEFAULT_PRIORS = {
   webgpu: {
     share: 0.02,
     ms: {
-      hot: { "1": 30, "2-3": 55, "4-6": 90, "7-10": 136, "11+": 220 },
-      warm: { "1": 60, "2-3": 90, "4-6": 130, "7-10": 190, "11+": 300 },
-      cold: { "1": 180, "2-3": 200, "4-6": 240, "7-10": 300, "11+": 420 },
+      hot: { "1": 22, "2-3": 33, "4-6": 55, "7-10": 84, "11+": 130 },
+      warm: { "1": 50, "2-3": 80, "4-6": 105, "7-10": 140, "11+": 200 },
+      cold: { "1": 105, "2-3": 160, "4-6": 190, "7-10": 230, "11+": 320 },
     },
   },
-  dml: { share: 0.03, ms: { hot: { "1": 40, "2-3": 70, "4-6": 110, "7-10": 170, "11+": 260 }, warm: { "1": 80, "2-3": 110, "4-6": 160, "7-10": 230, "11+": 350 }, cold: { "1": 200, "2-3": 230, "4-6": 280, "7-10": 350, "11+": 480 } } },
+  // DirectML runs the optimised graph (allowzero=0) but is 6-10x slower than WebGPU for batch > 1 (measured 2026-09-23)
+  dml: { share: 0.03, ms: { hot: { "1": 19, "2-3": 217, "4-6": 240, "7-10": 264, "11+": 330 }, warm: { "1": 50, "2-3": 250, "4-6": 280, "7-10": 300, "11+": 380 }, cold: { "1": 110, "2-3": 320, "4-6": 350, "7-10": 380, "11+": 470 } } },
 };
 
 export const isGpuLane = (lane) => lane.startsWith("webgpu") || lane.startsWith("dml");
-/** Bundle directory used by the ":fp16" lane variant (output of tools/convert_fp16.py). */
+/** Bundle directory used by the ":fp16" lane variant (output of tools/optimize_graph.py). */
 export const FP16_MODEL_DIR = process.env.LAYA_FP16_DIR ?? "models/laya-onnx-fp16";
 /**
  * Lane syntax:

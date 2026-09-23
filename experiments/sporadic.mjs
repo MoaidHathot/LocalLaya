@@ -4,6 +4,7 @@
  * and has to ramp up again. CPUs ramp much faster.
  *
  *   node experiments/sporadic.mjs --ep webgpu
+ *   node experiments/sporadic.mjs --ep webgpu --fp16
  *   node experiments/sporadic.mjs --ep cpu
  */
 import { parseArgs } from "node:util";
@@ -11,13 +12,13 @@ import { loadLaya } from "../src/laya-client.mjs";
 import { latencyStats } from "../src/metrics.mjs";
 import { STATE, QUESTIONS_1, QUESTIONS_3 } from "../src/questions.mjs";
 
-const { values: args } = parseArgs({ options: { ep: { type: "string", default: "webgpu" }, calls: { type: "string", default: "8" } } });
+const { values: args } = parseArgs({ options: { ep: { type: "string", default: "webgpu" }, calls: { type: "string", default: "8" }, fp16: { type: "boolean", default: false } } });
 const calls = Number(args.calls);
-const { laya } = await loadLaya({ ep: args.ep, log: () => {} });
+const { laya } = await loadLaya({ ep: args.ep, modelDir: args.fp16 ? "models/laya-onnx-fp16" : undefined, log: () => {}, logSeverityLevel: 3 });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 for (let i = 0; i < 5; i++) await laya.systemOne(STATE, QUESTIONS_3); // fully warm
-console.log(`ep=${args.ep}; ${calls} calls per gap setting, 3 questions`);
+console.log(`ep=${args.ep}${args.fp16 ? " fp16" : ""}; ${calls} calls per gap setting, 3 questions`);
 console.log("gap(ms)   p50      mean     min      max");
 for (const gap of [0, 250, 1000, 3000]) {
   const times = [];

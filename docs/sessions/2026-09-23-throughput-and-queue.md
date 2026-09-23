@@ -134,7 +134,40 @@ User challenged the "npm cannot fetch" claim. Checked instead of repeating it:
   Constraints from the user: keep everything preset-agnostic (more presets coming), and make sure gains are
   real (interleaved A/B in one session, not single runs).
 
-## Numbers worth remembering
+## Phase 7 - the sweep that found nothing, the profile that found everything
+
+User: "go ahead; keep it generic (more presets coming); make sure the gains are real."
+
+- **Measurement first**: `experiments/ab.mjs` - N variants in one process, interleaved rounds, paired ratio
+  with bootstrap CI, fidelity vs a reference on any preset's eval set (`--preset`, `--inputs`). Noise floor
+  measured: 1.000 [0.997, 1.001], answers bit-identical. Everything below is from this tool.
+- **WebGPU EP options** (8 variants incl. all combined): every ratio within +-0.5 %, every CI covers 1.0.
+  Nothing adopted. Real result: the binding-forwardable knobs are not a lever for this graph.
+- **CPU-fallback audit**: the 90 CPU nodes are Shape->Slice->Concat plumbing; ORT's runtime fusions all report
+  `modified: 0`. **DML nightly**: same `node_view` failure; the node is `Reshape(allowzero=1)` of the QKV view.
+- **ORT transformer optimizer** on the fp32 export, every model type: only Gelu (29) fuses. Attention, RoPE,
+  SkipLayerNorm: no match (torch.export structure). Stopped there, as agreed.
+- **ORT profiler** (the step that mattered): 28 `IsNaN` nodes (sdpa NaN guard per layer) run on the CPU because
+  the WebGPU EP has no IsNaN kernel -> 30 `MemcpyToHost` + 36 `MemcpyFromHost` per call; 196 `Cast` nodes from
+  the fp32 islands (LayerNorm/Softmax) of the first converter. Neither is "fusion"; both are exact, mechanical.
+- `tools/optimize_graph.py` (replaces `convert_fp16.py`): `IsNaN(x)` -> `Not(Equal(x,x))`, Reshape `allowzero`
+  cleared, Gelu fusion, fp16 without islands -> 1753 nodes, 2 `MemcpyToHost` per call. Two bugs on the way:
+  `optimize_by_fusion` takes a `ModelProto`, and the fused `com.microsoft` ops need the opset import added by
+  hand before shape inference.
+- **Results** (paired, vs fp32 on WebGPU): optB 0.453 [0.448, 0.457] vs previous fp16 0.846 on PoC+smart-home
+  (**1.87x**); 0.430 vs 0.916 on dev-request (**2.13x**). Fidelity identical to the previous bundle (134/134;
+  118/120 with the same two near-tie flips), accuracy = fp32 on both presets. Adopted as `models/laya-onnx-fp16`
+  (previous kept as `-v1`). Standard bench 21.1 / 32.0 / 83.1 ms; throughput 30-31 calls/s (3 q); sidecar
+  8-call burst 676 ms; cold 1 q 101 ms (was 180) - the CPU lane's cold-GPU niche is gone.
+- **DML works** with `allowzero=0`: 18-19 ms for 1 q (fastest EP), but 217 / 264 ms for 3 / 10 q even on a fixed
+  shape - not a shape-cache effect (tested). Priors updated, not a default lane.
+- **CPU lane**: the same clean-up in fp32 gives 1.03 [0.95, 1.06] -> keep the pinned HF bundle.
+- Unit tests that hard-coded prior values were rewritten against `DEFAULT_PRIORS`; router + sidecar suites pass.
+
+Numbers worth remembering (updated): `webgpu:fp16` 3 q 32 ms / 30 calls/s / 92 questions/s; 1 q 21 ms; 10 q
+83 ms; the two fp16 arg-max flips on dev-request are 0.426 vs 0.419 and 0.194 vs 0.192.
+
+## Numbers worth remembering (2026-09-21/23, before the graph optimisation where GPU numbers are given)
 
 - `webgpu:fp16` 3 q: 19-21 calls/s back-to-back (57-63 questions/s), 10/s at 53-60 ms, 5/s at 61-85 ms,
   1/s at 112-143 ms, 1 per 3 s at 172-257 ms. `cpu:8`: 2.5-3.8 calls/s, saturates above ~3/s.
