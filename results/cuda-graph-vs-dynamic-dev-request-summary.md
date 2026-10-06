@@ -1,6 +1,6 @@
 # A/B: cudadyn vs cuda (2026-09-23T20:46:23.784Z)
 
-Machine: Intel(R) Core(TM) i9-14900KF (32 threads), GPU NVIDIA GeForce RTX 4070; Node v25.3.0. 8 interleaved rounds; workload both (preset dev-request: 40/40 items from W:\Github\LocalLaya\presets\dev-request.eval.json). Baseline: cudadyn.
+Machine: Intel(R) Core(TM) i9-14900KF (32 threads), GPU NVIDIA GeForce RTX 4070; Node v25.3.0. 8 interleaved rounds; workload both (preset dev-request: 40/40 items from presets/dev-request.eval.json). Baseline: cudadyn.
 
 | variant | lane | options | poc 1q p50/p90 | poc 3q p50/p90 | poc 10q p50/p90 | preset dev-request p50/p90 | all p50 | paired ratio vs base [95 % CI] | arg-max agree | max abs dp | mean abs dp | accuracy |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|

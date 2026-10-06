@@ -154,7 +154,7 @@ HTTP to the sidecar (one Node process, 80-90 ms per call of which 5-23 ms is the
 
 ```powershell
 node skills/laya-decisions/scripts/laya.mjs --preset dev-request "is this valid json {bla: 1}"
-# from anywhere: $env:LAYA_DIR = "W:\Github\LocalLaya"; node <skills-dir>\laya-decisions\scripts\laya.mjs ...
+# from anywhere: $env:LAYA_DIR = "C:\path\to\LocalLaya"; node <skills-dir>\laya-decisions\scripts\laya.mjs ...
 ```
 
 ### Choosing how to call it
@@ -358,8 +358,8 @@ per call, so ~7 calls/s from a shell loop; `ask.mjs --local` one-shot pays the 1
     nothing for the CPU lane (1.03 [0.95, 1.06]), which keeps the pinned, hash-verified HF bundle. Details:
     `results/graph-opt-2026-09-23-summary.md`.
 11. **CUDA lane in a Python process: another 3x, same answers.** `onnxruntime-node` has no CUDA EP on Windows,
-    but the Python wheel has, and Microsoft's release feed for the CUDA 13 build plus NVIDIA's wheel index are
-    reachable where PyPI's file host is not (`npm run cuda:setup`, pinned versions, ~1.6 GiB). `tools/cuda_lane.py`
+    but the Python wheel has, and Microsoft's public release feed for the CUDA 13 build plus NVIDIA's wheel index
+    are usable even where PyPI's file host is not (`npm run cuda:setup`, pinned versions, ~1.6 GiB). `tools/cuda_lane.py`
     holds one CUDA session and answers over stdio; `src/lane.mjs` presents it behind the same handle as the
     worker lanes, with a `RemoteSession` implementing the two methods `@receptron/laya` calls, so nothing of
     the sequence logic is duplicated. The CUDA EP is launch-bound: every call costs **6.0 ms + 21.6 us per
@@ -498,12 +498,12 @@ vendored `@receptron/laya` 0.1.2 is MIT (Receptron), the Laya model weights are 
 
 ## Supply chain / safety
 
-- npm on this machine routes through `packagefeedproxy.microsoft.io`, which does not carry `@receptron/laya`,
-  and `registry.npmjs.org` is blocked at TLS. The exact published tarball 0.1.2 was fetched from jsDelivr,
+- The development machine's npm goes through a corporate package proxy that does not carry `@receptron/laya`
+  (and does not allow direct registry access). The exact published tarball 0.1.2 was fetched from jsDelivr,
   every file's SHA256 checked against jsDelivr's manifest **and** an independent unpkg copy (23/23 match),
   `dist/` audited against the GitHub source (1:1; only network call is `huggingface.co`), and installed from
   `vendor/receptron-laya-0.1.2.tgz` (`vendor/SHA256SUMS`). Runtime deps (`onnxruntime-node` 1.30.0,
-  `@huggingface/tokenizers` 0.2.0) resolve through the proxy.
+  `@huggingface/tokenizers` 0.2.0) resolve from the registry as usual (`package-lock.json` points at `registry.npmjs.org`).
 - Model pinned to HF commit `68f27dfe5a27a54fb2b1fefc432f43f972e90868` (immutable URLs), files verified by
   size + SHA256 against the repo's LFS oids (`src/laya-client.mjs`, `verify-model.mjs`). The library itself
   only compares byte sizes. After the first download loading uses `modelDir`: zero network at start-up.

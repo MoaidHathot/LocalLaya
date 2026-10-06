@@ -102,6 +102,13 @@ export function parseVariant(spec) {
 
 // ---- workload ---------------------------------------------------------------------------------------------------
 const exists = async (p) => access(p).then(() => true, () => false);
+// Label a file for logs and the results/*.md summaries: repo-relative with forward slashes when it is inside the
+// repo, otherwise as given. Keeps absolute machine paths out of committed summaries.
+const REPO_ROOT = path.dirname(PRESETS_DIR);
+function repoRelative(p) {
+  const rel = path.relative(REPO_ROOT, path.resolve(p));
+  return rel && !rel.startsWith("..") && !path.isAbsolute(rel) ? rel.split(path.sep).join("/") : p;
+}
 
 async function presetItems(name) {
   const presets = await loadPresets();
@@ -111,10 +118,11 @@ async function presetItems(name) {
   let source = null;
   if (args.inputs) {
     raw = JSON.parse(await readFile(args.inputs, "utf8"));
-    source = args.inputs;
+    source = repoRelative(args.inputs);
   } else if (await exists(path.join(PRESETS_DIR, `${name}.eval.json`))) {
-    source = path.join(PRESETS_DIR, `${name}.eval.json`);
-    raw = JSON.parse(await readFile(source, "utf8"));
+    const file = path.join(PRESETS_DIR, `${name}.eval.json`);
+    source = repoRelative(file);
+    raw = JSON.parse(await readFile(file, "utf8"));
   } else if (name === DEFAULT_PRESET) {
     const { EVAL_SET, stateFor } = await import("../data/smart-home-eval.mjs");
     source = "data/smart-home-eval.mjs";

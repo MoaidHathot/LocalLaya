@@ -1,8 +1,8 @@
 # CUDA process lane (2026-09-23)
 
 `onnxruntime-node` has no CUDA EP on Windows. The Python wheel has: `onnxruntime-gpu` 1.30.0 (CUDA 13 build) from
-Microsoft's release feed + CUDA 13.2 / cuDNN 9 runtime wheels from NVIDIA's index - both reachable from this
-network, unlike `files.pythonhosted.org`. `tools/cuda_lane.py` holds one CUDA session and answers over stdio;
+Microsoft's public release feed + CUDA 13.2 / cuDNN 9 runtime wheels from NVIDIA's index - both usable even where
+`files.pythonhosted.org` is not. `tools/cuda_lane.py` holds one CUDA session and answers over stdio;
 `src/lane.mjs` `ProcessLane` presents it behind the same handle as the worker lanes, with a `RemoteSession`
 implementing the two methods `@receptron/laya` calls, so tokenising, temperatures and answer formatting stay
 in the vendored library. Setup: `npm run cuda:setup` (pinned versions, `--no-deps`), check: `npm run cuda:check`.

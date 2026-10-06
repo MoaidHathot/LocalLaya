@@ -100,7 +100,7 @@ default), 9 (GitHub Actions, `bench-all` defaults).
   early-serving assertions must tolerate the second lane joining during the call; every sidecar test now
   stops the sidecar in `finally` so one failure does not cascade.
 - **CI**: `.github/workflows/unit-tests.yml` (Ubuntu/Windows x Node 20/22, `ONNXRUNTIME_NODE_INSTALL=skip`).
-  Found on the way: `package-lock.json` resolved URLs pointed at the Microsoft feed proxy, which GitHub cannot
+  Found on the way: `package-lock.json` resolved URLs pointed at the development machine's corporate proxy, which GitHub cannot
   reach - rewritten to `registry.npmjs.org` (npm's `replace-registry-host` keeps it working locally). The
   workflow itself is unverified: no runner here and no `act`.
 - Verification: `npm test` 9/9, `npm run test:router` 7/7 (~35 s), `npm run test:sidecar` 13/13 (~65 s),
@@ -111,10 +111,10 @@ default), 9 (GitHub Actions, `bench-all` defaults).
 
 User challenged the "npm cannot fetch" claim. Checked instead of repeating it:
 
-- Blocked: `registry.npmjs.org` (TLS handshake fails). The proxy `packagefeedproxy.microsoft.io/npm/` returns
+- The development machine's npm goes through a corporate package proxy (no direct registry access). The proxy returns
   404 for **`@receptron/laya` only** - that is the whole reason for `vendor/`. It serves `onnxruntime-node`
   completely: 181 versions, `latest` 1.30.0 (= installed, published 2026-09-14), nightly
-  `1.31.0-dev.20260918`. GitHub (incl. release zips), jsDelivr, unpkg, Hugging Face, PyPI all reachable.
+  `1.31.0-dev.20260918`. GitHub (incl. release zips), jsDelivr, unpkg, Hugging Face, PyPI's index all reachable.
 - So nothing fetchable would make it faster: `@receptron/laya` from the registry is the same bytes, no newer
   `onnxruntime-node` exists, and the CUDA EP is missing from the Windows build of `onnxruntime-node`
   (README matrix, `install-metadata.js`, no CUDA symbols in the binary) - not from any download.
@@ -169,8 +169,8 @@ Numbers worth remembering (updated): `webgpu:fp16` 3 q 32 ms / 30 calls/s / 92 q
 
 ## Phase 8 - the CUDA process lane
 
-- **The real fetch limit, stated precisely this time**: `pypi.org` answers but `files.pythonhosted.org` (every
-  PyPI wheel) and `api.nuget.org` are TLS-blocked. Reachable: Microsoft's ORT release feeds on
+- **The real fetch limit, stated precisely this time**: on the development machine `pypi.org` answers but
+  `files.pythonhosted.org` (every PyPI wheel) is not available. Usable instead: Microsoft's public ORT release feeds on
   `aiinfra.pkgs.visualstudio.com` (`onnxruntime-cuda-13` has `onnxruntime-gpu` 1.30.0 cp312/win_amd64 built for
   CUDA 13; `onnxruntime-cuda-12` only dev builds; `ORT-Nightly` 1.31 dev), NVIDIA's `pypi.nvidia.com` (CUDA 13.x
   runtime wheels un-suffixed: `nvidia-cublas` 13.x etc., plus `nvidia-cudnn-cu13`). Installed with `--no-deps`

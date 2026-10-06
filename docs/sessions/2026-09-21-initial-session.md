@@ -14,8 +14,8 @@ call it as an API, cache all downloads under the project directory. Hardware: i9
 
 - Verified the library API against the GitHub source (`Laya.load` options, `systemOne`, question types,
   cache layout). The plan's API usage was correct.
-- `npm install @receptron/laya` failed: npm routes through a Microsoft feed proxy without the package;
-  `registry.npmjs.org` and `npmmirror` blocked at TLS. Vendored the exact 0.1.2 tarball from jsDelivr,
+- `npm install @receptron/laya` failed: the development machine's npm goes through a corporate package proxy
+  that does not carry the package, and direct registry access is not available. Vendored the exact 0.1.2 tarball from jsDelivr,
   SHA256 per file checked against jsDelivr's manifest and an independent unpkg copy, `dist/` audited
   against source. Installed via `file:vendor/receptron-laya-0.1.2.tgz`.
 - Pinned the model to HF commit `68f27dfe...` and added SHA256 verification against LFS oids (the library
@@ -100,7 +100,7 @@ Asked for a middle ground; chose (via questions): opt-in `--sidecar` flag, 5 min
 - Agent skill `skills/laya-decisions/` (agentskills.io format) with a `scripts/laya.mjs` wrapper resolving
   the project via `LAYA_DIR`; tested from the repo, from a copy elsewhere, and without `LAYA_DIR`.
 
-## Move to `W:\Github\LocalLaya` (2026-09-22)
+## Move to the `LocalLaya` repo (2026-09-22)
 
 - Merged the 9-commit history into the GitHub-created repo (Unlicense + Visual Studio `.gitignore`, with a
   LocalLaya section appended); moved `models/`, `node_modules/`, `.venv/`, `.uv-cache/`, `.laya/`, raw

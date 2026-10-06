@@ -1,6 +1,6 @@
 # A/B: fp32 vs wg vs cuda (2026-09-23T11:15:30.699Z)
 
-Machine: Intel(R) Core(TM) i9-14900KF (32 threads), GPU NVIDIA GeForce RTX 4070; Node v25.3.0. 6 interleaved rounds; workload preset (preset dev-request: 40/40 items from W:\Github\LocalLaya\presets\dev-request.eval.json). Baseline: fp32.
+Machine: Intel(R) Core(TM) i9-14900KF (32 threads), GPU NVIDIA GeForce RTX 4070; Node v25.3.0. 6 interleaved rounds; workload preset (preset dev-request: 40/40 items from presets/dev-request.eval.json). Baseline: fp32.
 
 | variant | lane | options | preset dev-request p50/p90 | all p50 | paired ratio vs base [95 % CI] | arg-max agree | max abs dp | mean abs dp | accuracy |
 |---|---|---|---|---|---|---|---|---|---|
