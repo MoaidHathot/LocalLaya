@@ -1,11 +1,56 @@
-# LocalLaya - Laya on Windows via ONNX Runtime: CLI, sidecar, router, calibration, benchmarks
+# LocalLaya - selectable Laya, Vega-U and multilingual decisions
 
 Runs [Laya](https://huggingface.co/convaiinnovations/laya) (Convai Innovations' non-autoregressive "System 1"
 decision model: typed `choice` / `score` / `noul` answers with probabilities, one forward pass) from Node.js on
 Windows through [`@receptron/laya`](https://github.com/receptron/laya) + `onnxruntime-node`, on an
 i9-14900KF / RTX 4070 / 64 GB box.
 
-Everything downloaded lives under this directory (`models/`, `node_modules/`, `.venv/`, `.uv-cache/`).
+Everything downloaded lives under this directory (`models/`, `node_modules/`, `.venv/`, `.venv-laya/`, `.uv-cache/`).
+
+## Select a model and execution mode
+
+| `--model` | runtime | context per question | execution controls |
+|---|---|---|---|
+| `laya` (default) | original English ONNX + optimised fp16/CUDA Graph lanes | 512 tokens | existing `--lanes`, `--lane`, `--policy`, `--no-graph`; also `--device auto\|cpu\|cuda` |
+| `vega` | Vega-U / Qwen3.5-0.8B through Python Laya | up to 73,728 tokens | `--device auto\|cpu\|cuda`, `--max-len`, `--readout auto\|engine`, `--acceleration auto\|off` |
+| `multilingual` | Laya Multilingual / mmBERT-base through Python Laya, optional TileLang CUDA | up to 8,192 tokens | `--device auto\|cpu\|cuda`, `--max-len`, `--acceleration auto\|off` |
+
+```powershell
+# One-time preparation for the new Python models; .venv-laya is separate from the ONNX .venv.
+npm run python:setup
+npm run vega:setup                          # optional Windows-compatible fused kernels for faster Vega CUDA
+npm run models:download -- --model vega
+npm run models:download -- --model multilingual
+npm run multilingual:setup                 # optional fused Multilingual CUDA kernels + graph replay
+
+node ask.mjs --model vega --device cuda --sidecar --preset triage "Charged twice. Please refund me."
+node ask.mjs --model multilingual --device cpu --local --preset triage "تم خصم المبلغ مرتين"
+node ask.mjs --model laya --lane cuda:fp16 --sidecar "Turn off the living room lights"
+
+# Whole UTF-8 documents, with your own typed questions:
+node ask.mjs --model vega --device cuda --sidecar --text-file document.txt --questions questions.json
+```
+
+`--mode local|sidecar` also selects the call path. The REPL has `/model`, `/device`, `/context` and `/readout`.
+The browser page and `POST /decide` expose the same choices. A sidecar holds one model family at a time;
+switching waits for earlier requests, releases the old backend, then loads the selected one. Model load time
+is separate from inference time. The existing ONNX model still uses its execution-provider router.
+
+Questions/options consume part of each context budget. Python results report actual truncation in
+`usage.truncated` / `state_tokens_dropped`, plus `routing.model`, `device` and `exec`. Preset calibration is
+model-specific. The detailed timing tables below describe the **original ONNX model**.
+
+See **[docs/MODELS.md](docs/MODELS.md)** for setup, API examples, model switching, and runtime details.
+
+Vega CUDA acceleration is automatic when the optional packages are installed: FLA/Triton handles the
+reader's gated-delta attention and causal convolution, and validated CUDA Graphs replay its decision head.
+`--acceleration off` selects the original reference path; `/acceleration` switches it in the REPL.
+The compiled-kernel cache is project-local, and the worker reports the actual path in
+`routing.exec.acceleration`. See [the Vega speed measurements](results/vega-speed-2026-11-17-summary.md).
+
+Multilingual also supports `--acceleration auto|off`: auto uses the upstream TileLang path when its optional
+packages are installed, with an eight-shape CUDA Graph cache; off uses the original eager forward.
+See [the Multilingual speed measurements](results/multilingual-speed-2026-11-17-summary.md).
 
 ## Layout
 
@@ -17,6 +62,8 @@ Everything downloaded lives under this directory (`models/`, `node_modules/`, `.
 | `data/presets.mjs`, `presets/` | built-in question presets (smart-home calibrated; triage, guard, moderation, route, sentiment unmeasured) + your own `presets/<name>.json`; `dev-request` worked example with labelled eval |
 | `poc.mjs` | load once, answer 3 questions in one pass, 10 timed runs, sanity check on contrasting states |
 | `src/laya-client.mjs` | reusable loader: pinned HF revision, project-local cache, SHA256 verification, no network after first download, EP selection, P-core pinning (threads and, on Windows, the process), calibration, `createDecider()` facade |
+| `src/model-router.mjs`, `src/python-backend.mjs`, `tools/laya_worker.py` | explicit model selection, serialized switching, offline Python Laya process for Vega-U / multilingual |
+| `data/python-models.json`, `tools/setup-python.mjs`, `tools/prepare_models.py` | pinned Python versions and model revisions; separate `.venv-laya`, project-local downloads and digest checks |
 | `src/ep-router.mjs` | per-call execution-provider router (`LayaRouter`): probes lanes, predicts latency per (lane, GPU thermal state, question bucket, work), one FIFO queue for all lanes with the lane bound at the front of the queue, contention-aware, quarantines failing lanes, serves from the first lane while the others load |
 | `src/lane.mjs`, `src/lane-worker.mjs`, `tools/cuda_lane.py` | a lane = one Laya session in a worker thread (default), in this thread, or in a Python process (CUDA EP over stdio, CUDA Graph replay on static bucket graphs, finding 12), behind one handle: `systemOne(state, questions, temps, exec)`, `close()`, death notification |
 | `tools/setup-cuda-lane.mjs` | `npm run cuda:setup` / `cuda:check`: onnxruntime-gpu (Microsoft's CUDA 13 feed) + CUDA / cuDNN wheels (NVIDIA's index) into `.venv`, pinned, verified with a CUDA session; `--graphs` pre-generates the static bucket graphs |
@@ -523,7 +570,7 @@ original is `convaiinnovations/laya` (`pip install laya`, Python 3.10+, torch 2.
 | Lowest possible latency on the RTX 4070 | probably original with CUDA (T4 CUDA already matches WebGPU here); not measured |
 | Python-native pipeline | original |
 
-## Known limits / next steps
+## Known limits / next steps for the original ONNX profile
 
 - WebGPU EP is marked experimental by ORT; first call ~180 ms; sporadic calls pay GPU clock ramp-up.
 - CUDA Graph buckets follow the traffic: the first two calls of a never-seen shape run on the dynamic graph (1 q

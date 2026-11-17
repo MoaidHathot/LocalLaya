@@ -10,6 +10,10 @@
  *   node demo/cli.mjs --mode local --lanes cpu:8 "..."                        # no background process, CPU only
  *   node demo/cli.mjs --lane webgpu:fp16 "..."                                # force a lane for this call
  *   node demo/cli.mjs --health | --stats | --presets
+ *   node demo/cli.mjs --model vega --device cuda --mode local --text-file document.txt --questions questions.json
+ *   node demo/cli.mjs --model multilingual --max-len 8192 --preset triage "..."
+ * Models: --model laya|vega|multilingual, --device auto|cpu|cuda, --max-len <tokens>, --readout auto|engine (Vega).
+ * Python model speed: --acceleration auto (default) | off (reference); vega:setup / multilingual:setup install optional kernels.
  *
  * Modes: --mode auto (default: sidecar, spawned on demand, fall back to local) | sidecar | local | http --url <base>.
  * Per-call overrides: --lane <lane>, --policy auto|prefer-gpu|prefer-cpu|min-cpu, --deadline <ms>, --no-graph
@@ -19,10 +23,13 @@
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { createLaya, readInputs, summarize, top } from "./laya.mjs";
+import { MODEL_CLI_OPTIONS, modelArgs } from "../src/models.mjs";
 
 const { values: a, positionals } = parseArgs({
   allowPositionals: true,
   options: {
+    ...MODEL_CLI_OPTIONS,
+    "text-file": { type: "string" },
     preset: { type: "string" },
     questions: { type: "string" },
     state: { type: "string" },
@@ -58,12 +65,13 @@ const jsonArg = (v, what) => {
   }
 };
 
-const text = positionals.join(" ").trim();
+if (a["text-file"] && (positionals.length || a.state || a.file)) throw new Error("--text-file cannot be combined with text, --state or --file");
+const text = a["text-file"] ? readFileSync(a["text-file"], "utf8") : positionals.join(" ").trim();
 if (!a.health && !a.stats && !a.presets && !text && !a.state && !a.file) {
   say("nothing to decide: give a text, --state, or --file (or --health / --stats / --presets); -h for help");
   process.exit(2);
 }
-const opts = {};
+const opts = modelArgs(a);
 if (a.preset) opts.preset = a.preset;
 if (a.questions) opts.questions = jsonArg(a.questions, "--questions");
 if (a.lane) opts.lane = a.lane;
@@ -73,7 +81,7 @@ if (a["no-graph"]) opts.exec = { graph: false };
 
 let laya;
 try {
-  laya = await createLaya({ mode: a.mode, url: a.url, port: a.port ? Number(a.port) : undefined, lanes: a.lanes, log: say });
+  laya = await createLaya({ ...modelArgs(a), mode: a.mode, url: a.url, port: a.port ? Number(a.port) : undefined, lanes: a.lanes, log: say });
 } catch (e) {
   say(`error: ${e.message}`);
   process.exit(1);

@@ -21,7 +21,7 @@
  *
  * decide(input, opts)
  *   input   a string (wrapped by the preset's state template) or { state: <any JSON> }
- *   opts    { preset, questions, lane, policy, deadlineMs, calibration, exec }  (all optional; see references/api.md)
+ *   opts    { preset, questions, model, device, maxLen, readout, lane, policy, deadlineMs, calibration, exec }
  * decideMany(inputs, opts, { concurrency = 4 })   same, for a list; results in input order; the sidecar serves
  *   them one at a time (one queue), concurrency only overlaps the HTTP round trips.
  *
@@ -80,7 +80,7 @@ const toBody = (input, opts = {}) => {
   else if (input && typeof input === "object" && "state" in input) body.state = input.state;
   else if (input && typeof input === "object") body.state = input;
   else throw new Error("decide(): input must be a string or an object");
-  for (const k of ["preset", "questions", "lane", "policy", "deadlineMs", "calibration", "exec"]) if (opts[k] !== undefined) body[k] = opts[k];
+  for (const k of ["preset", "questions", "lane", "policy", "deadlineMs", "calibration", "exec", "model", "device", "maxLen", "readout", "acceleration"]) if (opts[k] !== undefined) body[k] = opts[k];
   return body;
 };
 
@@ -102,6 +102,11 @@ async function mapLimit(items, limit, fn) {
 /**
  * @param {object} [o]
  * @param {"auto"|"sidecar"|"local"|"http"} [o.mode="auto"]
+ * @param {"laya"|"vega"|"multilingual"} [o.model="laya"] explicit model (can also be selected per call)
+ * @param {"auto"|"cpu"|"cuda"} [o.device="auto"] execution device; legacy --lane supports WebGPU / DML too
+ * @param {number} [o.maxLen]           Python context budget, default 73728 (Vega) or 8192 (multilingual)
+ * @param {"auto"|"engine"} [o.readout="auto"] Vega readout
+ * @param {number} [o.timeoutMs=600000] decision timeout for the HTTP client / local Python worker
  * @param {number} [o.port]            sidecar port (default LAYA_PORT or 8787)
  * @param {string} [o.url]             mode "http": base URL of a running server, e.g. http://127.0.0.1:8787
  * @param {string} [o.idle]            sidecar idle exit when this call spawns it (default LAYA_IDLE or "5m")
@@ -112,7 +117,11 @@ async function mapLimit(items, limit, fn) {
  */
 export async function createLaya(o = {}) {
   const mode = o.mode ?? "auto";
+  if (!["auto", "sidecar", "local", "http"].includes(mode)) throw new Error("mode must be auto, sidecar, local or http");
   const log = o.log ?? (() => {});
+  const { modelOptions } = await mod("src/models.mjs");
+  const defaults = modelOptions({ model: process.env.LAYA_MODEL ?? "laya", device: process.env.LAYA_DEVICE ?? "auto", ...o });
+  const bodyFor = (input, opts = {}) => toBody(input, { ...opts, ...modelOptions(opts, defaults) });
   const sidecar = await mod("src/sidecar-client.mjs");
   const port = Number(o.port ?? sidecar.DEFAULT_PORT);
   const progress = (state, ms, health) => {
@@ -124,18 +133,20 @@ export async function createLaya(o = {}) {
   const remote = (client, info) => ({
     mode: info.mode,
     info,
-    decide: async (input, opts) => client.decide(toBody(input, opts)), // async: a bad input rejects instead of throwing synchronously
-    decideMany: async (inputs, opts, { concurrency = 4 } = {}) => mapLimit(inputs, concurrency, (input) => client.decide(toBody(input, opts))),
+    decide: async (input, opts) => client.decide(bodyFor(input, opts)), // async: a bad input rejects instead of throwing synchronously
+    decideMany: async (inputs, opts, { concurrency = 4 } = {}) => mapLimit(inputs, concurrency, (input) => client.decide(bodyFor(input, opts))),
     health: () => client.health(),
     stats: () => client.stats(),
     presets: () => client.presets(),
+    models: () => client.models(),
     close: async () => client.close(),
   });
 
   if (mode === "http") {
     if (!o.url) throw new Error('mode "http" needs url');
     const u = new URL(o.url);
-    const client = sidecar.createClient({ port: Number(u.port || 80), host: u.hostname });
+    if (u.protocol !== "http:" || (u.pathname !== "/" && u.pathname !== "")) throw new Error("http mode needs an http://host:port base URL");
+    const client = sidecar.createClient({ port: Number(u.port || 80), host: u.hostname, timeoutMs: o.timeoutMs });
     const h = await client.health();
     if (h?.service !== "laya") throw new Error(`${o.url} is not a Laya server`);
     return remote(client, { mode: "http", url: o.url, pid: h.pid, lanes: h.lanes });
@@ -143,8 +154,8 @@ export async function createLaya(o = {}) {
 
   if (mode === "auto" || mode === "sidecar") {
     try {
-      const { health } = await sidecar.ensureSidecar({ port, idle: o.idle ?? sidecar.DEFAULT_IDLE, maxAge: o.maxAge, lanes: o.lanes, onProgress: progress });
-      const client = sidecar.createClient({ port });
+      const { health } = await sidecar.ensureSidecar({ ...defaults, port, idle: o.idle ?? sidecar.DEFAULT_IDLE, maxAge: o.maxAge, lanes: o.lanes, onProgress: progress });
+      const client = sidecar.createClient({ port, timeoutMs: o.timeoutMs });
       return remote(client, { mode: "sidecar", url: `http://127.0.0.1:${port}`, pid: health.pid, lanes: health.lanes, lanesLoading: health.lanesLoading ?? [] });
     } catch (e) {
       if (mode === "sidecar") throw e;
@@ -153,26 +164,28 @@ export async function createLaya(o = {}) {
   }
 
   // local: the same request logic as the server, on an in-process router
-  const [{ LayaRouter }, { loadPresets }, { CalibrationCache, decideRequest }] = await Promise.all([mod("src/ep-router.mjs"), mod("data/presets.mjs"), mod("src/decide-core.mjs")]);
+  const [{ ModelRouter }, { loadPresets }, { CalibrationCache, decideRequest }] = await Promise.all([mod("src/model-router.mjs"), mod("data/presets.mjs"), mod("src/decide-core.mjs")]);
   const t0 = performance.now();
-  const router = await LayaRouter.create({
-    lanes: (o.lanes ?? "cuda:fp16,webgpu:fp16,cpu:8").split(","),
+  const router = await ModelRouter.create({
+    ...defaults,
+    ...(o.lanes ? { lanes: o.lanes.split(",") } : {}),
+    timeoutMs: o.timeoutMs,
     waitFor: "first",
     gpuKeepAliveMs: 30_000,
     warmup: { state: { text: "Please turn off the lights in the living room now" }, sizes: [3, 5] },
     log: (m) => log(`  ${m}`),
   });
   log(`model loaded in this process in ${((performance.now() - t0) / 1000).toFixed(1)} s (lanes ${[...router.lanes.keys()].join(", ")})`);
-  const calibration = new CalibrationCache({ root: PROJECT_DIR, override: o.calibration ?? null });
+  const calibration = new CalibrationCache({ root: PROJECT_DIR, override: o.calibration ?? null, overrideModel: defaults.model });
   let presets = await loadPresets();
   const decide = async (input, opts) => {
     presets = await loadPresets();
     try {
-      return await decideRequest(router, toBody(input, opts), presets, calibration);
+      return await decideRequest(router, bodyFor(input, opts), presets, calibration);
     } catch (e) {
       if (e.status === 503) {
         await router.ready; // a forced lane still loading: wait for it, then retry once
-        return decideRequest(router, toBody(input, opts), presets, calibration);
+        return decideRequest(router, bodyFor(input, opts), presets, calibration);
       }
       throw e;
     }
@@ -182,9 +195,10 @@ export async function createLaya(o = {}) {
     info: { mode: "local", lanes: [...router.lanes.keys()], router },
     decide,
     decideMany: (inputs, opts, { concurrency = 4 } = {}) => mapLimit(inputs, concurrency, (input) => decide(input, opts)),
-    health: async () => ({ service: "laya", status: "ready", lanes: [...router.lanes.keys()], lanesLoading: router.pendingLanes, mode: "local" }),
+    health: async () => ({ service: "laya", status: "ready", lanes: [...router.lanes.keys()], lanesLoading: router.pendingLanes, models: router.modelInfo(), mode: "local" }),
     stats: async () => router.stats(),
     presets: async () => Object.fromEntries(Object.entries(await loadPresets()).map(([k, p]) => [k, { description: p.description, source: p.source, questions: p.questions }])),
+    models: async () => router.modelInfo(),
     close: () => router.close(),
   };
 }

@@ -45,6 +45,15 @@ try {
       preset: { type: "string" },
       questions: { type: "string" },
       state: { type: "string" },
+      model: { type: "string" },
+      device: { type: "string" },
+      "max-len": { type: "string" },
+      readout: { type: "string" },
+      acceleration: { type: "string" },
+      mode: { type: "string" },
+      "text-file": { type: "string" },
+      policy: { type: "string" },
+      "no-graph": { type: "boolean" },
       lane: { type: "string" },
       lanes: { type: "string" },
       calibration: { type: "string" },
@@ -68,16 +77,16 @@ try {
 const { values: a, positionals } = parsed;
 const text = positionals.join(" ").trim();
 const lifecycle = a.status || a.stop || a.start || a.help;
-const oneShot = !lifecycle && !a.local && !a.pretty && (text || a.state);
+const oneShot = !lifecycle && !a.local && !a.pretty && !a.mode && !a["text-file"] && (text || a.state);
 
 /** Everything the fast path does not cover goes to ask.mjs in the project directory (same exit codes). */
 function delegate(extra = []) {
   const passthrough = argv.filter((x) => x !== "--pretty");
   const finalArgs = ["ask.mjs", ...passthrough, ...extra];
   if (!lifecycle) {
-    if (!a.local && !a.sidecar && !extra.includes("--local")) finalArgs.push("--sidecar");
+    if (!a.local && !a.sidecar && !a.mode && !extra.includes("--local")) finalArgs.push("--sidecar");
     // one-shot answers as JSON unless --pretty; the REPL (no text / state) stays human-readable
-    if (!a.pretty && !a.json && (text || a.state)) finalArgs.push("--json");
+    if (!a.pretty && !a.json && (text || a.state || a["text-file"])) finalArgs.push("--json");
   }
   const child = spawn(process.execPath, finalArgs, { cwd: projectDir, stdio: "inherit", windowsHide: true });
   child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
@@ -91,6 +100,7 @@ if (!oneShot) {
   delegate();
 } else {
   const sidecar = await import(pathToFileURL(path.join(projectDir, "src", "sidecar-client.mjs")).href);
+  const { modelArgs, modelOptions } = await import(pathToFileURL(path.join(projectDir, "src", "models.mjs")).href);
   const port = Number(a.port ?? sidecar.DEFAULT_PORT);
   const idle = a.idle ?? sidecar.DEFAULT_IDLE;
   const maxAge = a["max-age"] ?? process.env.LAYA_MAX_AGE;
@@ -102,7 +112,10 @@ if (!oneShot) {
       process.exit(2);
     }
   };
-  const body = {};
+  const selection = modelOptions({ model: process.env.LAYA_MODEL ?? "laya", device: process.env.LAYA_DEVICE ?? "auto", ...modelArgs(a) });
+  const body = { ...selection };
+  if (a.policy) body.policy = a.policy;
+  if (a["no-graph"]) body.exec = { graph: false };
   if (a.preset) body.preset = a.preset;
   if (a.state) body.state = jsonArg(a.state, "--state");
   else body.text = text;
@@ -118,7 +131,7 @@ if (!oneShot) {
     else if (state === "ready") console.error(`  sidecar ready in ${(ms / 1000).toFixed(1)} s (pid ${health?.pid}, lanes ${health?.lanes?.join(", ")})`);
   };
   try {
-    await sidecar.ensureSidecar({ port, idle, maxAge, lanes: a.lanes, onProgress: progress });
+    await sidecar.ensureSidecar({ ...selection, port, idle, maxAge, lanes: a.lanes, onProgress: progress });
     const r = await sidecar.decide(body, { port });
     process.stdout.write(JSON.stringify({ state: r.state, answers: r.answers, usage: r.usage, routing: r.routing, backend: "remote" }, null, 2) + "\n");
     process.exit(0);
@@ -128,7 +141,7 @@ if (!oneShot) {
       console.error(`error: ${e.message}`);
       process.exit(/preset/.test(e.message) || /question/.test(e.message) ? 2 : 1);
     }
-    if (e?.code === "SERVER_ERROR") {
+    if (e?.code === "SERVER_ERROR" || e?.code === "MODEL_UNSUPPORTED") {
       console.error(`error: ${e.message}`);
       process.exit(1);
     }

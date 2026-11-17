@@ -2,13 +2,13 @@
  * The request -> decision logic shared by serve.mjs (HTTP) and demo/laya.mjs (in-process "local" mode), so both
  * accept the same body and return the same shape:
  *
- *   body: { text?, state?, preset?, questions?, lane?, policy?, deadlineMs?, calibration?, exec? }
+ *   body: { text?, state?, preset?, questions?, model?, device?, maxLen?, readout?, lane?, policy?, deadlineMs?, calibration?, exec? }
  *   ->    { answers, usage, routing, state, questions, preset, calibration }
  *
  * - `text` is wrapped by the preset's state template; `state` is used verbatim.
  * - `questions` replaces the preset's question set (validated here, before the model sees them).
  * - the calibration table is, in order: the request's `calibration.temperature_by_options`, else the
- *   per-preset file calibration/<preset>.json (re-read when its mtime changes), else the shipped temperatures.
+ *   model-scoped per-preset file (re-read when its mtime changes), else the shipped temperatures.
  * - `lane` / `policy` / `deadlineMs` / `exec` are the router's per-call overrides (see ep-router.mjs).
  * Errors carry `status` (400 for bad input, 503 for a lane still loading) so an HTTP layer can map them.
  */
@@ -16,6 +16,7 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_PRESET } from "../data/presets.mjs";
+import { modelOptions } from "./models.mjs";
 
 export const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const POLICIES = ["auto", "prefer-gpu", "prefer-cpu", "min-cpu"];
@@ -34,24 +35,27 @@ export function validateQuestions(q) {
 
 /** Per-preset calibration tables, re-read when the file changes. `override` = one table for every preset (--calibration). */
 export class CalibrationCache {
-  constructor({ root = PROJECT_ROOT, override = null } = {}) {
+  constructor({ root = PROJECT_ROOT, override = null, overrideModel = "laya" } = {}) {
     this.root = root;
     this.override = override;
+    this.overrideModel = overrideModel;
     this.cache = new Map(); // preset -> { file, mtimeMs, table }
   }
-  async for(presetName) {
-    const file = path.resolve(this.root, this.override ?? `calibration/${presetName}.json`);
+  async for(presetName, model = "laya") {
+    if (model === "vega") return null;
+    const key = `${model}:${presetName}`;
+    const file = path.resolve(this.root, (model === this.overrideModel ? this.override : null) ?? `calibration/${model === "laya" ? "" : `${model}/`}${presetName}.json`);
     let mtimeMs;
     try {
       mtimeMs = (await stat(file)).mtimeMs;
     } catch {
-      this.cache.delete(presetName);
+      this.cache.delete(key);
       return null;
     }
-    const cached = this.cache.get(presetName);
+    const cached = this.cache.get(key);
     if (cached && cached.file === file && cached.mtimeMs === mtimeMs) return cached.table;
     const table = { ...JSON.parse(await readFile(file, "utf8")), file: path.relative(this.root, file).replace(/\\/g, "/") };
-    this.cache.set(presetName, { file, mtimeMs, table });
+    this.cache.set(key, { file, mtimeMs, table });
     return table;
   }
 }
@@ -64,7 +68,9 @@ export class CalibrationCache {
  * @param {CalibrationCache} calibration
  */
 export async function decideRequest(router, body, presets, calibration) {
-  if (!body || typeof body !== "object") throw httpError(400, "request body must be a JSON object");
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw httpError(400, "request body must be a JSON object");
+  const selection = router.selection ? router.selection(body) : modelOptions(body);
+  if (!router.selection && (selection.model !== "laya" || selection.device !== "auto")) throw httpError(400, "model/device selection requires ModelRouter; this router only serves the original Laya lanes");
   const presetName = body.preset ?? DEFAULT_PRESET;
   const preset = presets[presetName];
   if (!preset || preset.invalid) throw httpError(400, preset?.invalid ? `preset ${presetName} is invalid: ${preset.description}` : `unknown preset ${presetName}; have ${Object.keys(presets).join(", ")}`);
@@ -74,9 +80,10 @@ export async function decideRequest(router, body, presets, calibration) {
   if (body.state !== undefined) state = body.state;
   else if (typeof body.text === "string" && body.text.trim()) state = preset.state(body.text.trim());
   else throw httpError(400, "provide text (string) or state (any JSON)");
-  const opts = { calibration: body.calibration?.temperature_by_options ? { temperature_by_options: body.calibration.temperature_by_options, file: body.calibration.file ?? "request" } : await calibration.for(presetName) };
+  if (body.calibration != null && (!body.calibration.temperature_by_options || typeof body.calibration.temperature_by_options !== "object" || Array.isArray(body.calibration.temperature_by_options))) throw httpError(400, "calibration needs a temperature_by_options object");
+  const opts = { ...selection, calibration: body.calibration === null ? null : body.calibration?.temperature_by_options ? { temperature_by_options: body.calibration.temperature_by_options, file: body.calibration.file ?? "request" } : await calibration.for(presetName, selection.model) };
   if (body.lane) {
-    if (!router.lanes.has(body.lane)) {
+    if (!router.selection && !router.lanes.has(body.lane)) {
       if (router.pendingLanes.includes(body.lane)) throw httpError(503, `lane ${body.lane} is still loading`, { retryAfterMs: 500 });
       throw httpError(400, `lane ${body.lane} not loaded; have ${[...router.lanes.keys()].join(", ")}`);
     }

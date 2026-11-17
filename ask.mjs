@@ -14,6 +14,8 @@
  *   node ask.mjs --json "..."                                          # full JSON (answers, usage, routing)
  *   node ask.mjs                                                       # interactive REPL (/help)
  *   node ask.mjs --sidecar                                             # REPL over the sidecar (kept alive while open)
+ *   node ask.mjs --model vega --device cuda --sidecar --text-file document.txt --questions questions.json
+ *   node ask.mjs --model multilingual --device cpu --max-len 8192 "..."
  *
  * Where the model runs:
  *   default / --local     load the model in this process, answer, exit. Simple; N concurrent callers = N copies.
@@ -25,6 +27,13 @@
  *   --stop                stop the sidecar gracefully
  *
  * Options:
+ *   --model <name>        laya (existing ONNX, default) | vega (73,728 tokens) | multilingual (8,192)
+ *   --device <name>       auto (default) | cpu | cuda; --lane selects other legacy ONNX providers
+ *   --max-len <tokens>    Python model context budget; includes question/options (defaults to the model's limit)
+ *   --readout <name>      Vega: auto (default) | engine
+ *   --acceleration <mode> Python models: auto (available fused CUDA kernels/graphs) | off (eager reference)
+ *   --mode <name>         local | sidecar; equivalent to --local / --sidecar
+ *   --text-file <file>    read a UTF-8 document as the preset's text input
  *   --preset <name>       smart-home (default) | triage | guard | moderation | route | sentiment | presets/*.json
  *   --questions <file|json>  JSON question set, replaces the preset's questions
  *   --state <file|json>   JSON state, replaces the preset's text wrapper (text arguments are ignored)
@@ -51,10 +60,14 @@ import { parseArgs } from "node:util";
 import { formatAnswers, formatHeader, colors as c } from "./src/format.mjs";
 import { loadPresets, presetToJson, savePreset, PRESETS_DIR, DEFAULT_PRESET } from "./data/presets.mjs";
 import * as sidecar from "./src/sidecar-client.mjs";
+import { MODEL_CLI_OPTIONS, MODELS, modelArgs, modelOptions } from "./src/models.mjs";
 
 const { values: args, positionals } = parseArgs({
   allowPositionals: true,
   options: {
+    ...MODEL_CLI_OPTIONS,
+    mode: { type: "string" },
+    "text-file": { type: "string" },
     preset: { type: "string", default: DEFAULT_PRESET },
     questions: { type: "string" },
     state: { type: "string" },
@@ -83,13 +96,19 @@ if (args.help) {
 const color = !args["no-color"] && stdout.isTTY;
 const say = (s) => stderr.write(`${s}\n`);
 const dim = (s) => (color ? c.dim(s) : s);
-const text = positionals.join(" ").trim();
+if (args.mode && !["local", "sidecar"].includes(args.mode)) throw new Error("--mode must be local or sidecar (demo/cli.mjs also supports http)");
+if ((args.local && args.mode === "sidecar") || (args.sidecar && args.mode === "local")) throw new Error("choose one execution mode: local or sidecar");
+if (args["text-file"] && (positionals.length || args.state)) throw new Error("--text-file cannot be combined with text arguments or --state");
+const text = args["text-file"] ? await readFile(args["text-file"], "utf8") : positionals.join(" ").trim();
+const initialSelection = modelOptions({ model: process.env.LAYA_MODEL ?? "laya", device: process.env.LAYA_DEVICE ?? "auto", ...modelArgs(args),
+  ...(args.lane ? { lane: args.lane } : {}), ...(args.policy ? { policy: args.policy } : {}), ...(args["no-graph"] ? { exec: { graph: false } } : {}), ...(args.calibration ? { calibration: args.calibration } : {}) });
+let selection = initialSelection;
 const port = Number(args.port ?? sidecar.DEFAULT_PORT);
 const idle = args.idle ?? sidecar.DEFAULT_IDLE;
 const maxAge = args["max-age"] ?? process.env.LAYA_MAX_AGE;
 const envSidecar = /^(1|true|yes|on)$/i.test(process.env.LAYA_SIDECAR ?? "");
-const useSidecar = !args.local && (args.sidecar || envSidecar);
-const interactive = !text && !args.state && !args.start && !args.status && !args.stop;
+const useSidecar = !args.local && args.mode !== "local" && (args.sidecar || args.mode === "sidecar" || envSidecar);
+const interactive = !text && !args.state && !args["text-file"] && !args.start && !args.status && !args.stop;
 
 // ---- lifecycle commands ----------------------------------------------------------------------------------------
 if (args.status) {
@@ -114,11 +133,11 @@ if (args.stop) {
 }
 if (args.start) {
   try {
-    const { health, spawned } = await sidecar.ensureSidecar({ port, idle, maxAge, lanes: args.lanes, calibration: args.calibration, onProgress: progress });
+    const { health, spawned } = await sidecar.ensureSidecar({ ...selection, port, idle, maxAge, lanes: args.lanes, calibration: args.calibration, onProgress: progress });
     // --start is for programs that will call HTTP directly: report the full lane set, not just the first one serving
     const h = health.lanesLoading?.length ? await sidecar.waitAllLanes({ port }) : health;
     if (!spawned && args.lanes && h.lanes.join(",") !== args.lanes) say(dim(`note: sidecar already running with lanes ${h.lanes.join(",")}; --lanes ignored`));
-    stdout.write(`${JSON.stringify({ url: `http://127.0.0.1:${port}`, pid: h.pid, lanes: h.lanes, idleS: h.idleS, spawned })}\n`);
+    stdout.write(`${JSON.stringify({ url: `http://127.0.0.1:${port}`, pid: h.pid, lanes: h.lanes, models: h.models, idleS: h.idleS, spawned })}\n`);
     process.exit(0);
   } catch (e) {
     say(`${c.red("error:")} ${e.message}`);
@@ -144,9 +163,12 @@ if (!PRESETS[args.preset] || PRESETS[args.preset].invalid) {
 
 // calibration table per preset: --calibration for the initial preset, else calibration/<preset>.json if present
 const calibrationCache = new Map();
-async function calibrationFor(name) {
-  if (calibrationCache.has(name)) return calibrationCache.get(name);
-  const rel = name === args.preset && args.calibration ? args.calibration : `calibration/${name}.json`;
+async function calibrationFor(name, model = selection.model) {
+  if (model === "vega") return null;
+  const key = `${model}:${name}`;
+  if (calibrationCache.has(key)) return calibrationCache.get(key);
+  const explicit = model === initialSelection.model && name === args.preset && args.calibration;
+  const rel = explicit ? args.calibration : `calibration/${model === "laya" ? "" : `${model}/`}${name}.json`;
   const file = path.resolve(sidecar.PROJECT_ROOT, rel);
   let table = null;
   try {
@@ -154,9 +176,9 @@ async function calibrationFor(name) {
     const t = JSON.parse(await readFile(file, "utf8"));
     table = { temperature_by_options: t.temperature_by_options, file: rel.replace(/\\/g, "/") };
   } catch {
-    if (name === args.preset && args.calibration) throw new Error(`calibration file not found: ${file}`);
+    if (explicit) throw new Error(`calibration file not found: ${file}`);
   }
-  calibrationCache.set(name, table);
+  calibrationCache.set(key, table);
   return table;
 }
 
@@ -176,18 +198,18 @@ let calibration = await calibrationFor(presetName);
 
 // ---- backends --------------------------------------------------------------------------------------------------
 async function localBackend() {
-  const lanes = (args.lanes ?? (interactive ? "cuda:fp16,webgpu:fp16,cpu:8" : "cuda:fp16,webgpu:fp16")).split(",");
+  const lanes = (args.lanes ?? (selection.device === "cpu" ? "cpu:8" : selection.device === "cuda" ? "cuda:fp16" : interactive ? "cuda:fp16,webgpu:fp16,cpu:8" : "cuda:fp16,webgpu:fp16")).split(",");
   const t0 = performance.now();
-  say(dim(`loading ${lanes.join(" + ")} in this process ...`));
-  const { LayaRouter } = await import("./src/ep-router.mjs"); // lazy: pulls in onnxruntime
+  say(dim(`loading ${selection.model} (${selection.device})${selection.model === "laya" ? `: ${lanes.join(" + ")}` : " through Python Laya"} ...`));
+  const { ModelRouter } = await import("./src/model-router.mjs");
   // one-shot: answer from whichever lane is ready first, no background sampling; REPL: full router + GPU keep-alive (sporadic calls)
-  const router = await LayaRouter.create({ lanes, waitFor: interactive ? "all" : "first", sampleLoad: interactive, gpuKeepAliveMs: interactive ? 30_000 : 0, log: (m) => say(dim(`  ${m}`)) });
+  const router = await ModelRouter.create({ ...selection, ...(args.lanes ? { lanes } : !interactive ? { legacyDefaultLanes: ["cuda:fp16", "webgpu:fp16"] } : {}), waitFor: interactive ? "all" : "first", sampleLoad: interactive, gpuKeepAliveMs: interactive ? 30_000 : 0, log: (m) => say(dim(`  ${m}`)) });
   if (interactive) await router.warmup({ state: preset.state("Please turn off the lights in the living room now"), sizes: [Object.keys(questions).length] });
   say(dim(`ready in ${((performance.now() - t0) / 1000).toFixed(1)} s; lanes: ${[...router.lanes.keys()].join(", ")}`));
   return {
     kind: "local",
     via: "in-process",
-    lanes: [...router.lanes.keys()],
+    get lanes() { return [...router.lanes.keys()]; },
     decide: (state, qs, o) => router.decide(state, qs, o),
     stats: async () => router.stats(),
     close: () => router.close(),
@@ -195,7 +217,7 @@ async function localBackend() {
 }
 
 async function remoteBackend() {
-  const { health, spawned } = await sidecar.ensureSidecar({ port, idle, maxAge, lanes: args.lanes, calibration: args.calibration, onProgress: progress });
+  const { health, spawned } = await sidecar.ensureSidecar({ ...selection, port, idle, maxAge, lanes: args.lanes, calibration: args.calibration, onProgress: progress });
   if (!spawned && args.lanes && health.lanes.join(",") !== args.lanes) say(dim(`note: sidecar already running with lanes ${health.lanes.join(",")}; --lanes ignored`));
   let keepAlive = null;
   if (interactive && health.idleS > 0) {
@@ -214,7 +236,7 @@ async function remoteBackend() {
       return this.lanes;
     },
     decide: async (state, qs, o) => {
-      const r = await sidecar.decide({ state, questions: qs, preset: presetName, lane: o.lane, policy: o.policy, exec: o.exec, calibration: o.calibration ?? undefined }, { port });
+      const r = await sidecar.decide({ state, questions: qs, preset: presetName, ...o }, { port });
       return { answers: r.answers, usage: r.usage, routing: r.routing };
     },
     stats: () => sidecar.stats({ port }),
@@ -229,6 +251,7 @@ if (useSidecar) {
   try {
     backend = await remoteBackend();
   } catch (e) {
+    if (args.mode === "sidecar" || e.code === "MODEL_UNSUPPORTED") throw e;
     say(`${c.yellow("warning:")} sidecar unavailable (${e.code ?? "error"}: ${String(e.message).split("\n")[0]}); falling back to in-process`);
     if (e.code !== "FOREIGN_PORT") say(dim(`  log: ${sidecar.logFileFor(port)}`));
     backend = await localBackend();
@@ -239,7 +262,8 @@ if (useSidecar) {
 say(dim(`preset ${presetName}${calibration ? ` (calibration ${calibration.file})` : " (shipped temperatures)"}; ${backend.via}`));
 
 async function ask(state, shownText) {
-  const result = await backend.decide(state, questions, { ...(forcedLane ? { lane: forcedLane } : {}), ...(args.policy ? { policy: args.policy } : {}), ...(args["no-graph"] ? { exec: { graph: false } } : {}), calibration });
+  const legacy = selection.model === "laya";
+  const result = await backend.decide(state, questions, { ...selection, ...(legacy && forcedLane ? { lane: forcedLane } : {}), ...(legacy && args.policy ? { policy: args.policy } : {}), ...(legacy && args["no-graph"] ? { exec: { graph: false } } : {}), calibration });
   lastState = state;
   lastText = shownText;
   if (jsonOut) {
@@ -267,6 +291,12 @@ if (!interactive) {
 const HELP = `
 Type a message and press Enter: it becomes the state, the current questions are answered.
 Commands:
+  /model laya|vega|multilingual  select a model (loaded on the next question; releases the previous model)
+  /device auto|cpu|cuda      select the execution device
+  /context <tokens>         Python model context budget
+  /readout auto|engine      Vega readout (auto uses the engine until fitted heads are installed)
+  /acceleration auto|off    Python model acceleration (off = original PyTorch reference path)
+  /models                   show model choices and current selection
   /preset <name>            switch question set + state wrapper (${Object.keys(PRESETS).join(", ")})
   /presets                  list presets (built-in and presets/*.json|*.mjs)
   /save <name> [description]  save the current questions + state wrapper as presets/<name>.json
@@ -294,6 +324,24 @@ async function command(line) {
   const [cmd, ...restArr] = line.slice(1).split(" ");
   const rest = restArr.join(" ").trim();
   switch (cmd) {
+    case "models":
+      for (const [id, info] of Object.entries(MODELS)) stdout.write(`  ${id.padEnd(14)} ${info.maxLen} tokens  ${info.name}\n`);
+      stdout.write(`  selected: ${JSON.stringify(selection)}\n`);
+      break;
+    case "model":
+    case "device":
+    case "context":
+    case "readout":
+    case "acceleration": {
+      try {
+        const next = cmd === "model" ? { model: rest, device: selection.device } : { ...selection, [cmd === "context" ? "maxLen" : cmd]: cmd === "context" ? Number(rest) : rest };
+        selection = modelOptions(next);
+        forcedLane = undefined;
+        calibration = await calibrationFor(presetName);
+        stdout.write(`selected: ${JSON.stringify(selection)}; applies on the next question\n`);
+      } catch (e) { stdout.write(`${e.message}\n`); }
+      break;
+    }
     case "help":
       stdout.write(HELP + "\n");
       break;

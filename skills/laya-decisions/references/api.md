@@ -3,7 +3,42 @@
 All commands run in the LocalLaya project directory (or through `scripts/laya.mjs`, which resolves it via
 `LAYA_DIR` or its own location).
 
-## Which path to call (measured on the reference machine, sidecar warm, CUDA lane)
+## Model selection (LocalLaya 0.7)
+
+Select `--model laya` (default, original 512-token ONNX), `--model vega` (73,728-token Vega-U through Python
+Laya), or `--model multilingual` (8,192-token mmBERT). `--device auto|cpu|cuda` selects execution;
+`--max-len <tokens>` sets the Python context budget, and `--readout auto|engine` selects Vega's readout.
+`--text-file <path>` reads one UTF-8 document. `--mode local|sidecar` selects the call path explicitly;
+the demo library/CLI additionally support `http` and `auto`.
+
+Preparation: `npm run python:setup`, then `npm run models:download -- --model vega` / `--model multilingual`.
+For faster Vega CUDA, run `npm run vega:setup` once. `--acceleration auto` (default) uses available fused
+FLA/Triton kernels and validated head CUDA Graphs; `--acceleration off` restores the reference path.
+HTTP/library calls use `acceleration: "auto"|"off"`. Multilingual supports the same control since 0.9,
+using the upstream TileLang backend (`npm run multilingual:setup`). It is distinct from Vega's readout.
+The actual path and graph counts are in `routing.exec.acceleration`. First-use compilation/capture is
+amortized by repeated calls. A server older than 0.8 needs a restart to accept acceleration selection.
+Multilingual acceleration needs a 0.9 server; older servers are rejected instead of ignoring the setting.
+Python uses `.venv-laya` (`LAYA_MODEL_PYTHON`), independently of the ONNX `.venv` (`LAYA_PYTHON`).
+`LAYA_MODEL` / `LAYA_DEVICE` supply default choices. See `docs/MODELS.md` in the project for details.
+
+HTTP `/decide` accepts `model`, `device`, `maxLen`, and `readout`. `/models` and `/health.models` show defaults,
+active selection, loading model and available profiles. A sidecar holds one model family at a time and
+serializes switches with requests; model/device/context changes release the previous backend.
+The original `lane`, `policy`, `deadlineMs` and `exec.graph` controls are for `model: "laya"` only.
+
+Results add `routing.model`, `backend`, `device`, `contextTokens`, and (on a switch) `loadMs`.
+Python `routing.exec` reports `torch-eager`, device, readout (Vega), peak allocated VRAM and CPU fallback.
+Python `usage.truncated`, `state_tokens_dropped` and `truncated_questions` describe actual truncation;
+`input_tokens` sums question rows, so exceeding the context in that sum does not imply truncation.
+All models expose `score` as the expected ordinal level; Vega also retains `selected_level` and its native
+prediction sets / abstention / routing fields.
+
+English preset calibrations apply only to `laya`. Multilingual tables belong in
+`calibration/multilingual/<preset>.json`; Vega uses its own checkpoint calibration and refuses those tables.
+Explicit `calibration: null` uses shipped values. A pre-0.7 server must be restarted for model selection.
+
+## Which path to call (original ONNX model, reference machine, sidecar warm, CUDA lane)
 
 | caller | path | per decision |
 |---|---|---|

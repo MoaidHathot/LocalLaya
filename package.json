@@ -1,8 +1,8 @@
 {
   "name": "local-laya",
-  "version": "0.6.0",
+  "version": "0.9.0",
   "private": true,
-  "description": "PoC, benchmarks, calibration tooling and execution-provider router for Laya (ONNX port, @receptron/laya) on Windows",
+  "description": "Selectable local Laya ONNX, Vega-U and multilingual decisions, with CLI, sidecar, calibration and benchmarks",
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -25,13 +25,21 @@
     "fp16:check": "node experiments/ab.mjs --variant fp32=webgpu --variant fp16=webgpu:fp16 --variant cuda=cuda:fp16 --rounds 4",
     "cuda:setup": "node tools/setup-cuda-lane.mjs",
     "cuda:check": "node tools/setup-cuda-lane.mjs --check",
-    "test": "node --test test/unit.test.mjs",
+    "python:setup": "node tools/setup-python.mjs",
+    "python:check": "node tools/setup-python.mjs --check",
+    "vega:setup": "node tools/setup-python.mjs --accelerate",
+    "vega:check": "node tools/setup-python.mjs --accelerate --check",
+    "multilingual:setup": "node tools/setup-python.mjs --multilingual-fast",
+    "multilingual:check": "node tools/setup-python.mjs --multilingual-fast --check",
+    "models:download": "node tools/setup-python.mjs --download",
+    "test": "node --test test/unit.test.mjs test/model-router.test.mjs",
     "test:router": "node --test --test-concurrency=1 test/router.test.mjs",
     "test:cuda": "node --test --test-concurrency=1 test/cuda-lane.test.mjs",
     "test:sidecar": "node --test --test-concurrency=1 test/sidecar.test.mjs",
     "test:demo": "node --test --test-concurrency=1 test/demo.test.mjs",
+    "test:models": "node --test --test-concurrency=1 test/models.test.mjs",
     "demo": "node demo/run-all.mjs",
-    "test:all": "node --test test/unit.test.mjs && node --test --test-concurrency=1 test/router.test.mjs && node --test --test-concurrency=1 test/cuda-lane.test.mjs && node --test --test-concurrency=1 test/sidecar.test.mjs && node --test --test-concurrency=1 test/demo.test.mjs"
+    "test:all": "npm test && node --test --test-concurrency=1 test/router.test.mjs && node --test --test-concurrency=1 test/cuda-lane.test.mjs && node --test --test-concurrency=1 test/sidecar.test.mjs && node --test --test-concurrency=1 test/demo.test.mjs"
   },
   "dependencies": {
     "@receptron/laya": "file:vendor/receptron-laya-0.1.2.tgz"

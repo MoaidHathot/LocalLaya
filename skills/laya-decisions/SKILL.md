@@ -5,13 +5,13 @@ license: Unlicense (this project). Vendored @receptron/laya is MIT; Laya model w
 compatibility: Requires Node.js 20+ and a checkout of the LocalLaya project (github.com/MoaidHathot/LocalLaya) with the model downloaded (first run fetches 1.7 GB). Tested on Windows 11 with an NVIDIA GPU (fastest with the optional CUDA lane, `npm run cuda:setup`); works CPU-only. Binds 127.0.0.1 only.
 metadata:
   author: moaid
-  version: "1.2"
+  version: "1.5"
   project: LocalLaya (set LAYA_DIR to its checkout path when this skill lives elsewhere)
 ---
 
 # Laya decisions
 
-Laya is a 421M-parameter encoder that answers **typed questions about a state** in one forward pass:
+The default Laya is a 421M-parameter encoder that answers **typed questions about a state** in one forward pass:
 
 | type | you give | you get |
 |---|---|---|
@@ -29,6 +29,18 @@ From anywhere, via the wrapper (finds the project through `LAYA_DIR` or its own 
 ```powershell
 node scripts/laya.mjs --preset triage "Charged twice. Refund today or I cancel."
 ```
+
+Select another prepared model with `--model vega` (Vega-U, up to 73,728 tokens) or
+`--model multilingual` (Laya Multilingual, up to 8,192). Both use the project's separate Python runtime;
+setup is `npm run python:setup` then `npm run models:download -- --model <name>`.
+Use `--device auto|cpu|cuda`, `--max-len <tokens>`, and `--text-file document.txt` for long inputs.
+`--local` runs a private model process; the default wrapper uses the shared sidecar. A sidecar switches
+models on demand and releases the previous backend. The timings below apply to default ONNX Laya.
+Check `routing.model` / `device` and `usage.truncated`; calibration from the English model does not transfer.
+Vega CUDA supports `--acceleration auto|off`. Auto uses optional fused kernels (`npm run vega:setup`) and
+validated head CUDA Graphs; off is the reference path. See `routing.exec.acceleration` for what ran.
+Multilingual supports the same switch with its optional TileLang backend (`npm run multilingual:setup`).
+CPU and `off` use eager execution; the input context remains 8,192 tokens.
 
 - The wrapper talks to one shared background instance (the *sidecar*) and prints one JSON object on stdout:
   `{ state, answers, usage, routing, backend }`. Progress and warnings go to stderr. Exit code 0 on success,
@@ -83,8 +95,9 @@ Use for: intent and task classification, ticket/department routing, urgency or s
 model tier or tool should handle a request, filtering before an expensive step.
 
 Do not use for: generating or rewriting text; facts or explanations; anything a parser can answer exactly
-(valid JSON? contains a URL? - use code); more than ~20 options in one question; non-English text (English
-checkpoint only); states longer than ~300 tokens (truncated).
+(valid JSON? contains a URL? - use code). The default English ONNX checkpoint has a small shared question/state
+budget and is unsuitable for non-English text or long documents; explicitly choose `multilingual` or `vega`
+for those. Large option sets and unfamiliar domains require their own evaluation.
 
 Accuracy is domain dependent and mediocre zero-shot: measured 0.72 on smart-home intent, 0.75 / 0.85 on
 dev-request task / language, coin-flip on some yes/no questions that were then removed. Ad-hoc questions you

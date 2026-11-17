@@ -8,6 +8,10 @@
  *   node serve.mjs --sidecar               # spawned by ask.mjs: --idle defaults to $LAYA_IDLE or 5m
  *   node serve.mjs --max-age 12h           # recycle: exit (once nothing is in flight) after this long; the next call spawns a fresh one
  *   node serve.mjs --port 9000 --lanes webgpu:fp16,cpu:8     # default cuda:fp16,webgpu:fp16,cpu:8 (cuda dropped without the venv)
+ *   node serve.mjs --model vega --device cuda              # Vega-U through Python Laya, 73,728 tokens
+ *   node serve.mjs --model multilingual --device cpu --max-len 8192
+ *   POST /decide may select model, device, maxLen, readout (Vega: auto|engine), acceleration (Python models: auto|off).
+ *   A model switch releases the previous backend. GET /models lists choices; /health reports the active one.
  *   node serve.mjs --calibration calibration/smart-home-v3.json   # one table for every preset (default: per preset,
  *                                                                 # calibration/<preset>.json when present)
  *   node serve.mjs --cors                  # allow browser pages from other origins to call the API (off by default)
@@ -51,7 +55,8 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { LayaRouter } from "./src/ep-router.mjs";
+import { ModelRouter } from "./src/model-router.mjs";
+import { MODEL_CLI_OPTIONS, modelArgs, modelOptions, MODELS } from "./src/models.mjs";
 import { loadPresets, DEFAULT_PRESET, describePresets, PRESETS_DIR } from "./data/presets.mjs";
 import { parseDuration } from "./src/sidecar-client.mjs";
 import { CalibrationCache, decideRequest } from "./src/decide-core.mjs";
@@ -61,9 +66,12 @@ const VERSION = JSON.parse(await readFile(path.join(PROJECT_ROOT, "package.json"
 
 const { values: args } = parseArgs({
   options: {
+    ...MODEL_CLI_OPTIONS,
+    model: { type: "string", default: process.env.LAYA_MODEL ?? "laya" },
+    device: { type: "string", default: process.env.LAYA_DEVICE ?? "auto" },
     port: { type: "string", default: process.env.LAYA_PORT ?? "8787" },
     host: { type: "string", default: "127.0.0.1" },
-    lanes: { type: "string", default: process.env.LAYA_LANES ?? "cuda:fp16,webgpu:fp16,cpu:8" },
+    lanes: { type: "string", default: process.env.LAYA_LANES },
     calibration: { type: "string" },
     cors: { type: "boolean", default: false },
     idle: { type: "string" },
@@ -75,6 +83,7 @@ const { values: args } = parseArgs({
     "in-process": { type: "boolean", default: false },
   },
 });
+const selection = modelOptions({ ...modelArgs(args), ...(args.calibration ? { calibration: args.calibration } : {}) });
 const idleMs = parseDuration(args.idle ?? (args.sidecar ? process.env.LAYA_IDLE ?? "5m" : "0"));
 const maxAgeMs = parseDuration(args["max-age"]);
 const gpuKeepAliveMs = parseDuration(args["gpu-keepalive"]);
@@ -120,7 +129,7 @@ function armTimers() {
 function onIdle() {
   idleTimer = null;
   if (shuttingDown) return;
-  if (inFlight > 0 || Date.now() < lastRequestAt + idleMs) return armTimers();
+  if (status === "loading" || inFlight > 0 || Date.now() < lastRequestAt + idleMs) return armTimers();
   log(`idle for ${Math.round(idleMs / 1000)} s with nothing in flight; exiting`);
   shutdown("idle", 0);
 }
@@ -143,9 +152,9 @@ async function shutdown(reason, code = 0) {
   if (idleTimer) clearTimeout(idleTimer);
   if (samplingPauseTimer) clearTimeout(samplingPauseTimer);
   server.close();
-  // let in-flight decides finish (bounded), then drop keep-alive sockets so close() completes
-  const deadline = Date.now() + 10_000;
-  while (inFlight > 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+  // Long-document calls can take more than ten seconds. Drain accepted work before
+  // dropping its sockets; the Python backend separately bounds every inference.
+  while (inFlight > 0) await new Promise((r) => setTimeout(r, 50));
   server.closeAllConnections?.();
   try {
     await router?.close();
@@ -190,7 +199,7 @@ const readBody = (req, limit = 1_000_000) =>
   });
 
 // per-preset calibration tables (calibration/<preset>.json, re-read on change) or one table for all (--calibration)
-const calibration = new CalibrationCache({ root: PROJECT_ROOT, override: args.calibration ?? null });
+const calibration = new CalibrationCache({ root: PROJECT_ROOT, override: args.calibration ?? null, overrideModel: selection.model });
 
 /** One request -> one decision; presets are re-read on each call (cheap: mtime-cached in loadPresets). */
 async function decide(body) {
@@ -198,7 +207,7 @@ async function decide(body) {
   return decideRequest(router, body, PRESETS, calibration);
 }
 
-const CONFIGURED_LANES = args.lanes.split(",");
+const CONFIGURED_LANES = args.lanes?.split(",") ?? (selection.device === "cpu" ? ["cpu:8"] : selection.device === "cuda" ? ["cuda:fp16"] : ["cuda:fp16", "webgpu:fp16", "cpu:8"]);
 /** Lanes in the configured order (they register in completion order), then any others. */
 const laneList = () => (router ? [...CONFIGURED_LANES.filter((l) => router.lanes.has(l)), ...[...router.lanes.keys()].filter((l) => !CONFIGURED_LANES.includes(l))] : []);
 
@@ -210,8 +219,9 @@ const health = () => ({
   pid: process.pid,
   port: Number(args.port),
   sidecar: args.sidecar,
+  models: router?.modelInfo() ?? { default: selection, active: null, loading: selection.model, available: MODELS },
   lanes: laneList(),
-  lanesLoading: router ? router.pendingLanes : CONFIGURED_LANES,
+  lanesLoading: router ? router.pendingLanes : selection.model === "laya" ? CONFIGURED_LANES : [selection.model],
   workers: !args["in-process"],
   uptimeS: Math.round((Date.now() - started) / 1000),
   idleS: idleMs ? Math.round(idleMs / 1000) : 0,
@@ -237,6 +247,7 @@ const server = createServer(async (req, res) => {
       return res.end(PAGE);
     }
     if (req.method === "GET" && url.pathname === "/health") return json(res, 200, health());
+    if (req.method === "GET" && url.pathname === "/models") return json(res, 200, health().models);
     if (req.method === "GET" && url.pathname === "/presets") return json(res, 200, describePresets(await loadPresets()));
     if (req.method === "POST" && url.pathname === "/shutdown") {
       json(res, 200, { ok: true, pid: process.pid });
@@ -288,14 +299,15 @@ server.on("error", (e) => {
 });
 
 server.listen(Number(args.port), args.host, async () => {
-  log(`listening on http://${args.host}:${args.port} (v${VERSION}${idleMs ? `, idle exit after ${Math.round(idleMs / 1000)} s` : ", no idle exit"}${maxAgeMs ? `, max age ${Math.round(maxAgeMs / 1000)} s` : ""}); loading lanes ${args.lanes} ...`);
+  log(`listening on http://${args.host}:${args.port} (v${VERSION}${idleMs ? `, idle exit after ${Math.round(idleMs / 1000)} s` : ", no idle exit"}${maxAgeMs ? `, max age ${Math.round(maxAgeMs / 1000)} s` : ""}); loading ${selection.model} (${selection.device}) ...`);
   armTimers();
   try {
     PRESETS = await loadPresets();
     const warmupState = PRESETS[DEFAULT_PRESET].state("Please turn off the lights in the living room now");
     // serve as soon as the first lane is probed and warmed; the others join while we answer requests
-    router = await LayaRouter.create({
-      lanes: CONFIGURED_LANES,
+    router = await ModelRouter.create({
+      ...selection,
+      ...(args.lanes ? { lanes: CONFIGURED_LANES } : {}),
       workers: !args["in-process"],
       gpuKeepAliveMs,
       cudaGraph,
@@ -311,7 +323,7 @@ server.listen(Number(args.port), args.host, async () => {
     touch();
     log(`ready in ${((Date.now() - started) / 1000).toFixed(1)} s with ${laneList().join(", ")}${router.pendingLanes.length ? ` (still loading: ${router.pendingLanes.join(", ")})` : ""}; presets: ${Object.keys(PRESETS).join(", ")} (${PRESETS_DIR})`);
     router.ready.then(() => {
-      if (CONFIGURED_LANES.length > 1) log(`all lanes ready in ${((Date.now() - started) / 1000).toFixed(1)} s: ${laneList().join(", ")}`);
+      if (selection.model === "laya" && CONFIGURED_LANES.length > 1) log(`all lanes ready in ${((Date.now() - started) / 1000).toFixed(1)} s: ${laneList().join(", ")}`);
     }).catch(() => {});
   } catch (e) {
     status = "failed";
@@ -343,6 +355,13 @@ const PAGE = `<!doctype html>
 <body>
 <h2>Laya <span class="muted">typed decisions, one forward pass</span></h2>
 <div class="row">
+  <label>Model <select id="model"><option value="laya">LocalLaya (512)</option><option value="vega">Vega-U (73,728)</option><option value="multilingual">Multilingual (8,192)</option></select></label>
+  <label>Device <select id="device"><option>auto</option><option>cuda</option><option>cpu</option></select></label>
+  <label>Context <input id="maxLen" type="number" min="64" value="512" style="width:7em"></label>
+  <label>Vega readout <select id="readout"><option>auto</option><option>engine</option></select></label>
+  <label>Acceleration <select id="acceleration"><option>auto</option><option>off</option></select></label>
+</div>
+<div class="row">
   <label>Preset <select id="preset"></select></label>
   <label>Lane <select id="lane"><option value="">auto</option></select></label>
   <span id="desc" class="muted"></span>
@@ -354,6 +373,15 @@ const PAGE = `<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 let presets = {};
+let initialModel = true;
+const contexts = { laya: 512, vega: 73728, multilingual: 8192 };
+function modelChanged() {
+  const m = $('model').value;
+  $('maxLen').value = contexts[m]; $('maxLen').max = contexts[m]; $('maxLen').disabled = m === 'laya';
+  $('lane').value = ''; $('lane').disabled = m !== 'laya'; $('readout').disabled = m !== 'vega';
+  $('acceleration').disabled = m === 'laya';
+}
+$('model').onchange = modelChanged;
 async function init() {
   presets = await (await fetch('/presets')).json();
   const curPreset = $('preset').value, curLane = $('lane').value;
@@ -361,8 +389,14 @@ async function init() {
   for (const [k, p] of Object.entries(presets)) { const o = document.createElement('option'); o.value = k; o.textContent = k; $('preset').append(o); }
   if (presets[curPreset]) $('preset').value = curPreset;
   const h = await (await fetch('/health')).json();
+  if (initialModel) {
+    const d = h.models?.default || {};
+    $('model').value = d.model || 'laya'; $('device').value = d.device || 'auto'; modelChanged();
+    $('maxLen').value = d.maxLen || contexts[$('model').value]; $('readout').value = d.readout || 'auto';
+    $('acceleration').value = d.acceleration || 'auto'; initialModel = false;
+  }
   $('lane').innerHTML = '<option value="">auto</option>';
-  for (const l of h.lanes) { const o = document.createElement('option'); o.value = l; o.textContent = l; $('lane').append(o); }
+  for (const l of h.lanes.filter(l => /^(cpu|cuda|webgpu|dml)(:|$)/.test(l))) { const o = document.createElement('option'); o.value = l; o.textContent = l; $('lane').append(o); }
   if (h.lanes.includes(curLane)) $('lane').value = curLane;
   $('preset').onchange = () => { $('desc').textContent = presets[$('preset').value].description; };
   $('preset').onchange();
@@ -387,17 +421,20 @@ function render(r) {
     }
   }
   $('out').innerHTML = '<tr><th>question</th><th>answer</th><th>probability</th><th>distribution</th></tr>' + rows.join('');
-  $('status').textContent = r.routing.lane + ' ' + r.routing.ms.toFixed(0) + ' ms (predicted ' + r.routing.predictedMs.toFixed(0) + ', GPU ' + r.routing.gpuState + '), ' + r.usage.input_tokens + ' tokens';
+  $('status').textContent = r.routing.lane + ' ' + r.routing.ms.toFixed(0) + ' ms, ' + r.usage.input_tokens + ' input tokens' + (r.usage.truncated ? ' (input truncated)' : '');
   $('raw').textContent = JSON.stringify(r, null, 2);
 }
 async function ask() {
   $('status').textContent = 'thinking ...';
-  const body = { text: $('text').value, preset: $('preset').value };
-  if ($('lane').value) body.lane = $('lane').value;
+  const body = { text: $('text').value, preset: $('preset').value, model: $('model').value, device: $('device').value, maxLen: Number($('maxLen').value) };
+  if (body.model === 'laya' && $('lane').value) body.lane = $('lane').value;
+  if (body.model === 'vega') body.readout = $('readout').value;
+  if (body.model !== 'laya') body.acceleration = $('acceleration').value;
   const res = await fetch('/decide', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   const r = await res.json();
   if (!res.ok) { $('status').textContent = 'error: ' + r.error; return; }
   render(r);
+  await init();
 }
 $('ask').onclick = ask;
 $('text').addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.ctrlKey) ask(); });

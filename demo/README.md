@@ -39,13 +39,40 @@ await laya.close();
 | `local` | the model in this process (no background process; N processes = N copies) | 2-3 s every process | inference |
 | `http` | a server you started yourself (`url`); never spawns | - | inference + ~1.5 ms |
 
-Options: `{ mode, port, url, idle, maxAge, lanes, calibration, log }`. `decide(input, opts)`: `input` is a string
+Options: `{ mode, model, device, maxLen, readout, acceleration, timeoutMs, port, url, idle, maxAge, lanes, calibration, log }`. `decide(input, opts)`: `input` is a string
 (wrapped by the preset's state template) or `{ state }`; `opts` = `{ preset, questions, lane, policy, deadlineMs,
-calibration, exec }`, all optional. `decideMany(inputs, opts, { concurrency })` keeps the input order.
+calibration, exec, model, device, maxLen, readout, acceleration }`, all optional. `decideMany(inputs, opts, { concurrency })` keeps the input order.
+
+## Vega-U and multilingual
+
+After `npm run python:setup` and `npm run models:download -- --model all`:
+
+```js
+const d = await createLaya({ mode: "sidecar", model: "vega", device: "cuda" });
+try {
+  const a = await d.decide({ state: longDocument }, { questions });
+  const b = await d.decide("تم خصم المبلغ مرتين", { model: "multilingual", preset: "triage" });
+  const c = await d.decide("Turn off the lights", { model: "laya" });
+} finally { await d.close(); }
+```
+
+`model` is `laya` (default, original ONNX), `vega` (73,728-token limit), or `multilingual` (8,192).
+`device` is `auto`, `cpu`, or `cuda`. `maxLen` sets a Python model's context budget; Vega also accepts
+`readout: "auto"|"engine"`. CLI uses `--model`, `--device`, `--max-len`, `--readout`, and
+`--text-file` for a whole UTF-8 document. The mode table's timing numbers describe original ONNX Laya.
+
+Both Python models accept `acceleration: "auto"|"off"` (`--acceleration` in the CLI).
+`npm run vega:setup` installs Vega's optional kernels; `npm run multilingual:setup` installs the optional
+TileLang runtime for Multilingual. Off restores the original eager/reference path.
+`routing.exec.acceleration` reports the actual kernels/backend and graph use.
+
+The sidecar loads one model family at a time; model/device/context switches release and reload its backend.
+Calibration is model-scoped, and Python results report actual truncation and peak allocated VRAM.
+`models()` / `/health.models` report selection and available profiles. See [the full guide](../docs/MODELS.md).
 
 ## Which lane / mode handles a call
 
-You normally do not choose. The sidecar loads three lanes - `cuda:fp16` (Python process, if `npm run cuda:setup`
+For `model: "laya"`, the sidecar loads three lanes - `cuda:fp16` (Python process, if `npm run cuda:setup`
 was run), `webgpu:fp16`, `cpu:8` - and its router picks, per call, the lane with the lowest predicted latency
 including the queue and the GPU's thermal state; `routing.lane` / `routing.reason` say what it did. Measured
 on the reference machine (RTX 4070), 3 questions: CUDA ~9 ms (~12 on its dynamic graph), WebGPU ~32 ms, CPU

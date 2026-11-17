@@ -16,6 +16,7 @@ import { mkdir, open, readFile, stat, truncate } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { MODEL_TIMEOUT_MS, modelName } from "./models.mjs";
 
 export const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const DEFAULT_PORT = Number(process.env.LAYA_PORT ?? 8787);
@@ -108,7 +109,7 @@ export async function logTail(port = DEFAULT_PORT, lines = 12) {
  * Start serve.mjs as a detached background process (own console session, hidden window, stdout+stderr
  * appended to .laya/sidecar-<port>.log). Returns the ChildProcess; the caller must not wait on it.
  */
-export async function spawnSidecar({ port = DEFAULT_PORT, idle = DEFAULT_IDLE, maxAge, lanes, calibration, nodeArgs = [] } = {}) {
+export async function spawnSidecar({ port = DEFAULT_PORT, idle = DEFAULT_IDLE, maxAge, lanes, calibration, model, device, maxLen, readout, acceleration, nodeArgs = [] } = {}) {
   await mkdir(LOG_DIR, { recursive: true });
   const logFile = logFileFor(port);
   try {
@@ -121,6 +122,7 @@ export async function spawnSidecar({ port = DEFAULT_PORT, idle = DEFAULT_IDLE, m
   if (maxAge) argv.push("--max-age", String(maxAge));
   if (lanes) argv.push("--lanes", lanes);
   if (calibration) argv.push("--calibration", calibration);
+  for (const [k, v] of [["model", model], ["device", device], ["max-len", maxLen], ["readout", readout], ["acceleration", acceleration]]) if (v !== undefined) argv.push(`--${k}`, String(v));
   const child = spawn(process.execPath, argv, {
     cwd: PROJECT_ROOT,
     detached: true,
@@ -180,7 +182,7 @@ export async function waitAllLanes({ port = DEFAULT_PORT, host = "127.0.0.1", ti
  * Make sure a ready sidecar is listening: reuse a running one, wait for a loading one, or spawn a new one.
  * @returns {Promise<{health:object, spawned:boolean}>}
  */
-export async function ensureSidecar({ port = DEFAULT_PORT, host = "127.0.0.1", idle = DEFAULT_IDLE, maxAge, lanes, calibration, timeoutMs, onProgress } = {}) {
+export async function ensureSidecar({ port = DEFAULT_PORT, host = "127.0.0.1", idle = DEFAULT_IDLE, maxAge, lanes, calibration, model, device, maxLen, readout, acceleration, timeoutMs, onProgress } = {}) {
   const d = await discover({ port, host });
   if (d.state === "ready") return { health: d.health, spawned: false };
   if (d.state === "foreign") throw new SidecarError("FOREIGN_PORT", `port ${port} is used by something that is not the Laya sidecar; set LAYA_PORT / --port to a free port`);
@@ -193,13 +195,19 @@ export async function ensureSidecar({ port = DEFAULT_PORT, host = "127.0.0.1", i
     for (let i = 0; i < 40 && (await discover({ port, host })).state !== "none"; i++) await new Promise((r) => setTimeout(r, 100));
   }
   onProgress?.("spawning", 0);
-  const child = await spawnSidecar({ port, idle, maxAge, lanes, calibration });
+  const child = await spawnSidecar({ port, idle, maxAge, lanes, calibration, model, device, maxLen, readout, acceleration });
   const health = await waitReady({ port, host, timeoutMs, child, onProgress });
   return { health, spawned: true, pid: health.pid };
 }
 
 /** POST /decide. Retries briefly on 503 (instance still loading / being replaced). */
-export async function decide(body, { port = DEFAULT_PORT, host = "127.0.0.1", timeoutMs = 60_000, agent = false } = {}) {
+export async function decide(body, { port = DEFAULT_PORT, host = "127.0.0.1", timeoutMs = MODEL_TIMEOUT_MS, agent = false } = {}) {
+  if ((body.model && modelName(body.model) !== "laya") || (body.device && body.device !== "auto") || body.acceleration !== undefined) {
+    const h = await request("GET", "/health", { port, host, timeoutMs: 5000, agent });
+    if (!h.body?.models?.available) throw new SidecarError("MODEL_UNSUPPORTED", "the running sidecar predates model selection; restart it or use another --port");
+    const model = modelName(body.model ?? h.body.models.default?.model ?? "laya");
+    if (body.acceleration !== undefined && !h.body.models.available[model]?.accelerations?.includes(body.acceleration)) throw new SidecarError("MODEL_UNSUPPORTED", `the running sidecar does not support this ${model} acceleration setting; restart it or use another --port`);
+  }
   const t0 = Date.now();
   for (;;) {
     const res = await request("POST", "/decide", { port, host, body, timeoutMs, agent });
@@ -221,7 +229,7 @@ export async function decide(body, { port = DEFAULT_PORT, host = "127.0.0.1", ti
  * close() destroys the pooled socket so the process can exit (the agent is also unref'd - a forgotten close()
  * does not keep the event loop alive).
  */
-export function createClient({ port = DEFAULT_PORT, host = "127.0.0.1", timeoutMs = 60_000 } = {}) {
+export function createClient({ port = DEFAULT_PORT, host = "127.0.0.1", timeoutMs = MODEL_TIMEOUT_MS } = {}) {
   const agent = new http.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 10_000 });
   // http.Agent has no unref(); its sockets are unref'd when idle by Node itself ("agent sockets are unref'd when free")
   return {
@@ -231,6 +239,7 @@ export function createClient({ port = DEFAULT_PORT, host = "127.0.0.1", timeoutM
     health: async () => (await request("GET", "/health", { port, host, timeoutMs: 5000, agent })).body,
     stats: async () => (await request("GET", "/stats", { port, host, timeoutMs: 5000, agent })).body,
     presets: async () => (await request("GET", "/presets", { port, host, timeoutMs: 5000, agent })).body,
+    models: async () => (await request("GET", "/models", { port, host, timeoutMs: 5000, agent })).body,
     touch: async () => (await request("POST", "/touch", { port, host, timeoutMs: 2000, agent })).body,
     close: () => agent.destroy(),
   };

@@ -5,6 +5,65 @@ The chronological record of how we got here is in `docs/sessions/`.
 
 ## Goal
 
+### 0.9 - Multilingual acceleration (2026-11-17)
+
+- Multilingual now accepts `--acceleration auto|off` across the CLI, REPL, HTTP/browser, demo and skill.
+  Auto uses upstream Laya's TileLang CUDA backend when installed; CPU/off/unavailable dependencies use eager.
+  Setup/check: `npm run multilingual:setup` / `multilingual:check`, after preparing the model.
+- Optional TileLang 0.1.15 and compiler/runtime wheels are pinned in `data/python-models.json`, installed
+  into `.venv-laya`, and cache under `.laya/tilelang`. The model's input budget and attention pattern are retained.
+- Eight-shape CUDA Graph LRU. A new shape runs fused kernels first; an immediate repeat captures it, and
+  resident shapes replay. Per-call metadata reports which path ran and its bucket.
+- Quiet-machine paired measurements: one short question 15.8 -> 4.1 ms, one near 8K 245 -> 99 ms;
+  three short questions 19.3 -> 5.0 ms, three near 8K 847 -> 337 ms. First-shape compilation/capture is extra.
+- 197/197 checked choices matched across six languages and varied lengths; max probability delta 0.0213,
+  max expected-score delta 0.0114 levels. Unit, cache/fallback and targeted integration checks passed.
+- [Multilingual measurement report](../results/multilingual-speed-2026-11-17-summary.md).
+
+### 0.8 - Vega acceleration (2026-11-17)
+
+- Stopped the pre-existing 8787 sidecar before profiling. Optional FLA 0.6.0 / Triton Windows 3.9.0.post30
+  kernels now accelerate the reader; validated CUDA Graphs replay the small decision head. Setup/check:
+  `npm run vega:setup` / `vega:check`; everything stays in `.venv-laya` and `.laya/triton`.
+- `--acceleration auto|off` reaches the CLI, REPL, HTTP/browser, demo library and skill. Off is the original
+  reference path; CPU remains usable with optional CUDA packages installed. Worker affinity follows the
+  existing P-core convention. Metadata reports actual kernels, graph counts and prefill behavior.
+- Long causal prefills (>32K) are processed in 2K blocks through the full cache, with stitched hidden states
+  and Flash-compatible lower-right masks. Fixed KV storage avoids repeated-allocation fragmentation:
+  the final Node API 70,014-token call took 4.4 s, at 3,268 MiB allocated / 3,660 MiB reserved.
+- Short/medium interleaved comparison: three questions, six pairs: 50 -> 34 ms short, 233 -> 113 ms at ~1K,
+  429 -> 243 ms at ~4K. 165/165 argmax choices and auto/review routes matched; maximum probability delta
+  0.016613, with four auxiliary abstain/unbound flag changes. Graph-only delta <= 0.000001.
+- Varied 33K/50K document checks added six matching choices, with no changed flags; 171 total matched
+  choices across these checks. 18 unit and 25 integration tests passed for this update.
+- Details, cold costs, numerical caveats and reproduction commands:
+  [Vega speed report](../results/vega-speed-2026-11-17-summary.md).
+
+### 0.7 - selectable models (2026-11-17)
+
+- `laya` selects the existing English ONNX stack; `vega` selects Vega-U / Qwen3.5-0.8B through Python Laya;
+  `multilingual` selects mmBERT-base through Python Laya. Context limits: 512 / 73,728 / 8,192 tokens.
+- Model, CPU/CUDA device and context controls reach the CLI, REPL, sidecar/HTTP, browser, demo library and
+  skill wrapper. Local/sidecar/HTTP modes are selectable. See [MODELS.md](MODELS.md).
+- `ModelRouter` serializes calls and releases the active backend when switching model, device or context.
+  Model choice is explicit; the original `LayaRouter` still chooses EP lanes for English ONNX.
+- New `.venv-laya`: Laya 0.4.35, vegaml 0.16.3, PyTorch 2.15.0+cu132, Transformers 5.23.0, Hub 2.4.0.
+  `python:setup`, `python:check`, `models:download` manage it. Models/revisions are pinned in
+  `data/python-models.json`, downloaded into `models/python`, digest-verified, and loaded offline.
+- Calibration is model-scoped. Vega's expected ordinal score is normalized to the existing result contract;
+  its native argmax and additional decision metadata are retained. The adapter measures actual Vega prompt
+  truncation because the upstream facade tests summed tokens across questions. Multilingual gets a derived
+  tokenizer config so upstream's normalization cannot modify the pinned download.
+- `test/model-router.test.mjs`: model selection, FIFO/lifecycle, calibration isolation, protocol errors,
+  child failure/timeouts, old-server compatibility (no models needed). `test/models.test.mjs`: real CPU/CUDA
+  and HTTP/CLI integration. `experiments/model-context.mjs`: reproducible context/latency smoke measurements.
+- Verification: 55 tests across the unit/router/CUDA/sidecar/demo/Python-model suites; original CUDA fidelity
+  195/195, graph replay 5.0 ms for one question. Vega read 70,014 state tokens (143 s, 10,073 MiB peak),
+  multilingual read 7,814 (293 ms); synthetic capacity checks, not domain-accuracy measurements. See
+  [the measurement report](../results/model-context-2026-11-17-summary.md).
+
+### Original ONNX work
+
 Run [Laya](https://huggingface.co/convaiinnovations/laya) (Convai Innovations' non-autoregressive
 "System 1" decision model: typed `choice` / `score` / `noul` answers with probabilities in one forward
 pass) **locally on Windows**, through the ONNX port [`@receptron/laya`](https://github.com/receptron/laya),
@@ -153,8 +212,8 @@ on static bucket graphs (1 q 2x, 3 q 1.4x; item 7 below is now the record of how
    inputs per preset that matters, label them, run `calibrate.mjs`, act on the verdicts.
 2. **Fine-tuning path** when wording stops helping: the original repo's RLCD notebook (Kaggle 2xT4, 4-5 h),
    then `export/export_onnx.py` -> load via `modelDir`. Not started.
-3. **Multilingual checkpoint**: only the English root is published as ONNX; export
-   `convaiinnovations/laya-multilingual` ourselves if non-English input is needed.
+3. **Multilingual checkpoint - available through Python since 0.7.** `--model multilingual` selects it with
+   an 8,192-token budget. A separate ONNX export/optimization would be additional work.
 4. **Sidecar, if ever needed**: named-pipe transport (no port); a Windows service / Task Scheduler entry for
    always-on use (`--idle 0 --max-age 24h`).
 5. **Router**: the CPU lane is only chosen for sporadic small calls on a cold GPU and as a fallback - decide

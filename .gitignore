@@ -438,6 +438,7 @@ results/*
 !results/*-summary.md
 # python toolchain for tools/convert_fp16.py (uv venv + cache)
 .venv/
+.venv-laya/
 .uv-cache/
 __pycache__/
 # sidecar logs

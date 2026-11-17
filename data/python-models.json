@@ -1,0 +1,35 @@
+{
+  "runtime": { "laya": "0.4.35", "vegaml": "0.16.3", "torch": "2.15.0", "transformers": "5.23.0", "huggingface_hub": "2.4.0" },
+  "acceleration": { "fla-core": "0.6.0", "flash-linear-attention": "0.6.0", "einops": "0.8.2", "triton-windows": "3.9.0.post30", "triton": "3.9.0" },
+  "multilingualAcceleration": {
+    "tilelang": "0.1.15", "apache-tvm-ffi": "0.1.12", "torch-c-dlpack-ext": "0.1.5",
+    "cloudpickle": "3.1.2", "ml-dtypes": "0.7.0", "psutil": "7.2.2", "z3-solver": "4.15.4.0",
+    "nvidia-cuda-nvcc": "13.5.37", "nvidia-cuda-crt": "13.5.37", "nvidia-nvvm": "13.5.37",
+    "nvidia-cuda-nvrtc": "13.5.37", "nvidia-cuda-runtime": "13.5.37", "nvidia-cuda-cccl": "13.3.5.0.6",
+    "nvidia-curand": "10.4.5.25"
+  },
+  "models": {
+    "vega": {
+      "name": "Vega-U / Qwen3.5-0.8B through Laya",
+      "maxLen": 73728,
+      "repo": "nandakishorm/vega-U",
+      "revision": "4d2050287982ca7a7bb0c22fd19a389f5f94474e",
+      "directory": "models/python/vega-U-4d2050287982",
+      "files": ["config.json", "vega_config.json", "engine.safetensors", "port.safetensors", "stats.npz"],
+      "backbone": {
+        "repo": "Qwen/Qwen3.5-0.8B",
+        "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+        "directory": "models/python/2fc06364715b/Qwen3.5-0.8B",
+        "files": ["config.json", "tokenizer.json", "tokenizer_config.json", "merges.txt", "vocab.json", "chat_template.jinja", "model.safetensors.index.json", "model.safetensors-00001-of-00001.safetensors"]
+      }
+    },
+    "multilingual": {
+      "name": "Laya Multilingual / mmBERT-base",
+      "maxLen": 8192,
+      "repo": "convaiinnovations/laya-multilingual",
+      "revision": "92d22143468d8af669dc1a5a0480a2b21b4fe56e",
+      "directory": "models/python/laya-multilingual-92d22143468d",
+      "files": ["config.json", "rl_agent_config.json", "encoder/config.json", "model.safetensors", "tokenizer/tokenizer.json", "tokenizer/tokenizer_config.json"]
+    }
+  }
+}

@@ -223,12 +223,15 @@ test("skill wrapper: fast path answers over HTTP in one Node process, inline JSO
   const p = await wrapper(["--pretty", "--no-color", "Turn on the TV"]);
   assert.match(p.stdout, /intent\s+control_device/);
   assert.throws(() => JSON.parse(p.stdout), "pretty output is not JSON");
-  // the fast path is not slower than going through ask.mjs (one Node process instead of two)
+  // Compare client overhead, not GPU clock ramp / graph-build stalls. The two calls can
+  // have very different inference times (measured 253 ms vs ~25 ms on an idle GPU).
   const t1 = Date.now();
-  await ask(["--sidecar", "--json", "--preset", "triage", "Charged twice. Refund today or I cancel."]);
+  const comparison = JSON.parse((await ask(["--sidecar", "--json", "--preset", "triage", "Charged twice. Refund today or I cancel."])).stdout);
   const askMs = Date.now() - t1;
-  console.log(`      wrapper fast path ${wrapperMs} ms vs ask.mjs --sidecar ${askMs} ms (inference ~${r.routing.ms.toFixed(0)} ms of that)`);
-  assert.ok(wrapperMs < askMs * 1.5 + 100, `wrapper ${wrapperMs} ms should not be slower than ask.mjs ${askMs} ms`);
+  const overhead = (wall, result) => wall - result.routing.ms - (result.routing.queueMs ?? 0) - (result.routing.loadMs ?? 0);
+  const wrapperOverhead = overhead(wrapperMs, r), askOverhead = overhead(askMs, comparison);
+  console.log(`      wrapper overhead ${wrapperOverhead.toFixed(0)} ms vs ask.mjs ${askOverhead.toFixed(0)} ms (total ${wrapperMs} / ${askMs} ms, inference ${r.routing.ms.toFixed(0)} / ${comparison.routing.ms.toFixed(0)} ms)`);
+  assert.ok(wrapperOverhead < askOverhead * 1.5 + 100, `wrapper overhead ${wrapperOverhead.toFixed(0)} ms should not be slower than ask.mjs ${askOverhead.toFixed(0)} ms`);
 });
 
 test("hard kill: the next call notices and respawns", async () => {
