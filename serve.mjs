@@ -10,7 +10,7 @@
  *   node serve.mjs --port 9000 --lanes webgpu:fp16,cpu:8     # default cuda:fp16,webgpu:fp16,cpu:8 (cuda dropped without the venv)
  *   node serve.mjs --model vega --device cuda              # Vega-U through Python Laya, 73,728 tokens
  *   node serve.mjs --model multilingual --device cpu --max-len 8192
- *   POST /decide may select model, device, maxLen, readout (Vega: auto|engine), acceleration (Python models: auto|off).
+ *   POST /decide may select model, device, maxLen, readout (Vega: auto|engine), acceleration (Python models: auto|on|off), graphs (auto|on|off).
  *   A model switch releases the previous backend. GET /models lists choices; /health reports the active one.
  *   node serve.mjs --calibration calibration/smart-home-v3.json   # one table for every preset (default: per preset,
  *                                                                 # calibration/<preset>.json when present)
@@ -87,7 +87,7 @@ const selection = modelOptions({ ...modelArgs(args), ...(args.calibration ? { ca
 const idleMs = parseDuration(args.idle ?? (args.sidecar ? process.env.LAYA_IDLE ?? "5m" : "0"));
 const maxAgeMs = parseDuration(args["max-age"]);
 const gpuKeepAliveMs = parseDuration(args["gpu-keepalive"]);
-const cudaGraph = !/^(off|0|false|no)$/i.test(args["cuda-graph"]);
+const cudaGraph = selection.graphs === "auto" ? !/^(off|0|false|no)$/i.test(args["cuda-graph"]) : selection.graphs === "on";
 // memory of the shapes real traffic used, per port (the test port keeps its own); "off" = none
 const cudaBucketsFile = /^(off|0|false|no|none)$/i.test(args["cuda-buckets-file"]) ? null : args["cuda-buckets-file"] || path.join(PROJECT_ROOT, ".laya", `cuda-buckets-${args.port}.json`);
 const SAMPLING_PAUSE_MS = 10_000;
@@ -307,6 +307,7 @@ server.listen(Number(args.port), args.host, async () => {
     // serve as soon as the first lane is probed and warmed; the others join while we answer requests
     router = await ModelRouter.create({
       ...selection,
+      lifetime: "persistent",
       ...(args.lanes ? { lanes: CONFIGURED_LANES } : {}),
       workers: !args["in-process"],
       gpuKeepAliveMs,
@@ -359,7 +360,8 @@ const PAGE = `<!doctype html>
   <label>Device <select id="device"><option>auto</option><option>cuda</option><option>cpu</option></select></label>
   <label>Context <input id="maxLen" type="number" min="64" value="512" style="width:7em"></label>
   <label>Vega readout <select id="readout"><option>auto</option><option>engine</option></select></label>
-  <label>Acceleration <select id="acceleration"><option>auto</option><option>off</option></select></label>
+  <label>Acceleration <select id="acceleration"><option>auto</option><option>on</option><option>off</option></select></label>
+  <label>Graphs <select id="graphs"><option>auto</option><option>on</option><option>off</option></select></label>
 </div>
 <div class="row">
   <label>Preset <select id="preset"></select></label>
@@ -393,7 +395,7 @@ async function init() {
     const d = h.models?.default || {};
     $('model').value = d.model || 'laya'; $('device').value = d.device || 'auto'; modelChanged();
     $('maxLen').value = d.maxLen || contexts[$('model').value]; $('readout').value = d.readout || 'auto';
-    $('acceleration').value = d.acceleration || 'auto'; initialModel = false;
+    $('acceleration').value = d.acceleration || 'auto'; $('graphs').value = d.graphs || 'auto'; initialModel = false;
   }
   $('lane').innerHTML = '<option value="">auto</option>';
   for (const l of h.lanes.filter(l => /^(cpu|cuda|webgpu|dml)(:|$)/.test(l))) { const o = document.createElement('option'); o.value = l; o.textContent = l; $('lane').append(o); }
@@ -426,7 +428,7 @@ function render(r) {
 }
 async function ask() {
   $('status').textContent = 'thinking ...';
-  const body = { text: $('text').value, preset: $('preset').value, model: $('model').value, device: $('device').value, maxLen: Number($('maxLen').value) };
+  const body = { text: $('text').value, preset: $('preset').value, model: $('model').value, device: $('device').value, maxLen: Number($('maxLen').value), graphs: $('graphs').value };
   if (body.model === 'laya' && $('lane').value) body.lane = $('lane').value;
   if (body.model === 'vega') body.readout = $('readout').value;
   if (body.model !== 'laya') body.acceleration = $('acceleration').value;

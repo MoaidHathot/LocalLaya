@@ -5,6 +5,7 @@ The legacy ONNX worker and its environment are independent of this worker.
 """
 import argparse
 import contextlib
+import gc
 import importlib.metadata
 import json
 import os
@@ -15,6 +16,7 @@ import time
 import traceback
 from vega_fast import configure_reader, pin_process
 from multilingual_fast import MultilingualAcceleration
+from runtime_progress import StartupProgress
 
 ROOT = Path(__file__).resolve().parents[1]
 os.environ.update(HF_HOME=str(ROOT / "models/.huggingface"), HF_HUB_OFFLINE="1",
@@ -44,6 +46,32 @@ def prepared(spec):
 
 def versions():
     return {name: importlib.metadata.version(name) for name in ("laya", "vegaml", "torch", "transformers", "huggingface_hub")}
+
+
+def load_auto_device(factory, requested, torch):
+    """Auto may retry a GPU allocation failure on CPU; explicit CUDA and model errors stay errors."""
+    cuda = torch.cuda.is_available()
+    if requested == "cuda" and not cuda:
+        raise RuntimeError("CUDA was requested but no working CUDA device is available; use --device cpu or rerun python:setup")
+    selected = ("cuda" if cuda else "cpu") if requested == "auto" else requested
+    reason = ("CUDA available" if selected == "cuda" else "CUDA unavailable; selected CPU") if requested == "auto" else f"explicit {selected}"
+    try:
+        agent = factory(selected)
+    except torch.cuda.OutOfMemoryError as exc:
+        if requested != "auto" or selected != "cuda":
+            raise
+        reason = f"CUDA load ran out of memory; selected CPU: {exc}"
+        exc.__traceback__ = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        selected = "cpu"
+        agent = factory(selected)
+    actual = str(agent.device).split(":")[0]
+    if actual != selected:
+        if requested != "auto":
+            raise RuntimeError(f"requested {selected} but Laya loaded on {actual}")
+        reason = f"Laya loaded on {actual} instead of {selected}"
+    return agent, actual, reason
 
 
 def multilingual_runtime(spec, model_dir):
@@ -106,18 +134,23 @@ def main():
     parser.add_argument("--model", choices=MANIFEST["models"], default="vega")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--max-len", type=int)
-    parser.add_argument("--acceleration", choices=("auto", "off"), default="auto")
+    parser.add_argument("--acceleration", choices=("auto", "on", "off"), default="auto")
+    parser.add_argument("--graphs", choices=("on", "off"), default="on")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     started = time.perf_counter()
+    progress = StartupProgress(enabled=not args.check)
+    progress.log("Python worker started")
     with contextlib.redirect_stdout(sys.stderr):
-        import torch
+        with progress.stage("import_torch", "Importing PyTorch"):
+            import torch
 
-        runtime = versions()
-        for name, version in MANIFEST["runtime"].items():
-            if runtime[name].split("+")[0] != version:
-                raise RuntimeError(f"{name}=={version} required, found {runtime[name]}; run npm run python:setup")
-        cuda = torch.cuda.is_available()
+        with progress.stage("runtime_check", "Checking runtime and CUDA availability"):
+            runtime = versions()
+            for name, version in MANIFEST["runtime"].items():
+                if runtime[name].split("+")[0] != version:
+                    raise RuntimeError(f"{name}=={version} required, found {runtime[name]}; run npm run python:setup")
+            cuda = torch.cuda.is_available()
         if args.check:
             info = {"versions": runtime, "cuda": cuda, "cudaRuntime": torch.version.cuda,
                     "gpu": torch.cuda.get_device_name(0) if cuda else None}
@@ -126,40 +159,55 @@ def main():
                 info["cudaOk"] = (torch.ones(2, device="cuda") + 1).tolist() == [2.0, 2.0]
         else:
             affinity = pin_process()
-            if args.device == "cuda" and not cuda:
-                raise RuntimeError("CUDA was requested but this PyTorch installation has no working CUDA device; use --device cpu or rerun python:setup with --torch-backend auto")
-            device = "cuda" if args.device == "auto" and cuda else "cpu" if args.device == "auto" else args.device
             profile = MANIFEST["models"][args.model]
             max_len = args.max_len or profile["maxLen"]
             if not 64 <= max_len <= profile["maxLen"]:
                 raise ValueError(f"max_len must be between 64 and {profile['maxLen']}")
-            model_dir = prepared(profile)
+            with progress.stage("model_files", "Checking local model files"):
+                model_dir = prepared(profile)
             # Separate process: thread settings cannot affect the legacy ONNX lane.
             torch.set_num_threads(1 if args.model == "vega" else 8)
-            import laya
+            with progress.stage("import_laya", "Importing Laya model runtime"):
+                # Agent is lazy in laya.__init__; resolve it here so these imports
+                # are timed separately from checkpoint loading.
+                from laya import Agent
 
+            def construct(device):
+                if device == "cuda":
+                    with progress.stage("cuda_init", "Initializing CUDA"):
+                        torch.cuda.init()
+                if args.model == "vega":
+                    with progress.stage("reader_kernels", "Configuring Vega reader kernels"):
+                        configure_reader(device, args.acceleration)
+                    with progress.stage(f"load_model_{device}", f"Loading Vega checkpoint on {device}"):
+                        return Agent(vegaml=model_dir, backbone=prepared(profile["backbone"]), device=device, max_len=max_len)
+                with progress.stage(f"load_model_{device}", f"Loading Multilingual checkpoint on {device}"):
+                    return Agent(multilingual_runtime(profile, model_dir), device=device, backend="eager")
+
+            agent, device, device_reason = load_auto_device(construct, args.device, torch)
+            graph_replay = args.graphs == "on" and device == "cuda" and args.acceleration != "off"
             if args.model == "vega":
                 acceleration = configure_reader(device, args.acceleration)
-                agent = laya.Agent(vegaml=model_dir, backbone=prepared(profile["backbone"]), device=device, max_len=max_len)
                 graphs = None
                 streaming = None
-                if args.acceleration == "auto" and device == "cuda":
-                    from vega_graph import HeadReplay
+                if args.acceleration != "off" and device == "cuda":
                     from vega_stream import streamed_prefill
-                    graphs = HeadReplay(agent.vega.engine.engine)
+                    if graph_replay:
+                        from vega_graph import HeadReplay
+                        graphs = HeadReplay(agent.vega.engine.engine)
                     streaming = streamed_prefill(agent.vega.engine.perc, symbolic_masks=torch.cuda.get_device_capability()[0] >= 8,
                                                  capacity_tokens=max_len)
             else:
-                agent = laya.Agent(multilingual_runtime(profile, model_dir), device=device, backend="eager")
                 agent.cfg["max_len"] = max_len
-                multilingual_acceleration = MultilingualAcceleration(agent, args.acceleration)
-            actual = str(agent.device).split(":")[0]
-            if actual != device:
-                raise RuntimeError(f"requested {device} but Laya loaded on {actual}")
+                with progress.stage("accelerator", "Selecting Multilingual execution backend"):
+                    multilingual_acceleration = MultilingualAcceleration(agent, args.acceleration, graph_replay=graph_replay)
+                progress.log(f"Multilingual backend: {agent.backend}" + (f" ({multilingual_acceleration.reason})" if multilingual_acceleration.reason else ""))
+                graph_replay = graph_replay and agent.backend == "tilelang"
             base_temps = dict(getattr(agent, "temperature_by_options", {}))
-            info = {"ready": True, "model": args.model, "device": actual, "maxLen": max_len,
+            info = {"ready": True, "model": args.model, "device": device, "deviceReason": device_reason, "graphReplayEnabled": graph_replay, "maxLen": max_len,
                     "repo": profile["repo"], "revision": profile["revision"], "versions": runtime,
-                    "loadMs": (time.perf_counter() - started) * 1000, "pid": os.getpid(), "affinity": affinity}
+                    "loadMs": (time.perf_counter() - started) * 1000, "pid": os.getpid(), "affinity": affinity,
+                    "startup": progress.report()}
             if args.model == "vega":
                 info["acceleration"] = acceleration
             else:
@@ -168,6 +216,7 @@ def main():
     if args.check:
         return
 
+    first_prediction = True
     for line in sys.stdin:
         message = None
         try:
@@ -180,6 +229,8 @@ def main():
             if state is None or not isinstance(state, (str, dict, list)):
                 raise ValueError("Python models accept a string, object or conversation list as state")
             t0 = time.perf_counter()
+            if first_prediction:
+                print(f"[inference] First decision on {device}; initializing any remaining kernels ...", file=sys.stderr, flush=True)
             with contextlib.redirect_stdout(sys.stderr):
                 if device == "cuda":
                     torch.cuda.reset_peak_memory_stats()
@@ -213,6 +264,7 @@ def main():
                 actual = "cpu" if fallback else str(agent.device).split(":")[0]
                 result["usage"]["context_tokens"] = max_len
                 execution = {"mode": "torch-eager", "device": actual, "requestedDevice": args.device,
+                             "deviceReason": device_reason, "graphReplayEnabled": graph_replay and actual == "cuda",
                              "maxLen": max_len, "cpuFallback": fallback,
                              "peakVramMiB": round(torch.cuda.max_memory_allocated() / 1024**2, 1) if device == "cuda" else 0,
                              "reservedVramMiB": round(torch.cuda.memory_reserved() / 1024**2, 1) if device == "cuda" else 0}
@@ -228,6 +280,9 @@ def main():
                     if execution["acceleration"]["backend"] == "tilelang":
                         execution["mode"] = "torch-accelerated"
                 elapsed = (time.perf_counter() - t0) * 1000
+            if first_prediction:
+                print(f"[inference] First decision completed in {elapsed / 1000:.2f}s", file=sys.stderr, flush=True)
+                first_prediction = False
             emit({"id": message["id"], "result": result, "exec": execution, "ms": elapsed})
         except Exception as exc:
             traceback.print_exc(file=sys.stderr)

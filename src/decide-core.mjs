@@ -2,11 +2,11 @@
  * The request -> decision logic shared by serve.mjs (HTTP) and demo/laya.mjs (in-process "local" mode), so both
  * accept the same body and return the same shape:
  *
- *   body: { text?, state?, preset?, questions?, model?, device?, maxLen?, readout?, lane?, policy?, deadlineMs?, calibration?, exec? }
+ *   body: { text?, state?, preset?, questions?, model?, device?, maxLen?, readout?, acceleration?, graphs?, lane?, policy?, deadlineMs?, calibration?, exec? }
  *   ->    { answers, usage, routing, state, questions, preset, calibration }
  *
  * - `text` is wrapped by the preset's state template; `state` is used verbatim.
- * - `questions` replaces the preset's question set (validated here, before the model sees them).
+ * - `questions` replaces the preset's question set (validated and normalized here, before inference).
  * - the calibration table is, in order: the request's `calibration.temperature_by_options`, else the
  *   model-scoped per-preset file (re-read when its mtime changes), else the shipped temperatures.
  * - `lane` / `policy` / `deadlineMs` / `exec` are the router's per-call overrides (see ep-router.mjs).
@@ -17,20 +17,36 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_PRESET } from "../data/presets.mjs";
 import { modelOptions } from "./models.mjs";
+import { normalizeQuestions } from "./question-schema.mjs";
+export { validateQuestions } from "./question-schema.mjs";
 
 export const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const POLICIES = ["auto", "prefer-gpu", "prefer-cpu", "min-cpu"];
 
 export const httpError = (status, message, extra = {}) => Object.assign(new Error(message), { status, ...extra });
 
-export function validateQuestions(q) {
-  if (!q || typeof q !== "object" || Array.isArray(q) || !Object.keys(q).length) throw httpError(400, "questions must be a non-empty object");
-  for (const [id, x] of Object.entries(q)) {
-    if (!x || !["choice", "score", "noul"].includes(x.type)) throw httpError(400, `question ${id}: type must be choice | score | noul`);
-    if (x.instructions === undefined) throw httpError(400, `question ${id}: instructions required`);
-    if (x.type === "choice" && !(Array.isArray(x.criteria) ? x.criteria.length >= 2 : x.criteria && Object.keys(x.criteria).length >= 2)) throw httpError(400, `question ${id}: choice needs >= 2 criteria`);
-    if (x.type === "score" && !(Array.isArray(x.criteria) && x.criteria.length >= 2)) throw httpError(400, `question ${id}: score needs an ordered array of >= 2 levels`);
+/** Shared validation for HTTP bodies and complete CLI request files. */
+export function validateCalibration(calibration) {
+  if (calibration != null && (!calibration.temperature_by_options || typeof calibration.temperature_by_options !== "object" || Array.isArray(calibration.temperature_by_options))) throw httpError(400, "calibration needs a temperature_by_options object");
+}
+
+export function executionOptions(body) {
+  const opts = {};
+  if (body.lane) opts.lane = body.lane;
+  if (body.policy !== undefined) {
+    if (!POLICIES.includes(body.policy)) throw httpError(400, `policy must be one of ${POLICIES.join(", ")}`);
+    opts.policy = body.policy;
   }
+  if (body.deadlineMs !== undefined) {
+    const d = Number(body.deadlineMs);
+    if (!(d > 0)) throw httpError(400, "deadlineMs must be a positive number");
+    opts.deadlineMs = d;
+  }
+  if (body.exec !== undefined) {
+    if (!body.exec || typeof body.exec !== "object" || Array.isArray(body.exec)) throw httpError(400, "exec must be an object, e.g. { graph: false }");
+    opts.exec = body.exec;
+  }
+  return opts;
 }
 
 /** Per-preset calibration tables, re-read when the file changes. `override` = one table for every preset (--calibration). */
@@ -74,33 +90,18 @@ export async function decideRequest(router, body, presets, calibration) {
   const presetName = body.preset ?? DEFAULT_PRESET;
   const preset = presets[presetName];
   if (!preset || preset.invalid) throw httpError(400, preset?.invalid ? `preset ${presetName} is invalid: ${preset.description}` : `unknown preset ${presetName}; have ${Object.keys(presets).join(", ")}`);
-  const questions = body.questions ?? preset.questions;
-  validateQuestions(questions);
+  const questions = normalizeQuestions(body.questions ?? preset.questions);
   let state;
   if (body.state !== undefined) state = body.state;
   else if (typeof body.text === "string" && body.text.trim()) state = preset.state(body.text.trim());
   else throw httpError(400, "provide text (string) or state (any JSON)");
-  if (body.calibration != null && (!body.calibration.temperature_by_options || typeof body.calibration.temperature_by_options !== "object" || Array.isArray(body.calibration.temperature_by_options))) throw httpError(400, "calibration needs a temperature_by_options object");
-  const opts = { ...selection, calibration: body.calibration === null ? null : body.calibration?.temperature_by_options ? { temperature_by_options: body.calibration.temperature_by_options, file: body.calibration.file ?? "request" } : await calibration.for(presetName, selection.model) };
+  validateCalibration(body.calibration);
+  const opts = { ...selection, ...executionOptions(body), calibration: body.calibration === null ? null : body.calibration?.temperature_by_options ? { temperature_by_options: body.calibration.temperature_by_options, file: body.calibration.file ?? "request" } : await calibration.for(presetName, selection.model) };
   if (body.lane) {
     if (!router.selection && !router.lanes.has(body.lane)) {
       if (router.pendingLanes.includes(body.lane)) throw httpError(503, `lane ${body.lane} is still loading`, { retryAfterMs: 500 });
       throw httpError(400, `lane ${body.lane} not loaded; have ${[...router.lanes.keys()].join(", ")}`);
     }
-    opts.lane = body.lane;
-  }
-  if (body.policy !== undefined) {
-    if (!POLICIES.includes(body.policy)) throw httpError(400, `policy must be one of ${POLICIES.join(", ")}`);
-    opts.policy = body.policy;
-  }
-  if (body.deadlineMs !== undefined) {
-    const d = Number(body.deadlineMs);
-    if (!(d > 0)) throw httpError(400, "deadlineMs must be a positive number");
-    opts.deadlineMs = d;
-  }
-  if (body.exec !== undefined) {
-    if (!body.exec || typeof body.exec !== "object") throw httpError(400, "exec must be an object, e.g. { graph: false }");
-    opts.exec = body.exec;
   }
   const r = await router.decide(state, questions, opts);
   return { answers: r.answers, usage: r.usage, routing: r.routing, state, questions, preset: body.questions ? null : presetName, calibration: opts.calibration?.file ?? null };

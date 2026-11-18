@@ -17,6 +17,15 @@ npm run demo                                                                    
 
 ## `laya.mjs` - the library
 
+Choose just `model` and `mode` for automatic configuration:
+`createLaya({ model: "multilingual", mode: "sidecar" })` or
+`createLaya({ model: "multilingual", mode: "local" })`. Library instances are reusable by default;
+`lifetime: "one-shot"` chooses the startup profile for a private isolated call. The CLI infers that
+profile automatically for single local inputs, and uses the reuse profile for batches.
+One-shot Multilingual auto uses eager execution to skip TileLang startup; reusable sessions enable its
+available fused kernels. `acceleration: "on"` opts into kernel initialization for a one-shot.
+`graphs: "auto"|"on"|"off"` overrides graph policy; other explicit model/device/runtime options still win.
+
 ```js
 import { createLaya, top, gate } from "./demo/laya.mjs";   // or from your copy, with LAYA_DIR set
 
@@ -39,9 +48,16 @@ await laya.close();
 | `local` | the model in this process (no background process; N processes = N copies) | 2-3 s every process | inference |
 | `http` | a server you started yourself (`url`); never spawns | - | inference + ~1.5 ms |
 
-Options: `{ mode, model, device, maxLen, readout, acceleration, timeoutMs, port, url, idle, maxAge, lanes, calibration, log }`. `decide(input, opts)`: `input` is a string
+Options: `{ mode, model, device, maxLen, readout, acceleration, graphs, lifetime, timeoutMs, port, url, idle, maxAge, lanes, calibration, log }`. `decide(input, opts)`: `input` is a string
 (wrapped by the preset's state template) or `{ state }`; `opts` = `{ preset, questions, lane, policy, deadlineMs,
-calibration, exec, model, device, maxLen, readout, acceleration }`, all optional. `decideMany(inputs, opts, { concurrency })` keeps the input order.
+calibration, exec, model, device, maxLen, readout, acceleration, graphs }`, all optional. `decideMany(inputs, opts, { concurrency })` keeps the input order.
+
+Questions accept `type: "predicate"` as an alias for `noul`, `choices` for a choice question's `criteria`,
+and `levels` for a score question's `criteria`. Answers and echoed question definitions use the canonical
+schema. See [the request guide](../docs/REQUESTS.md) and [complete ticket JSON](data/ticket-request.json)
+for reading a file and passing its state/questions to the library or sidecar.
+For a complete single-request JSON file, use `node ask.mjs --file demo/data/ticket-request.json --sidecar --json`.
+`demo/cli.mjs --file` accepts batch arrays or `{ items: [...] }`.
 
 ## Vega-U and multilingual
 
@@ -61,10 +77,12 @@ try {
 `readout: "auto"|"engine"`. CLI uses `--model`, `--device`, `--max-len`, `--readout`, and
 `--text-file` for a whole UTF-8 document. The mode table's timing numbers describe original ONNX Laya.
 
-Both Python models accept `acceleration: "auto"|"off"` (`--acceleration` in the CLI).
+Both Python models accept `acceleration: "auto"|"on"|"off"` (`--acceleration` in the CLI).
 `npm run vega:setup` installs Vega's optional kernels; `npm run multilingual:setup` installs the optional
-TileLang runtime for Multilingual. Off restores the original eager/reference path.
-`routing.exec.acceleration` reports the actual kernels/backend and graph use.
+TileLang runtime for Multilingual. On tries the available kernels regardless of lifetime; off restores the
+original eager/reference path. `routing.exec.acceleration` reports the actual kernels/backend and graph use.
+Fresh Python processes still pay runtime import/model-loading costs. The first successful result includes
+`routing.initialization` with phase timings; a `log` callback receives progress on the local path.
 
 The sidecar loads one model family at a time; model/device/context switches release and reload its backend.
 Calibration is model-scoped, and Python results report actual truncation and peak allocated VRAM.

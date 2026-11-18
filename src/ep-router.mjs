@@ -30,6 +30,7 @@
 import { createCpuLoadMeter, queryGpu } from "./metrics.mjs";
 import { pinProcessToPCores } from "./laya-client.mjs";
 import { openLane } from "./lane.mjs";
+import { normalizeQuestions } from "./question-schema.mjs";
 
 export const N_BUCKETS = ["1", "2-3", "4-6", "7-10", "11+"];
 export const nBucket = (n) => (n <= 1 ? "1" : n <= 3 ? "2-3" : n <= 6 ? "4-6" : n <= 10 ? "7-10" : "11+");
@@ -230,11 +231,13 @@ export class LayaRouter {
    * @param {{state?:object, sizes?:number[]}} [o.warmup]  warm every lane (shader compile, EMA priming) before it serves
    * @param {"all"|"first"} [o.waitFor="all"]        resolve when every lane is done, or as soon as the first lane serves;
    *                                                 `router.ready` resolves when all lanes are done either way
+   * @param {"parallel"|"first-available"} [o.loadStrategy="parallel"] first-available probes in configured order and stops at the first usable lane
    * @param {(lane:string, info:{loadMs:number, probeMs:number, warmup:object|null, readyMs:number})=>void} [o.onLaneReady]
    * @param {(m:string)=>void} [o.log]
    */
   static async create(o = {}) {
-    const r = new LayaRouter({ lanes: ["cuda:fp16", "webgpu:fp16", "cpu:8"], policy: "auto", explore: 0.05, sampleLoad: true, gpuKeepAliveMs: 0, minGpuFreeMiB: 2200, pinProcess: true, workers: true, warmup: null, waitFor: "all", onLaneReady: null, ...o });
+    const r = new LayaRouter({ lanes: ["cuda:fp16", "webgpu:fp16", "cpu:8"], policy: "auto", explore: 0.05, sampleLoad: true, gpuKeepAliveMs: 0, minGpuFreeMiB: 2200, pinProcess: true, workers: true, warmup: null, waitFor: "all", loadStrategy: "parallel", onLaneReady: null, ...o });
+    if (!["parallel", "first-available"].includes(r.opts.loadStrategy)) throw new Error("loadStrategy must be parallel or first-available");
     // in the background: overlaps with the model loads, done before the first call
     const pinned = r.opts.pinProcess ? pinProcessToPCores({ log: r.log }) : Promise.resolve({ applied: false, reason: "disabled" });
     const gpu = await queryGpu();
@@ -244,23 +247,32 @@ export class LayaRouter {
     let firstReady;
     const first = new Promise((resolve) => (firstReady = resolve));
     for (const lane of r.opts.lanes) r.loading.add(lane);
-    r.ready = Promise.all(
-      r.opts.lanes.map((lane) =>
-        r._probeLane(lane, gpu).then((ok) => {
-          r.loading.delete(lane);
-          if (ok) firstReady();
-        }),
-      ),
-    ).then(() => {
-      if (!r.lanes.size) throw new Error("LayaRouter: no lane could be loaded");
-      return r;
-    });
+    r.ready = r._loadConfiguredLanes(gpu, firstReady);
     r.ready.catch(() => {}); // awaited below and/or by the caller; never an unhandled rejection
     if (r.opts.waitFor === "first") await Promise.race([first, r.ready]);
     else await r.ready;
     r.processAffinity = await pinned;
     if (r.opts.sampleLoad) r._startSampling(!!gpu);
     return r;
+  }
+
+  async _loadConfiguredLanes(gpu, firstReady = () => {}) {
+    const probe = async (lane) => {
+      const ok = await this._probeLane(lane, gpu);
+      this.loading.delete(lane);
+      if (ok) firstReady();
+      return ok;
+    };
+    if (this.opts.loadStrategy === "first-available") {
+      for (const lane of this.opts.lanes) {
+        if (this.closed || await probe(lane)) break;
+      }
+      this.loading.clear();
+    } else {
+      await Promise.all(this.opts.lanes.map(probe));
+    }
+    if (!this.lanes.size) throw new Error("LayaRouter: no lane could be loaded");
+    return this;
   }
 
   /** Lanes that are still loading (waitFor: "first"). */
@@ -520,6 +532,7 @@ export class LayaRouter {
   async decide(state, questions, o = {}) {
     if (this.closed) throw new Error("router is closed");
     if (!this.lanes.size) throw new Error(this.loading.size ? `no lane ready yet (loading ${[...this.loading].join(", ")})` : "no lanes loaded");
+    questions = normalizeQuestions(questions);
     const n = Object.keys(questions).length;
     const work = estimateWork(state, questions);
     const policy = o.policy ?? this.opts.policy;

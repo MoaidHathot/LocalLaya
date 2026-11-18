@@ -12,7 +12,9 @@ export const MODELS = {
 export const MODEL_NAMES = Object.keys(MODELS);
 export const DEVICES = ["auto", "cpu", "cuda"];
 export const READOUTS = ["auto", "engine"];
-export const ACCELERATIONS = ["auto", "off"];
+export const ACCELERATIONS = ["auto", "on", "off"];
+export const GRAPH_MODES = ["auto", "on", "off"];
+for (const model of Object.values(MODELS)) model.graphs = GRAPH_MODES;
 MODELS.vega.accelerations = ACCELERATIONS;
 MODELS.multilingual.accelerations = ACCELERATIONS;
 export const PYTHON = process.env.LAYA_MODEL_PYTHON ?? path.join(PROJECT_ROOT, ".venv-laya", process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
@@ -45,16 +47,19 @@ export function modelOptions(o = {}, defaults = {}) {
   if (model === "vega" && o.calibration != null) throw bad("LocalLaya temperature tables cannot be applied to Vega; Vega uses its own checkpoint calibration");
   if (model === "laya" && o.acceleration !== undefined) throw bad("acceleration controls the Python models; use model=vega or multilingual (original Laya uses exec.graph)");
   const acceleration = o.acceleration ?? (sameModel ? defaults.acceleration : undefined) ?? "auto";
-  if (!ACCELERATIONS.includes(acceleration)) throw bad("acceleration must be auto or off");
-  return { model, device, maxLen, readout, ...(model !== "laya" ? { acceleration } : {}) };
+  if (!ACCELERATIONS.includes(acceleration)) throw bad("acceleration must be auto, on or off");
+  const graphs = o.graphs ?? defaults.graphs ?? "auto";
+  if (!GRAPH_MODES.includes(graphs)) throw bad("graphs must be auto, on or off");
+  if (model !== "laya" && acceleration === "off" && graphs === "on") throw bad("graphs=on needs acceleration=auto or on for Python models");
+  return { model, device, maxLen, readout, graphs, ...(model !== "laya" ? { acceleration } : {}) };
 }
 
 export function modelArgs(args) {
   return Object.fromEntries([
-    ["model", args.model], ["device", args.device], ["maxLen", args["max-len"] === undefined ? undefined : Number(args["max-len"])], ["readout", args.readout], ["acceleration", args.acceleration],
+    ["model", args.model], ["device", args.device], ["maxLen", args["max-len"] === undefined ? undefined : Number(args["max-len"])], ["readout", args.readout], ["acceleration", args.acceleration], ["graphs", args.graphs],
   ].filter(([, v]) => v !== undefined));
 }
 
 export const MODEL_CLI_OPTIONS = {
-  model: { type: "string" }, device: { type: "string" }, "max-len": { type: "string" }, readout: { type: "string" }, acceleration: { type: "string" },
+  model: { type: "string" }, device: { type: "string" }, "max-len": { type: "string" }, readout: { type: "string" }, acceleration: { type: "string" }, graphs: { type: "string" },
 };

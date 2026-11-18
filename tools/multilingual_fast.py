@@ -72,9 +72,10 @@ def repeat_graphs(fast):
 
 
 class MultilingualAcceleration:
-    def __init__(self, agent, requested="auto"):
+    def __init__(self, agent, requested="auto", graph_replay=True):
         self.agent = agent
         self.requested = requested
+        self.graph_replay = graph_replay
         self.versions = {}
         self.reason = None
         if requested == "off" or agent.device.type != "cuda":
@@ -86,7 +87,7 @@ class MultilingualAcceleration:
                 self.versions[package] = importlib.metadata.version(package)
                 if self.versions[package] != version:
                     raise ImportError(f"{package}=={version} required; run npm run multilingual:setup")
-            agent.set_backend("tilelang", strict=True, use_graphs=True)
+            agent.set_backend("tilelang", strict=True, use_graphs=graph_replay)
             self.prepare()
         except Exception as exc:
             # Optional acceleration must leave the existing eager model usable.
@@ -97,6 +98,8 @@ class MultilingualAcceleration:
         # Upstream can reinstall the backend after an OOM/CPU retry. Bound the new
         # cache too, without retaining an old FastLaya and its device weights.
         fast = getattr(self.agent.backend_object, "fast", None)
+        if fast is not None:
+            fast.use_graphs = self.graph_replay
         if fast is not None and not isinstance(fast.graphs, GraphCache):
             cache = GraphCache()
             cache.update(fast.graphs)
@@ -111,7 +114,7 @@ class MultilingualAcceleration:
         used = active and actual_device != "cpu" and not cpu_fallback
         return {"requested": self.requested, "backend": "tilelang" if used else "eager",
                 "versions": self.versions, "reason": self.reason,
-                "graphs": fast.graphs.stats() if fast is not None else {"entries": 0, "hits": 0, "builds": 0},
+                "graphs": {**(fast.graphs.stats() if fast is not None else {"entries": 0, "hits": 0, "builds": 0}), "enabled": used and self.graph_replay},
                 "kernelVariants": len(fast._attn_k) if fast is not None else 0}
 
 

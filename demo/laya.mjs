@@ -21,7 +21,7 @@
  *
  * decide(input, opts)
  *   input   a string (wrapped by the preset's state template) or { state: <any JSON> }
- *   opts    { preset, questions, model, device, maxLen, readout, lane, policy, deadlineMs, calibration, exec }
+ *   opts    { preset, questions, model, device, maxLen, readout, acceleration, graphs, lane, policy, deadlineMs, calibration, exec }
  * decideMany(inputs, opts, { concurrency = 4 })   same, for a list; results in input order; the sidecar serves
  *   them one at a time (one queue), concurrency only overlaps the HTTP round trips.
  *
@@ -80,7 +80,7 @@ const toBody = (input, opts = {}) => {
   else if (input && typeof input === "object" && "state" in input) body.state = input.state;
   else if (input && typeof input === "object") body.state = input;
   else throw new Error("decide(): input must be a string or an object");
-  for (const k of ["preset", "questions", "lane", "policy", "deadlineMs", "calibration", "exec", "model", "device", "maxLen", "readout", "acceleration"]) if (opts[k] !== undefined) body[k] = opts[k];
+  for (const k of ["preset", "questions", "lane", "policy", "deadlineMs", "calibration", "exec", "model", "device", "maxLen", "readout", "acceleration", "graphs"]) if (opts[k] !== undefined) body[k] = opts[k];
   return body;
 };
 
@@ -106,6 +106,9 @@ async function mapLimit(items, limit, fn) {
  * @param {"auto"|"cpu"|"cuda"} [o.device="auto"] execution device; legacy --lane supports WebGPU / DML too
  * @param {number} [o.maxLen]           Python context budget, default 73728 (Vega) or 8192 (multilingual)
  * @param {"auto"|"engine"} [o.readout="auto"] Vega readout
+ * @param {"auto"|"on"|"off"} [o.acceleration="auto"] auto skips TileLang for one-shot Multilingual; on tries kernels, off uses eager
+ * @param {"one-shot"|"persistent"} [o.lifetime="persistent"] local model's expected reuse; remote servers always manage reusable sessions
+ * @param {"auto"|"on"|"off"} [o.graphs="auto"] graph capture policy; auto follows the model's lifetime
  * @param {number} [o.timeoutMs=600000] decision timeout for the HTTP client / local Python worker
  * @param {number} [o.port]            sidecar port (default LAYA_PORT or 8787)
  * @param {string} [o.url]             mode "http": base URL of a running server, e.g. http://127.0.0.1:8787
@@ -168,11 +171,12 @@ export async function createLaya(o = {}) {
   const t0 = performance.now();
   const router = await ModelRouter.create({
     ...defaults,
+    lifetime: o.lifetime ?? "persistent",
     ...(o.lanes ? { lanes: o.lanes.split(",") } : {}),
+    lane: o.lane, policy: o.policy, deadlineMs: o.deadlineMs,
     timeoutMs: o.timeoutMs,
     waitFor: "first",
-    gpuKeepAliveMs: 30_000,
-    warmup: { state: { text: "Please turn off the lights in the living room now" }, sizes: [3, 5] },
+    ...(o.lifetime === "one-shot" ? {} : { warmup: { state: { text: "Please turn off the lights in the living room now" }, sizes: [3, 5] } }),
     log: (m) => log(`  ${m}`),
   });
   log(`model loaded in this process in ${((performance.now() - t0) / 1000).toFixed(1)} s (lanes ${[...router.lanes.keys()].join(", ")})`);

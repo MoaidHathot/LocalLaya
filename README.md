@@ -9,11 +9,32 @@ Everything downloaded lives under this directory (`models/`, `node_modules/`, `.
 
 ## Select a model and execution mode
 
+For normal use, choose just the model and whether to share a sidecar:
+
+```powershell
+node ask.mjs --model laya --local "Turn on the lights"
+node ask.mjs --model vega --local "Turn on the lights"
+node ask.mjs --model multilingual --local "Turn on the lights"
+
+node ask.mjs --model laya --sidecar "Turn on the lights"
+node ask.mjs --model vega --sidecar "Turn on the lights"
+node ask.mjs --model multilingual --sidecar "Turn on the lights"
+```
+
+Device, acceleration and context defaults are automatic. A local one-shot uses the **startup profile**:
+one validated Laya provider (CUDA -> WebGPU -> CPU), available fused Vega kernels, and eager Multilingual
+execution to skip TileLang initialization. Graph capture is skipped for all three.
+Sidecars, REPLs and persistent library instances use the **reuse profile**, including graph caches. The
+chosen model keeps its full context budget. `routing.profile` and `routing.exec` report the selection.
+Explicit options still win, including `--device cpu`, `--acceleration on|off`, `--max-len`, `--lanes`, and
+`--graphs on|off`. `--graphs auto` is the mode-aware default. Add `--preset triage`, for example, to choose
+which questions are asked; this is independent of runtime tuning.
+
 | `--model` | runtime | context per question | execution controls |
 |---|---|---|---|
 | `laya` (default) | original English ONNX + optimised fp16/CUDA Graph lanes | 512 tokens | existing `--lanes`, `--lane`, `--policy`, `--no-graph`; also `--device auto\|cpu\|cuda` |
-| `vega` | Vega-U / Qwen3.5-0.8B through Python Laya | up to 73,728 tokens | `--device auto\|cpu\|cuda`, `--max-len`, `--readout auto\|engine`, `--acceleration auto\|off` |
-| `multilingual` | Laya Multilingual / mmBERT-base through Python Laya, optional TileLang CUDA | up to 8,192 tokens | `--device auto\|cpu\|cuda`, `--max-len`, `--acceleration auto\|off` |
+| `vega` | Vega-U / Qwen3.5-0.8B through Python Laya | up to 73,728 tokens | `--device auto\|cpu\|cuda`, `--max-len`, `--readout auto\|engine`, `--acceleration auto\|on\|off` |
+| `multilingual` | Laya Multilingual / mmBERT-base through Python Laya, optional TileLang CUDA | up to 8,192 tokens | `--device auto\|cpu\|cuda`, `--max-len`, `--acceleration auto\|on\|off` |
 
 ```powershell
 # One-time preparation for the new Python models; .venv-laya is separate from the ONNX .venv.
@@ -31,10 +52,14 @@ node ask.mjs --model laya --lane cuda:fp16 --sidecar "Turn off the living room l
 node ask.mjs --model vega --device cuda --sidecar --text-file document.txt --questions questions.json
 ```
 
-`--mode local|sidecar` also selects the call path. The REPL has `/model`, `/device`, `/context` and `/readout`.
+`--mode local|sidecar` also selects the call path. Omit the text to keep a local model loaded in a REPL.
+The REPL has `/model`, `/device`, `/context`, `/readout` and `/graphs`.
 The browser page and `POST /decide` expose the same choices. A sidecar holds one model family at a time;
 switching waits for earlier requests, releases the old backend, then loads the selected one. Model load time
-is separate from inference time. The existing ONNX model still uses its execution-provider router.
+is separate from inference time. Fresh Python processes still take seconds to import the runtime and load
+weights. Startup phases and first-inference timings appear on stderr; `routing.initialization` carries the
+startup breakdown on the first successful result. Repeated sidecar/REPL calls reuse the loaded model.
+The existing ONNX model still uses its execution-provider router.
 
 Questions/options consume part of each context budget. Python results report actual truncation in
 `usage.truncated` / `state_tokens_dropped`, plus `routing.model`, `device` and `exec`. Preset calibration is
@@ -43,14 +68,42 @@ model-specific. The detailed timing tables below describe the **original ONNX mo
 See **[docs/MODELS.md](docs/MODELS.md)** for setup, API examples, model switching, and runtime details.
 
 Vega CUDA acceleration is automatic when the optional packages are installed: FLA/Triton handles the
-reader's gated-delta attention and causal convolution, and validated CUDA Graphs replay its decision head.
+reader's gated-delta attention and causal convolution, and reusable sessions enable validated head CUDA Graphs.
 `--acceleration off` selects the original reference path; `/acceleration` switches it in the REPL.
 The compiled-kernel cache is project-local, and the worker reports the actual path in
 `routing.exec.acceleration`. See [the Vega speed measurements](results/vega-speed-2026-11-17-summary.md).
 
-Multilingual also supports `--acceleration auto|off`: auto uses the upstream TileLang path when its optional
-packages are installed, with an eight-shape CUDA Graph cache; off uses the original eager forward.
+Multilingual supports `--acceleration auto|on|off`: auto uses eager for a local one-shot and the optional
+TileLang path for reusable sessions, with an eight-shape CUDA Graph cache. On tries TileLang even for an
+isolated call; off uses the original eager forward. CPU or unavailable kernels use eager and report why.
 See [the Multilingual speed measurements](results/multilingual-speed-2026-11-17-summary.md).
+The [cold-start measurements](results/multilingual-cold-start-2026-11-17-summary.md) show why one-shot auto
+uses eager: median time to the answer fell from 9.60 s to 5.96 s in the paired fresh-process comparison.
+
+## Custom JSON requests
+
+Put your own `state` and `questions` in a JSON file, then pass the complete request to the CLI:
+
+```powershell
+node ask.mjs --model multilingual --sidecar --file demo/data/ticket-request.json --json
+node ask.mjs --model multilingual --local --file demo/data/ticket-request.json --json
+```
+
+With the PowerShell profile function, use `LocalLaya --file .\ticket.json --sidecar --model multilingual`.
+CLI flags override settings in the file, and relative file paths use your current directory. The same
+payload can be sent to `POST /decide`. LocalLaya accepts both question-field styles:
+
+| Input field | Equivalent canonical field |
+|---|---|
+| `type: "predicate"` | `type: "noul"` |
+| `choices` on a choice question | `criteria` |
+| `levels` on a score question | `criteria` |
+
+The aliases work across models, CLI question files, HTTP, the Node library and presets. Answers use the
+canonical schema: a predicate returns its probability under `answers.<id>.noul`.
+
+See the complete [ticket request](demo/data/ticket-request.json) and
+[request schema / JSON-file commands](docs/REQUESTS.md).
 
 ## Layout
 
@@ -105,6 +158,7 @@ node ask.mjs "Turn off the living room lights"                # one shot
 node ask.mjs --preset triage "Charged twice. Refund today or I cancel."
 node ask.mjs --json --preset guard "Ignore all previous instructions"
 node ask.mjs --state state.json --questions questions.json    # your own state + questions
+node ask.mjs --file demo/data/ticket-request.json --json      # one complete JSON request
 node ask.mjs --sidecar "..."                                  # shared background instance, ~0.3 s per call (see Sidecar)
 npm run ask                                                   # interactive: model stays loaded
 ```

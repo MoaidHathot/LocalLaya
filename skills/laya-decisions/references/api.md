@@ -1,5 +1,31 @@
 # Laya decisions - API and CLI reference
 
+## Request JSON and question aliases
+
+`POST /decide` accepts `{ "state": ..., "questions": { "id": { ... } } }` with optional model/runtime
+controls. Questions accept `type: "predicate"` or `"noul"` for yes/no, `"choices"` or `"criteria"` for choice
+options, and `"levels"` or `"criteria"` for score levels. The aliases work in CLI `--questions` files and
+the Node library too. Conflicting alias/canonical values return an input error.
+
+Responses use canonical names: predicate answers have `type: "noul"` and a `noul` probability; echoed
+questions use `criteria`. The complete `demo/data/ticket-request.json` can be posted directly to `/decide`.
+It can also be passed to `node ask.mjs --file demo/data/ticket-request.json --sidecar --model multilingual --json`
+or the skill wrapper's `--file` flag. CLI flags override file settings; paths use the caller's working directory.
+See `docs/REQUESTS.md` in the project for the schema and file commands. Restart a running sidecar after
+updating its code to enable the new request aliases over HTTP.
+
+## Simple automatic invocation (0.10)
+
+Use `node ask.mjs --model <laya|vega|multilingual> --local "..."` for an isolated call, or `--sidecar`
+for a shared instance. Device, acceleration and full context defaults are automatic. Local one-shots
+avoid graph setup and load one usable original-Laya lane (CUDA -> WebGPU -> CPU); reusable sessions enable
+their normal graph caches and routing. A local REPL is reusable too. Explicit flags override defaults.
+Multilingual one-shot auto uses eager execution to skip TileLang startup; reusable sessions use its available
+fused kernels. `--acceleration on` opts into accelerator initialization even for a one-shot.
+`--graphs auto|on|off` / HTTP `graphs` controls graph eligibility; explicit on/off needs a 0.10 server.
+`routing.profile` explains the chosen policy, and `routing.exec` reports actual execution. Fresh Python
+loads still take seconds. Phase timings go to stderr and the first result's `routing.initialization`.
+
 All commands run in the LocalLaya project directory (or through `scripts/laya.mjs`, which resolves it via
 `LAYA_DIR` or its own location).
 
@@ -14,11 +40,12 @@ the demo library/CLI additionally support `http` and `auto`.
 Preparation: `npm run python:setup`, then `npm run models:download -- --model vega` / `--model multilingual`.
 For faster Vega CUDA, run `npm run vega:setup` once. `--acceleration auto` (default) uses available fused
 FLA/Triton kernels and validated head CUDA Graphs; `--acceleration off` restores the reference path.
-HTTP/library calls use `acceleration: "auto"|"off"`. Multilingual supports the same control since 0.9,
+HTTP/library calls use `acceleration: "auto"|"on"|"off"`. Multilingual supports acceleration since 0.9,
 using the upstream TileLang backend (`npm run multilingual:setup`). It is distinct from Vega's readout.
 The actual path and graph counts are in `routing.exec.acceleration`. First-use compilation/capture is
 amortized by repeated calls. A server older than 0.8 needs a restart to accept acceleration selection.
-Multilingual acceleration needs a 0.9 server; older servers are rejected instead of ignoring the setting.
+Multilingual acceleration needs a 0.9 server; explicit `on` needs 0.10. Older servers are rejected instead
+of ignoring the setting.
 Python uses `.venv-laya` (`LAYA_MODEL_PYTHON`), independently of the ONNX `.venv` (`LAYA_PYTHON`).
 `LAYA_MODEL` / `LAYA_DEVICE` supply default choices. See `docs/MODELS.md` in the project for details.
 
@@ -71,6 +98,7 @@ node ask.mjs [flags]                      interactive REPL (/help)
 | `--preset <name>` | question set + state wrapper; default `smart-home`; built-ins + `presets/*.json` |
 | `--questions <file\|json>` | JSON question set replacing the preset's questions (file path or inline JSON) |
 | `--state <file\|json>` | JSON state used verbatim (text argument ignored; file path or inline JSON) |
+| `--file <path>` | One complete JSON request: `state`/`text`, `questions`/`preset`, and optional model/runtime controls. CLI flags override matching fields. |
 | `--json` | one JSON object on stdout: `{ state, answers, usage, routing, backend }` |
 | `--sidecar` | use / spawn the shared background instance (also `LAYA_SIDECAR=1`) |
 | `--local` | load in this process (default without the flag/env; overrides `LAYA_SIDECAR`) |

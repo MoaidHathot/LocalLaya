@@ -5,6 +5,53 @@ The chronological record of how we got here is in `docs/sessions/`.
 
 ## Goal
 
+### Complete request files (2026-11-18)
+
+- `ask.mjs --file ticket.json` reads one complete request, including state/text, questions/preset and
+  model/runtime controls. The `LocalLaya` PowerShell profile function forwards this flag directly.
+  Explicit CLI settings take precedence over file settings, then environment values and defaults.
+- Works with local one-shot and shared-sidecar modes. Caller-relative paths and UTF-8 BOMs are supported;
+  the skill wrapper delegates with an absolute entry point and preserves the caller's working directory.
+- Shared validation covers execution/calibration settings. Invalid JSON, unsupported fields, malformed
+  question schemas and conflicting input-source flags are rejected before model startup.
+- Verified: 33 unit/CLI-protocol scenarios and both real-model schema scenarios passed, including complete
+  file calls through local/sidecar execution, field aliases, explicit overrides and the skill wrapper.
+
+### Question schema aliases (2026-11-18)
+
+- Accept `predicate` as `noul`, choice `choices` as `criteria`, and score `levels` as `criteria`.
+  One normalizer serves HTTP, local/remote CLIs, Node deciders and JSON/module presets, before model
+  routing and calibration. Canonical field names and matching duplicate fields are accepted too.
+- Invalid/conflicting alias fields produce input errors before inference or model switching. Caller-owned
+  objects are preserved; responses use the canonical answer and question schema.
+- [`demo/data/ticket-request.json`](../demo/data/ticket-request.json) contains the complete user example;
+  [`docs/REQUESTS.md`](REQUESTS.md) documents the schema, file commands and output fields.
+- Verified: 27 unit scenarios and both real-model schema scenarios passed. The original JSON and canonical
+  spelling returned identical answers for all three models; local/HTTP library calls, both CLIs, the skill
+  wrapper and JSON-file inputs were exercised.
+
+### 0.10 - model + mode automatic profiles
+
+- `ask.mjs --model <name> --local|--sidecar` is enough for runtime selection. Local one-shots use a startup
+  profile: first validated Laya provider in CUDA/WebGPU/CPU order, no background sampling/keep-alive or
+  graph capture. Vega keeps available fused kernels; Multilingual uses eager to skip TileLang initialization.
+  Both keep their full context. REPLs, servers and normal
+  library instances use a persistent/reuse profile.
+- Optional `--graphs auto|on|off` overrides graph policy; `--acceleration on` tries available kernels even
+  for a one-shot. Device, acceleration, context and explicit lane
+  settings retain precedence. `routing.profile` explains the resolved policy; `routing.exec` reports actual
+  execution. `createLaya({ lifetime: "one-shot" })` opts a private library instance into the startup profile.
+- Automatic Python loading retries CUDA allocation failures on CPU; explicit CUDA and checkpoint errors
+  remain explicit. Multilingual can use fused kernels with graphs off by choosing acceleration on.
+- Python startup now logs import/CUDA/checkpoint/backend phases and first-inference timing. The first
+  successful result carries `routing.initialization`; runtime progress stays on stderr, keeping JSON clean.
+- Fresh-process Multilingual comparison: median time to the first answer 9.60 -> 5.96 s (37.9% lower),
+  with 15/15 repeated short-input decisions matching. TileLang initialization accounted for ~3.6 s.
+  [Cold-start report](../results/multilingual-cold-start-2026-11-17-summary.md).
+- Verified: 23 Node unit tests, 4 real profile scenarios (including CPU-only device-policy tests), the
+  Multilingual cache/control checks, and 27 router/sidecar/demo regression scenarios. The minimal local
+  and sidecar requests work with all three models; explicit graph and CPU overrides were exercised.
+
 ### 0.9 - Multilingual acceleration (2026-11-17)
 
 - Multilingual now accepts `--acceleration auto|off` across the CLI, REPL, HTTP/browser, demo and skill.

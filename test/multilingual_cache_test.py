@@ -63,19 +63,20 @@ class MultilingualAccelerationTests(unittest.TestCase):
 
     def test_off_and_cpu_do_not_require_optional_packages(self):
         with patch("importlib.metadata.version", side_effect=AssertionError("dependency probe")):
-            for device, requested in [("cpu", "auto"), ("cuda", "off")]:
+            for device, requested in [("cpu", "auto"), ("cpu", "on"), ("cuda", "off")]:
                 agent = AgentStub(device)
                 controller = MultilingualAcceleration(agent, requested)
                 self.assertEqual(controller.stats()["backend"], "eager")
                 self.assertEqual(agent.calls, [])
 
     def test_missing_dependency_preserves_eager(self):
-        agent = AgentStub()
-        with patch("importlib.metadata.version", side_effect=importlib.metadata.PackageNotFoundError("tilelang")):
-            controller = MultilingualAcceleration(agent)
-        self.assertEqual(controller.stats()["backend"], "eager")
-        self.assertIn("unavailable", controller.reason)
-        self.assertEqual(agent.calls, ["eager"])
+        for requested in ["auto", "on"]:
+            agent = AgentStub()
+            with patch("importlib.metadata.version", side_effect=importlib.metadata.PackageNotFoundError("tilelang")):
+                controller = MultilingualAcceleration(agent, requested)
+            self.assertEqual(controller.stats()["backend"], "eager")
+            self.assertIn("unavailable", controller.reason)
+            self.assertEqual(agent.calls, ["eager"])
 
     def test_reinstalled_backend_gets_a_new_bounded_cache(self):
         agent = AgentStub()
@@ -88,6 +89,17 @@ class MultilingualAccelerationTests(unittest.TestCase):
             self.assertIsInstance(fast.graphs, GraphCache)
             self.assertEqual(controller.stats("cuda")["backend"], "tilelang")
             self.assertEqual(controller.stats("cpu", cpu_fallback=True)["backend"], "eager")
+
+    def test_graph_policy_can_disable_capture_without_disabling_fused_backend(self):
+        agent = AgentStub()
+        controller = MultilingualAcceleration(agent, "off", graph_replay=False)
+        agent.backend = "tilelang"
+        fast = SimpleNamespace(graphs={}, _attn_k={})
+        agent.backend_object = SimpleNamespace(fast=fast)
+        controller.prepare()
+        self.assertFalse(fast.use_graphs)
+        self.assertEqual(controller.stats("cuda")["backend"], "tilelang")
+        self.assertFalse(controller.stats("cuda")["graphs"]["enabled"])
 
 
 if __name__ == "__main__":

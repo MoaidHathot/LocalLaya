@@ -42,6 +42,9 @@ Unmeasured presets are reasonable question sets, not validated classifiers. Meas
 - `choice.criteria`: `{ key: "short description" }` (or an array of keys). `score.criteria`: ordered array, index 0
   = lowest. `noul.criteria` (optional): `{ true: "...", false: "..." }` descriptions.
 - Question ids become the keys of `answers`.
+- Aliases are accepted in presets and request/question JSON: `type: "predicate"` means `noul`,
+  `choice.choices` means `choice.criteria`, and `score.levels` means `score.criteria`. Matching duplicate
+  fields are accepted; conflicting values are an input error. Outputs use canonical `noul`/`criteria` names.
 
 Rules of thumb for options (they are model input, scored at their own `[MASK]` token):
 

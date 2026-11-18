@@ -7,6 +7,7 @@
  *
  *   node scripts/laya.mjs --preset triage "Charged twice, refund me today"
  *   node scripts/laya.mjs --state '{"text":"..."}' --questions q.json          # own state + questions (file or inline JSON)
+ *   node scripts/laya.mjs --file ticket.json                                  # complete JSON request, shared sidecar
  *   node scripts/laya.mjs --local "..."         # in-process instead of the sidecar (no background process)
  *   node scripts/laya.mjs --status | --stop | --start
  *   node scripts/laya.mjs --pretty "..."        # human-readable instead of JSON
@@ -50,7 +51,9 @@ try {
       "max-len": { type: "string" },
       readout: { type: "string" },
       acceleration: { type: "string" },
+      graphs: { type: "string" },
       mode: { type: "string" },
+      file: { type: "string" },
       "text-file": { type: "string" },
       policy: { type: "string" },
       "no-graph": { type: "boolean" },
@@ -77,18 +80,18 @@ try {
 const { values: a, positionals } = parsed;
 const text = positionals.join(" ").trim();
 const lifecycle = a.status || a.stop || a.start || a.help;
-const oneShot = !lifecycle && !a.local && !a.pretty && !a.mode && !a["text-file"] && (text || a.state);
+const oneShot = !lifecycle && !a.local && !a.pretty && !a.mode && a.file === undefined && !a["text-file"] && (text || a.state);
 
-/** Everything the fast path does not cover goes to ask.mjs in the project directory (same exit codes). */
+/** Delegate with an absolute entry point, preserving caller-relative input file paths. */
 function delegate(extra = []) {
   const passthrough = argv.filter((x) => x !== "--pretty");
-  const finalArgs = ["ask.mjs", ...passthrough, ...extra];
+  const finalArgs = [path.join(projectDir, "ask.mjs"), ...passthrough, ...extra];
   if (!lifecycle) {
     if (!a.local && !a.sidecar && !a.mode && !extra.includes("--local")) finalArgs.push("--sidecar");
     // one-shot answers as JSON unless --pretty; the REPL (no text / state) stays human-readable
-    if (!a.pretty && !a.json && (text || a.state || a["text-file"])) finalArgs.push("--json");
+    if (!a.pretty && !a.json && (text || a.state || a["text-file"] || a.file !== undefined)) finalArgs.push("--json");
   }
-  const child = spawn(process.execPath, finalArgs, { cwd: projectDir, stdio: "inherit", windowsHide: true });
+  const child = spawn(process.execPath, finalArgs, { stdio: "inherit", windowsHide: true });
   child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
   child.on("error", (e) => {
     console.error(`laya.mjs: failed to start node: ${e.message}`);

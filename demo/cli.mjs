@@ -13,7 +13,8 @@
  *   node demo/cli.mjs --model vega --device cuda --mode local --text-file document.txt --questions questions.json
  *   node demo/cli.mjs --model multilingual --max-len 8192 --preset triage "..."
  * Models: --model laya|vega|multilingual, --device auto|cpu|cuda, --max-len <tokens>, --readout auto|engine (Vega).
- * Python model speed: --acceleration auto (default) | off (reference); vega:setup / multilingual:setup install optional kernels.
+ * Python model speed: --acceleration auto (mode-aware default) | on (try fused kernels) | off (reference).
+ * Multilingual one-shot auto skips TileLang startup; reusable sessions enable it. --graphs auto|on|off overrides graph policy.
  *
  * Modes: --mode auto (default: sidecar, spawned on demand, fall back to local) | sidecar | local | http --url <base>.
  * Per-call overrides: --lane <lane>, --policy auto|prefer-gpu|prefer-cpu|min-cpu, --deadline <ms>, --no-graph
@@ -81,7 +82,8 @@ if (a["no-graph"]) opts.exec = { graph: false };
 
 let laya;
 try {
-  laya = await createLaya({ ...modelArgs(a), mode: a.mode, url: a.url, port: a.port ? Number(a.port) : undefined, lanes: a.lanes, log: say });
+  laya = await createLaya({ ...modelArgs(a), mode: a.mode, lifetime: a.file ? "persistent" : "one-shot", url: a.url,
+    port: a.port ? Number(a.port) : undefined, lanes: a.lanes, lane: a.lane, policy: a.policy, deadlineMs: opts.deadlineMs, log: say });
 } catch (e) {
   say(`error: ${e.message}`);
   process.exit(1);

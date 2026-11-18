@@ -126,7 +126,8 @@ export const DEFAULT_PRESET = "smart-home";
 //     "state": { "request": "$TEXT", "app": "my tool" },   // template; "$TEXT" is replaced by the message.
 //                                                           // A string means a single key: "state": "request".
 //                                                           // Omitted -> { "text": "$TEXT" }
-//     "questions": { "<id>": { "type": "choice|score|noul", "instructions": "...", "criteria": ... } }
+//     "questions": { "<id>": { "type": "choice|score|noul|predicate", "instructions": "...", "criteria": ... } }
+//     // aliases: choices for choice criteria, levels for score criteria
 //   }
 // presets/<name>.mjs:   export default { description, state: (text) => ({ ... }), questions }
 //
@@ -135,6 +136,7 @@ export const DEFAULT_PRESET = "smart-home";
 import { readdir, readFile, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
+import { normalizeQuestions } from "../src/question-schema.mjs";
 
 export const PRESETS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "presets");
 
@@ -150,7 +152,7 @@ export function presetFromJson(obj, name = "preset") {
   if (!obj || typeof obj !== "object" || !obj.questions || !Object.keys(obj.questions).length) throw new Error(`preset ${name}: "questions" (non-empty object) required`);
   const template = obj.state === undefined ? { text: "$TEXT" } : typeof obj.state === "string" ? { [obj.state]: "$TEXT" } : obj.state;
   if (JSON.stringify(template).indexOf('"$TEXT"') < 0) throw new Error(`preset ${name}: state template must contain "$TEXT" somewhere`);
-  return { description: obj.description ?? "", state: (text) => fill(template, text), questions: obj.questions, template, source: obj.source ?? "file" };
+  return { description: obj.description ?? "", state: (text) => fill(template, text), questions: normalizeQuestions(obj.questions), template, source: obj.source ?? "file" };
 }
 
 /** JSON form of a (possibly built-in) preset with the given question set and extra state fields. */
@@ -176,7 +178,7 @@ export async function loadPresets(dir = PRESETS_DIR) {
       else {
         const mod = (await import(pathToFileURL(path.join(dir, f)).href)).default;
         if (typeof mod?.state !== "function" || !mod?.questions) throw new Error("default export needs state(text) and questions");
-        all[name] = { ...mod, source: "file" };
+        all[name] = { ...mod, questions: normalizeQuestions(mod.questions), source: "file" };
       }
       all[name].file = path.join(dir, f);
     } catch (e) {

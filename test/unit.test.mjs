@@ -1,10 +1,76 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { chooseLane, LatencyModel, LayaRouter, nBucket, thermalState, DEFAULT_PRIORS, estimateWork, LOAD_STALE_MS } from "../src/ep-router.mjs";
 import { parseDuration, SidecarError } from "../src/sidecar-client.mjs";
 import { bucketKey, fitTemperature, metrics, optionCount, optionLabels, softmax } from "../src/calibration.mjs";
 import { presetFromJson, presetToJson, PRESETS } from "../data/presets.mjs";
 import { buildSessionConfig, parseWebgpuOptions, pCoreAffinity } from "../src/laya-client.mjs";
+import { normalizeQuestions } from "../src/question-schema.mjs";
+import { validateQuestions } from "../src/decide-core.mjs";
+
+test("the ticket request aliases preserve question IDs, option order and caller-owned data", async () => {
+  const { questions } = JSON.parse(await readFile(new URL("../demo/data/ticket-request.json", import.meta.url), "utf8"));
+  const before = structuredClone(questions);
+  const freeze = (x) => { if (x && typeof x === "object") { Object.values(x).forEach(freeze); Object.freeze(x); } };
+  freeze(questions);
+  const normalized = normalizeQuestions(questions);
+  assert.deepEqual(normalized, {
+    refund: { type: "noul", instructions: questions.refund.instructions },
+    team: { type: "choice", instructions: questions.team.instructions, criteria: questions.team.choices },
+    severity: { type: "score", instructions: questions.severity.instructions, criteria: questions.severity.levels },
+  });
+  assert.deepEqual(Object.keys(normalized), ["refund", "team", "severity"]);
+  assert.deepEqual(Object.keys(normalized.team.criteria), ["billing", "engineering", "support"]);
+  assert.deepEqual(normalized.severity.criteria, ["Low", "Medium", "High"]);
+  assert.deepEqual(questions, before);
+  assert.equal(normalizeQuestions(normalized), normalized, "canonical requests are idempotent across API/router boundaries");
+  assert.doesNotThrow(() => validateQuestions(questions));
+  const preset = presetFromJson({ questions });
+  assert.deepEqual(preset.questions, normalized, "presets also normalize before calibration helpers see the types");
+  assert.equal(bucketKey(preset.questions.refund.type, optionCount(preset.questions.refund)), "noul:2");
+  assert.deepEqual(presetToJson(preset, preset.questions).questions, normalized);
+});
+
+test("question aliases accept arrays, mixed spellings and matching duplicate fields", () => {
+  const criteria = { second: "Second description", first: "First description" };
+  const q = {
+    predicate: { type: "predicate", instructions: "?", criteria: { false: "no", true: "yes" }, extra: "kept" },
+    choice: { type: "choice", instructions: "?", criteria, choices: { first: "First description", second: "Second description" } },
+    array: { type: "choice", instructions: "?", choices: ["second", "first"] },
+    score: { type: "score", instructions: "?", criteria: ["Low", "High"], levels: ["Low", "High"] },
+    legacy: { type: "noul", instructions: "?" },
+  };
+  const normalized = normalizeQuestions(q);
+  assert.deepEqual(normalized.predicate, { ...q.predicate, type: "noul" });
+  assert.deepEqual(Object.keys(normalized.choice.criteria), ["second", "first"]);
+  assert.deepEqual(normalized.array.criteria, ["second", "first"]);
+  assert.deepEqual(normalized.score.criteria, ["Low", "High"]);
+  assert.equal(normalized.legacy, q.legacy);
+  assert.ok(!Object.hasOwn(normalized.choice, "choices"));
+  assert.ok(!Object.hasOwn(normalized.score, "levels"));
+});
+
+test("ambiguous aliases and invalid question shapes are actionable input errors", () => {
+  const invalid = [
+    [{ type: "choice", criteria: ["a", "b"], choices: ["b", "a"] }, /criteria and choices conflict/],
+    [{ type: "score", criteria: ["Low", "High"], levels: ["High", "Low"] }, /criteria and levels conflict/],
+    [{ type: "choice", choices: ["a", "b"], levels: ["a", "b"] }, /levels is only valid/],
+    [{ type: "score", choices: ["Low", "High"] }, /choices is only valid/],
+    [{ type: "predicate", levels: ["no", "yes"] }, /levels is only valid/],
+    [{ type: "choice", choices: "ab" }, /choice needs/],
+    [{ type: "choice", choices: { only: "one" } }, /choice needs/],
+    [{ type: "score", levels: { Low: 0, High: 1 } }, /ordered array/],
+    [{ type: "score", levels: ["only"] }, /ordered array/],
+    [{ type: "predicate", instructions: undefined }, /instructions required/],
+  ];
+  for (const [q, message] of invalid) {
+    assert.throws(() => normalizeQuestions({ ticket: { instructions: "?", ...q } }), (e) => e.status === 400 && e.code === "BAD_REQUEST" && message.test(e.message));
+  }
+  for (const q of [null, [], {}, "questions", { ticket: null }, { ticket: [] }]) {
+    assert.throws(() => normalizeQuestions(q), (e) => e.status === 400);
+  }
+});
 
 test("buildSessionConfig: EP selection, thread pinning, WebGPU provider options", () => {
   // cpu: pinned pool = 16 threads with an affinity string of 15 entries (the caller is the 16th)

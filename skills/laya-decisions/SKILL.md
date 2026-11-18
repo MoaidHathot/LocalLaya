@@ -5,7 +5,7 @@ license: Unlicense (this project). Vendored @receptron/laya is MIT; Laya model w
 compatibility: Requires Node.js 20+ and a checkout of the LocalLaya project (github.com/MoaidHathot/LocalLaya) with the model downloaded (first run fetches 1.7 GB). Tested on Windows 11 with an NVIDIA GPU (fastest with the optional CUDA lane, `npm run cuda:setup`); works CPU-only. Binds 127.0.0.1 only.
 metadata:
   author: moaid
-  version: "1.5"
+  version: "1.6"
   project: LocalLaya (set LAYA_DIR to its checkout path when this skill lives elsewhere)
 ---
 
@@ -19,6 +19,9 @@ The default Laya is a 421M-parameter encoder that answers **typed questions abou
 | `noul` | a yes/no statement | `P(true)` |
 | `score` | ordered levels | expected level (0..n-1) + distribution |
 
+Input aliases: `predicate` for `noul`, `choices` for choice `criteria`, and `levels` for score `criteria`.
+They work in request JSON, CLI question files and presets. Answers use the canonical names above.
+
 It never generates text. It is the fast, cheap step that decides *what to do next* (which tool, which team,
 act or ask, safe or not) so the expensive step (LLM, human, tool) runs only when needed.
 
@@ -28,7 +31,20 @@ From anywhere, via the wrapper (finds the project through `LAYA_DIR` or its own 
 
 ```powershell
 node scripts/laya.mjs --preset triage "Charged twice. Refund today or I cancel."
+node scripts/laya.mjs --model multilingual --file ticket.json
 ```
+
+`--file` reads a complete JSON request containing `state` and `questions` (or `text` and `preset`), plus
+optional model/runtime settings. Paths use your current directory, and explicit CLI settings override
+matching fields in the file. The wrapper prints JSON by default; `--pretty` selects readable output.
+
+Usually only select a model: `--model laya|vega|multilingual`. The wrapper uses the shared sidecar;
+add `--local` for a private one-shot. Runtime defaults follow that choice: one-shots avoid graph setup,
+while reusable sessions cache graphs. Explicit device, acceleration and context flags still override
+defaults; `--graphs on|off` overrides graph policy. `routing.profile` explains the automatic choices.
+Multilingual one-shot auto also skips TileLang initialization. Use `--acceleration on` to opt into that
+cost explicitly. Python imports and checkpoint loading still take seconds in a fresh process; progress
+appears on stderr, with startup timings in the first result's `routing.initialization`.
 
 Select another prepared model with `--model vega` (Vega-U, up to 73,728 tokens) or
 `--model multilingual` (Laya Multilingual, up to 8,192). Both use the project's separate Python runtime;
@@ -37,8 +53,8 @@ Use `--device auto|cpu|cuda`, `--max-len <tokens>`, and `--text-file document.tx
 `--local` runs a private model process; the default wrapper uses the shared sidecar. A sidecar switches
 models on demand and releases the previous backend. The timings below apply to default ONNX Laya.
 Check `routing.model` / `device` and `usage.truncated`; calibration from the English model does not transfer.
-Vega CUDA supports `--acceleration auto|off`. Auto uses optional fused kernels (`npm run vega:setup`) and
-validated head CUDA Graphs; off is the reference path. See `routing.exec.acceleration` for what ran.
+Vega CUDA supports `--acceleration auto|on|off`. Auto/on uses optional fused kernels (`npm run vega:setup`),
+with validated head CUDA Graphs for reusable sessions; off is the reference path. See `routing.exec.acceleration` for what ran.
 Multilingual supports the same switch with its optional TileLang backend (`npm run multilingual:setup`).
 CPU and `off` use eager execution; the input context remains 8,192 tokens.
 

@@ -9,6 +9,8 @@ import { PythonBackend } from "../src/python-backend.mjs";
 import { modelOptions, PROJECT_ROOT } from "../src/models.mjs";
 import { CalibrationCache, decideRequest } from "../src/decide-core.mjs";
 import { decide } from "../src/sidecar-client.mjs";
+import { runtimeProfile } from "../src/runtime-profile.mjs";
+import { LayaRouter } from "../src/ep-router.mjs";
 
 const questions = { q: { type: "noul", instructions: "Is this a request?" } };
 const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
@@ -16,14 +18,84 @@ const deferred = () => { let resolve; const promise = new Promise((r) => { resol
 test("model controls refuse unsupported combinations and reset budgets when selecting another model", () => {
   const defaults = modelOptions({ model: "vega-u", device: "cuda", readout: "engine" });
   assert.equal(defaults.maxLen, 73728);
-  assert.deepEqual(modelOptions({ model: "laya-multilingual" }, defaults), { model: "multilingual", device: "cuda", maxLen: 8192, readout: "auto", acceleration: "auto" });
+  assert.deepEqual(modelOptions({ model: "laya-multilingual" }, defaults), { model: "multilingual", device: "cuda", maxLen: 8192, readout: "auto", acceleration: "auto", graphs: "auto" });
   assert.equal(modelOptions({ model: "multilingual", acceleration: "off" }).acceleration, "off");
+  assert.equal(modelOptions({ model: "multilingual", acceleration: "on" }).acceleration, "on");
   for (const o of [{ model: "missing" }, { model: ["vega"] }, { model: "vega", maxLen: 73729 }, { model: "vega", maxLen: "8192" },
     { model: "laya", maxLen: 8192 }, { model: "vega", lane: "cpu:8" }, { model: "multilingual", exec: { graph: false } },
     { model: "vega", policy: "auto" }, { model: "vega", calibration: { temperature_by_options: {} } },
     { model: "multilingual", readout: "engine" }, { model: "vega", readout: "ttt" }, { device: "webgpu" },
-    { model: "vega", acceleration: "unknown" }, { model: "laya", acceleration: "auto" }]) {
+    { model: "vega", acceleration: "unknown" }, { model: "laya", acceleration: "auto" },
+    { graphs: "maybe" }, { model: "multilingual", acceleration: "off", graphs: "on" }]) {
     assert.throws(() => modelOptions(o), (e) => e.status === 400, JSON.stringify(o));
+  }
+});
+
+test("automatic profiles follow lifetime and preserve explicit runtime choices", () => {
+  for (const model of ["laya", "vega", "multilingual"]) {
+    const selection = modelOptions({ model });
+    const once = runtimeProfile(selection, { lifetime: "one-shot" });
+    const reusable = runtimeProfile(selection);
+    assert.equal(once.graphReplay, false);
+    assert.equal(once.sampleLoad, false);
+    assert.equal(once.gpuKeepAliveMs, 0);
+    assert.equal(reusable.graphReplay, true);
+    assert.equal(runtimeProfile(modelOptions({ model, graphs: "on" }), { lifetime: "one-shot" }).graphReplay, true);
+    assert.equal(runtimeProfile(modelOptions({ model, graphs: "off" })).graphReplay, false);
+    assert.equal(runtimeProfile(modelOptions({ model, device: "cpu" })).graphReplay, false);
+  }
+  const laya = modelOptions({ model: "laya" });
+  assert.deepEqual(runtimeProfile(laya, { lifetime: "one-shot" }).lanes, ["cuda:fp16", "webgpu:fp16", "cpu:8"]);
+  assert.equal(runtimeProfile(laya, { lifetime: "one-shot" }).loadStrategy, "first-available");
+  assert.equal(runtimeProfile(laya).loadStrategy, "parallel");
+  const manual = runtimeProfile(laya, { lifetime: "one-shot", lanes: ["webgpu:fp16", "cpu:8"], sampleLoad: true, gpuKeepAliveMs: 2000 });
+  assert.deepEqual(manual.lanes, ["webgpu:fp16", "cpu:8"]);
+  assert.equal(manual.loadStrategy, "parallel");
+  assert.equal(manual.sampleLoad, true);
+  assert.equal(manual.gpuKeepAliveMs, 2000);
+  assert.deepEqual(runtimeProfile(laya, { lifetime: "one-shot", lane: "cpu:16" }).lanes, ["cpu:16"]);
+  assert.equal(runtimeProfile(laya, { lifetime: "one-shot", policy: "prefer-cpu" }).loadStrategy, "parallel");
+  assert.equal(runtimeProfile(laya, { lifetime: "one-shot", deadlineMs: 50 }).loadStrategy, "parallel");
+  assert.equal(runtimeProfile(laya, { cudaGraph: false }).graphReplay, false);
+  assert.equal(runtimeProfile(modelOptions({ graphs: "on" }), { cudaGraph: false }).graphReplay, true);
+  assert.throws(() => runtimeProfile(laya, { lifetime: "unknown" }), /lifetime/);
+});
+
+test("Multilingual one-shot auto avoids TileLang startup; explicit acceleration and graphs still work", () => {
+  const profile = (o = {}, lifetime = "one-shot") => runtimeProfile(modelOptions({ model: "multilingual", ...o }), { lifetime });
+  const automatic = profile();
+  assert.equal(automatic.acceleration, "off");
+  assert.equal(automatic.requestedAcceleration, "auto");
+  assert.match(automatic.reason, /skips TileLang/);
+  assert.equal(profile({ graphs: "off" }).acceleration, "off");
+  assert.equal(profile({}, "persistent").acceleration, "on");
+  assert.equal(profile({ acceleration: "on" }).acceleration, "on");
+  assert.equal(profile({ acceleration: "on" }).graphReplay, false, "forcing kernels need not pay for graph capture");
+  assert.equal(profile({ graphs: "on" }).acceleration, "on", "explicit graphs also enables its required backend");
+  assert.equal(profile({ acceleration: "off" }, "persistent").acceleration, "off");
+  assert.equal(profile({ acceleration: "off" }, "persistent").graphReplay, false);
+  for (const lifetime of ["one-shot", "persistent"]) {
+    const cpu = profile({ device: "cpu", acceleration: "on", graphs: "on" }, lifetime);
+    assert.equal(cpu.acceleration, "off", "explicit CPU uses eager even with the optional CUDA kernels installed");
+    assert.equal(cpu.graphReplay, false);
+    assert.equal(cpu.requestedAcceleration, "on");
+  }
+  assert.equal(runtimeProfile(modelOptions({ model: "vega" }), { lifetime: "one-shot" }).acceleration, "on");
+});
+
+test("one-shot lane loading selects the first usable provider and reaches the CPU fallback", async () => {
+  for (const available of ["cuda:fp16", "webgpu:fp16", "cpu:8", null]) {
+    const r = Object.create(LayaRouter.prototype);
+    r.opts = { lanes: ["cuda:fp16", "webgpu:fp16", "cpu:8"], loadStrategy: "first-available" };
+    r.lanes = new Map(); r.loading = new Set(r.opts.lanes);
+    const attempts = [];
+    r._probeLane = async (lane) => { attempts.push(lane); if (lane === available) { r.lanes.set(lane, {}); return true; } return false; };
+    if (available) {
+      await r._loadConfiguredLanes(null);
+      assert.deepEqual([...r.lanes.keys()], [available]);
+      assert.deepEqual(attempts, r.opts.lanes.slice(0, r.opts.lanes.indexOf(available) + 1));
+    } else await assert.rejects(r._loadConfiguredLanes(null), /no lane/);
+    assert.equal(r.loading.size, 0);
   }
 });
 
@@ -41,12 +113,52 @@ class FakeRouter extends ModelRouter {
         if (state === "fail") throw new Error("inference failed");
         this.events.push(`end:${state}`);
         this.lastOptions = opts;
-        return { answers: { q: { type: "noul", noul: 0.5 } }, usage: { input_tokens: 10 }, routing: { lane, ms: 1, queueMs: 0 } };
+        this.lastQuestions = qs;
+        return { answers: { q: { type: "noul", noul: 0.5 } }, usage: { input_tokens: 10 }, routing: { lane, device: selection.device === "auto" ? "cpu" : selection.device, ms: 1, queueMs: 0 } };
       },
       close: async () => { this.events.push(`close:${selection.model}`); },
     };
   }
 }
+
+test("all model selections receive canonical questions and malformed aliases never switch backends", async () => {
+  const aliases = {
+    refund: { type: "predicate", instructions: "Refund requested?" },
+    team: { type: "choice", instructions: "Team?", choices: { billing: "refunds", support: "other" } },
+    severity: { type: "score", instructions: "Severity?", levels: ["Low", "High"] },
+  };
+  const before = structuredClone(aliases);
+  const r = await FakeRouter.create({ model: "laya", device: "cpu" });
+  try {
+    for (const model of ["laya", "vega", "multilingual"]) {
+      await r.decide("ticket", aliases, { model });
+      assert.equal(r.lastQuestions.refund.type, "noul");
+      assert.deepEqual(r.lastQuestions.team.criteria, aliases.team.choices);
+      assert.deepEqual(r.lastQuestions.severity.criteria, aliases.severity.levels);
+      assert.equal(r.lastQuestions.team.choices, undefined);
+    }
+    const opens = r.events.filter(e => e.startsWith("open:")).length;
+    await assert.rejects(r.decide("bad ticket", { team: { ...aliases.team, criteria: ["different", "options"] } }, { model: "vega" }), (e) => e.status === 400 && /conflict/.test(e.message));
+    assert.equal(r.active.selection.model, "multilingual");
+    assert.equal(r.events.filter(e => e.startsWith("open:")).length, opens);
+    assert.equal(r.pending, 0);
+    assert.deepEqual(aliases, before);
+  } finally { await r.close(); }
+});
+
+test("effective graph policy controls reuse and reports one-shot versus persistent configuration", async () => {
+  const r = await FakeRouter.create({ model: "vega", device: "cuda", lifetime: "one-shot" });
+  try {
+    const a = await r.decide("first", questions);
+    assert.equal(a.routing.profile.lifetime, "one-shot");
+    assert.equal(a.routing.profile.graphs, "off");
+    await r.decide("explicit off", questions, { graphs: "off" });
+    assert.equal(r.events.filter(e => e.startsWith("open:")).length, 1, "same effective policy reuses the loaded model");
+    const b = await r.decide("explicit on", questions, { graphs: "on" });
+    assert.equal(b.routing.profile.graphs, "on");
+    assert.equal(r.events.filter(e => e.startsWith("open:")).length, 2);
+  } finally { await r.close(); }
+});
 
 test("model switching waits for inference, keeps FIFO order, reuses weights across readouts, and drains on close", async () => {
   const r = await FakeRouter.create({ model: "vega", device: "cpu" });
@@ -155,6 +267,26 @@ test("Python protocol: valid typed answers, recoverable input errors and malform
   } finally { await b.close(); }
 });
 
+test("Python startup gets resolved controls and reports requested controls and first-use timings", async () => {
+  const b = await PythonBackend.create(modelOptions({ model: "vega" }), {
+    python: process.execPath, script: fixture, graphReplay: false, acceleration: "off", accelerationReason: "startup policy",
+  });
+  try {
+    assert.equal(b.info.requestedGraphs, "off");
+    assert.equal(b.info.workerAcceleration, "off");
+    assert.equal(b.info.acceleration.requested, "auto");
+    assert.equal(b.info.acceleration.selected, "off");
+    const [first, second] = await Promise.all([b.decide("first", questions), b.decide("second", questions)]);
+    assert.equal(first.routing.exec.acceleration.requested, "auto");
+    assert.equal(first.routing.exec.acceleration.selected, "off");
+    assert.equal(first.routing.exec.acceleration.reason, "startup policy");
+    assert.ok(first.routing.initialization.processMs > 0);
+    assert.deepEqual(first.routing.initialization.phases, b.info.startup.phases);
+    assert.equal(second.routing.initialization, undefined, "startup cost is reported once, even with concurrent callers");
+  }
+  finally { await b.close(); }
+});
+
 test("Python process exit, timeout and missing executable reject pending callers and release the child", async () => {
   for (const state of ["die", "hang"]) {
     const b = await openFixture(state === "hang" ? 1000 : 5000);
@@ -182,6 +314,7 @@ test("an older sidecar cannot silently ignore model or acceleration selection", 
     advertisesModels = true;
     await assert.rejects(decide({ model: "vega", acceleration: "off", text: "test" }, { port: server.address().port }), (e) => e.code === "MODEL_UNSUPPORTED");
     advertisesVegaAcceleration = true;
+    await assert.rejects(decide({ model: "vega", acceleration: "on", text: "test" }, { port: server.address().port }), (e) => e.code === "MODEL_UNSUPPORTED");
     await assert.rejects(decide({ model: "multilingual", acceleration: "off", text: "test" }, { port: server.address().port }), (e) => e.code === "MODEL_UNSUPPORTED");
     assert.equal(decisions, 0);
   } finally { await new Promise((resolve) => server.close(resolve)); }

@@ -2,6 +2,8 @@
 
 LocalLaya exposes three explicit model choices through `ask.mjs`, `serve.mjs`, the browser page,
 `demo/laya.mjs`, `demo/cli.mjs`, and the skill wrapper.
+All three accept the same [request/question schema](REQUESTS.md), including the `predicate`, `choices`
+and `levels` aliases.
 
 | model | checkpoint | context limit | runtime |
 |---|---|---|---|
@@ -56,6 +58,63 @@ On filesystems without hard links, those data files are copied instead.
 
 ## Choose independently
 
+### Automatic configuration: model + local/sidecar
+
+The shortest commands are `node ask.mjs --model vega --local "..."` and
+`node ask.mjs --model vega --sidecar "..."`. Substitute `laya` or `multilingual` as needed.
+No device, acceleration, context or graph flags are required.
+
+| model | local one-shot | sidecar / foreground server / REPL / persistent library |
+|---|---|---|
+| `laya` | probe CUDA FP16, then WebGPU FP16, then CPU:8; stop after the first usable lane; no CUDA Graph setup | load the normal three lanes, serve from the first ready lane; use routing, graph reuse and GPU keep-alive |
+| `vega` | CUDA when available, otherwise CPU; available fused kernels and bounded long prefills; eager decision head | same device/kernel selection, plus validated head graph replay |
+| `multilingual` | CUDA when available, otherwise CPU; eager execution, skipping TileLang initialization and graph capture | available TileLang kernels, plus repeat-aware graph caching |
+
+These are benchmark-informed defaults: they favor total time to the first answer for an isolated call and
+amortized latency for a reused model. Multilingual's conservative one-shot policy skips TileLang for any
+input length; `--acceleration on` opts into its setup cost for a workload that benefits from it. Optional
+kernel compilation may still cost time on first use. Full context defaults
+are 512 / 73,728 / 8,192, including question overhead. Calibration remains model-scoped.
+
+`routing.profile` reports the lifetime (`one-shot` or `persistent`), acceleration/graph policy and reason; `routing.exec`
+reports what the backend actually did. Automatic Python device selection may retry a CUDA allocation failure
+on CPU. Explicit `--device cuda` remains strict, and model/checkpoint errors are surfaced.
+
+Explicit flags override the defaults. `--acceleration on` tries the available fused kernels even for a
+one-shot, keeping the normal capability checks and eager fallback. It does not force graph capture.
+`--graphs on` enables graph reuse (and its required backend) for a one-shot, while `--graphs off`
+disables it for a reusable session. Backends still apply their normal capture policy (for example,
+Multilingual captures a newly repeated shape). Python `--acceleration off` uses eager execution;
+combining it with `--graphs on` is an error. Original Laya also retains `--no-graph` for a per-call bypass.
+Explicit `--lanes` loads the specified set, and a startup `--lane` alone loads that lane. A routing policy
+or deadline keeps its candidate lanes available instead of choosing a single one at startup.
+
+The demo CLI infers one-shot versus batch use. The Node library defaults to a reusable model; use
+`createLaya({ model: "vega", mode: "local", lifetime: "one-shot" })` for an isolated call. A remote server
+always owns a reusable session regardless of how short-lived its client is.
+
+### Cold startup versus warm inference
+
+The millisecond performance tables measure an already-loaded model. Each local one-shot starts Python,
+imports PyTorch/Laya, loads the checkpoint, then answers and exits. A fresh process still takes seconds
+with eager execution. A sidecar's first request pays startup too; later requests and a local REPL reuse it.
+
+Python startup now reports phases on stderr: runtime imports, CUDA initialization, checkpoint loading,
+backend selection, and the first inference. A five-second heartbeat also reports that loading is in progress.
+`--json` keeps stdout as one result object. Its first successful decision includes `routing.initialization`:
+
+- `processMs`: Node's time from starting the Python worker until ready, including process startup;
+- `totalMs`: worker-side startup time;
+- `phases`: `{ stage, ms, status }` records for imports/loading/accelerator setup.
+
+`routing.ms` measures the decision after readiness, including first-use kernel work. Startup metadata is
+reported once per loaded backend and remains available through `/stats`. The reproducible
+`experiments/cold-start.mjs` measures time to the stdout answer separately from shutdown time.
+On the reference machine, the paired short-input median fell from 9.60 s with TileLang to 5.96 s with
+one-shot auto/eager. See the [cold-start report](../results/multilingual-cold-start-2026-11-17-summary.md).
+
+### Explicit controls
+
 1. **Model:** `--model laya|vega|multilingual`.
 2. **Call path:** `--local` / `--mode local`, or `--sidecar` / `--mode sidecar`.
 3. **Device:** `--device auto|cpu|cuda`. Python `auto` selects CUDA when available, otherwise CPU.
@@ -63,9 +122,11 @@ On filesystems without hard links, those data files are copied instead.
 4. **Context:** `--max-len <tokens>` for the Python models, up to their profile's limit.
 5. **Vega readout:** `--readout auto|engine`. Both use the shipped engine here: this adapter currently loads
    no fitted TTT heads. These modes are independent of CUDA versus CPU and local versus sidecar.
-6. **Python model acceleration:** `--acceleration auto|off`. Vega auto uses available fused CUDA kernels and
-   validated head CUDA Graph replay; Multilingual auto uses the upstream TileLang path when installed.
-   Off selects the original eager/reference forward. CPU uses the existing eager optimizations.
+6. **Python model acceleration:** `--acceleration auto|on|off`. Auto follows the model/lifetime table above.
+   On tries the available fused kernels even for a one-shot; off selects the original eager/reference forward.
+   CPU and unavailable optional kernels use eager/reference execution. Graph policy is a separate control.
+7. **Graph reuse:** `--graphs auto|on|off`, for all models. Auto follows the lifetime profile above; graph
+   capture is available on supported CUDA backends. `/graphs` changes it in the REPL.
 
 ```powershell
 node ask.mjs --model laya --local --lanes webgpu:fp16 --no-color "Turn on the TV"
@@ -80,8 +141,13 @@ node ask.mjs --model vega --sidecar --text-file document.txt --questions questio
 before. An explicit `--mode sidecar` fails if the sidecar cannot start; the older `--sidecar` flag retains
 its local fallback for connection/startup failures. An inference failure never changes the selected model.
 
+`--file ticket.json` on `ask.mjs` reads a complete JSON request (`state`/`text`, `questions`/`preset`, optional
+model/runtime controls). Explicit CLI flags override its settings; file settings override CLI environment
+defaults. For example: `node ask.mjs --model multilingual --sidecar --file demo/data/ticket-request.json --json`.
+See [request-file input](REQUESTS.md#run-a-complete-json-file-from-the-cli).
+
 Start a REPL with `node ask.mjs --sidecar --model vega`. Use `/model laya`, `/model multilingual`,
-`/device cpu`, `/device cuda`, `/context 4096`, `/readout engine`, `/acceleration off`, `/models`, and `/again`.
+`/device cpu`, `/device cuda`, `/context 4096`, `/readout engine`, `/acceleration off`, `/graphs auto`, `/models`, and `/again`.
 The new selection takes effect on the next question. `/model` resets the context to that model's default
 and clears a forced ONNX lane. `/device` also clears a forced lane.
 
@@ -107,6 +173,7 @@ contains the same information. The browser page has model, device, context and r
   "maxLen": 73728,
   "readout": "engine",
   "acceleration": "auto",
+  "graphs": "auto",
   "preset": "triage",
   "text": "Charged twice. Please refund the duplicate."
 }
@@ -118,7 +185,7 @@ original bundle and its automatic EP selection.
 Omitted controls inherit the server defaults, except that changing models resets model-specific context
 and readout defaults. `LAYA_MODEL` / `LAYA_DEVICE` set defaults for the CLI, demo library and new server.
 
-One model family is resident per server. Requests execute FIFO. Switching model, device, acceleration or Python context
+One model family is resident per server. Requests execute FIFO. Switching model, device, acceleration, effective graph policy or Python context
 budget waits for earlier requests, closes that backend, and loads the requested one. Changing Vega readout
 reuses the loaded weights. Original Laya retains its multiple EP lanes while it is the active model.
 The process release also frees PyTorch's CUDA allocator. For simultaneous resident models, use separate
@@ -148,7 +215,8 @@ try {
 The library supports `mode: "auto"|"sidecar"|"local"|"http"`; HTTP mode takes an `http://host:port` `url`.
 The low-level `loadLaya`, `createDecider` and `LayaRouter` APIs are ONNX-specific; model selection uses
 `createLaya` or `ModelRouter`.
-Each call can override `model`, `device`, `maxLen`, `readout` and `acceleration`. The client and Python worker default to a
+Each call can override `model`, `device`, `maxLen`, `readout`, `acceleration` and `graphs`. Explicit graph on/off
+selection and `acceleration: "on"` need a 0.10 server. The client and Python worker default to a
 ten-minute decision timeout for long documents; library callers can set `timeoutMs`. `close()` in local
 mode drains accepted work and releases the model; a remote client's `close()` releases its HTTP connection.
 On Windows a timed-out Python worker is stopped as a process tree, including the interpreter behind the
@@ -158,6 +226,11 @@ virtual environment's launcher. HTTP shutdown waits for accepted long-document c
 
 - `routing.model`, `backend`, `device`, and `contextTokens` identify what ran. `routing.ms` measures the
   decision; `queueMs` measures waiting, and `loadMs` appears when a decision triggers a backend switch.
+- `routing.profile` explains the automatic runtime policy. `graphReplayEnabled` in the Python execution
+  metadata reports whether that backend can use graph replay for the call.
+- Python `routing.exec.acceleration.requested` preserves `auto|on|off`; `selected` is the resolved on/off
+  policy. The backend/reader fields report actual execution, including eager fallback on CPU or unavailable
+  kernels. First-use startup timings are in `routing.initialization` (see above).
 - Python `routing.exec` includes `mode: "torch-eager"|"torch-accelerated"`, `device`, `requestedDevice`, `maxLen`, `remoteMs`,
   `peakVramMiB`, and `cpuFallback`. Multilingual Laya may retry a GPU OOM on CPU; that execution is reported
   as CPU. PyTorch peak allocated bytes exclude the CUDA context and other applications.
@@ -178,9 +251,12 @@ virtual environment's launcher. HTTP shutdown waits for accepted long-document c
 ```powershell
 npm test                     # model-selection, lifecycle/protocol, calibration-isolation and existing unit tests
 npm run test:models          # real CPU/CUDA, score/truncation, Unicode, switching, HTTP, CLIs, skill wrapper
+npm run test:profiles        # minimal model + mode commands, device fallback and explicit overrides
+npm run test:questions       # question aliases, JSON-file input, HTTP/CLI/library equivalence
 npm run test:all             # original router/CUDA/sidecar/demo regression suite plus unit tests
 node experiments/model-context.mjs --models vega,multilingual --device cuda --words 0,1024,4096,7800
 node experiments/model-context.mjs --models vega --device cuda --words 16384,32768,70000
+node experiments/cold-start.mjs --rounds 3  # fresh-process Multilingual auto vs explicit acceleration=on
 ```
 
 The context script records actual token counts, times, peak PyTorch VRAM and predictions. Its repeated
@@ -199,8 +275,9 @@ einops 0.8.2, and Triton Windows 3.9.0.post30 (Triton 3.9.0 on Linux). The Windo
 compiler/toolchain. `vega:check` proves the gated-delta and convolution kernels execute on the GPU.
 Kernels compile locally and cache under `.laya/triton`; a new kernel shape can make its first call slower.
 
-With `--acceleration auto` (default), Vega uses these fused reader kernels when available and a bounded
-eight-entry CUDA Graph cache for the small decision head. Each head graph is checked against the eager
+With `--acceleration auto` (default) or `on`, Vega uses these fused reader kernels when available. Reusable
+sessions (or explicit `--graphs on`) also enable a bounded eight-entry CUDA Graph cache for the small
+decision head. Each head graph is checked against the eager
 head before serving. Failed shapes use eager execution and are listed in the result metadata. Graphs are
 per process and are rebuilt after a model reload; the Triton disk cache survives it. If optional packages
 are missing or differ from the pins, the reader uses reference kernels and reports why. CPU uses reference
@@ -231,12 +308,14 @@ compiler/runtime wheels. They live in `.venv-laya`; compilation products live in
 `multilingual:check` loads the model and executes a real CUDA prediction. On this Windows machine the
 installer's `--index-url` mirror option is needed, as for the other Python packages.
 
-Auto selects `laya`'s upstream TileLang backend: resident 16-bit weights, fused operations, local/global
+Auto in a reusable session, or explicit `--acceleration on`, selects `laya`'s upstream TileLang backend:
+resident 16-bit weights, fused operations, local/global
 attention kernels, and CUDA Graph replay. The model's existing attention pattern and 8,192-token input
 budget are preserved. The adapter bounds graph residency to eight shapes. Batches use power-of-two row
 buckets, and sequence lengths use 16-token buckets through 256, then 64-token buckets.
 New shapes first use fused kernels. An immediate repeat captures a graph; resident shapes then replay.
-This avoids graph-capture overhead for one-off inputs. `graphs.mode` distinguishes kernels/capture/replay.
+This avoids graph-capture overhead for one-off shapes in a reusable session. `graphs.mode` distinguishes
+kernels/capture/replay. A local one-shot with auto skips TileLang initialization entirely and uses eager.
 
 ```powershell
 node ask.mjs --model multilingual --device cuda --local --acceleration auto --preset triage

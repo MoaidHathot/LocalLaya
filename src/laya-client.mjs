@@ -22,6 +22,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { Laya } from "@receptron/laya";
+import { normalizeQuestions } from "./question-schema.mjs";
 
 const execFileP = promisify(execFile);
 
@@ -296,7 +297,7 @@ export async function createDecider(opts = {}) {
   const loaded = await loadLaya(opts);
   return {
     ...loaded,
-    decide: (state, questions) => loaded.laya.systemOne(state, questions),
+    decide: async (state, questions) => loaded.laya.systemOne(state, normalizeQuestions(questions)),
     close: () => loaded.laya.close(),
   };
 }

@@ -1,6 +1,6 @@
 {
   "name": "local-laya",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "private": true,
   "description": "Selectable local Laya ONNX, Vega-U and multilingual decisions, with CLI, sidecar, calibration and benchmarks",
   "type": "module",
@@ -32,12 +32,14 @@
     "multilingual:setup": "node tools/setup-python.mjs --multilingual-fast",
     "multilingual:check": "node tools/setup-python.mjs --multilingual-fast --check",
     "models:download": "node tools/setup-python.mjs --download",
-    "test": "node --test test/unit.test.mjs test/model-router.test.mjs",
+    "test": "node --test test/unit.test.mjs test/model-router.test.mjs test/cli-file.test.mjs",
     "test:router": "node --test --test-concurrency=1 test/router.test.mjs",
     "test:cuda": "node --test --test-concurrency=1 test/cuda-lane.test.mjs",
     "test:sidecar": "node --test --test-concurrency=1 test/sidecar.test.mjs",
     "test:demo": "node --test --test-concurrency=1 test/demo.test.mjs",
     "test:models": "node --test --test-concurrency=1 test/models.test.mjs",
+    "test:profiles": "node --test --test-concurrency=1 test/profiles.test.mjs",
+    "test:questions": "node --test --test-concurrency=1 test/question-aliases.test.mjs",
     "demo": "node demo/run-all.mjs",
     "test:all": "npm test && node --test --test-concurrency=1 test/router.test.mjs && node --test --test-concurrency=1 test/cuda-lane.test.mjs && node --test --test-concurrency=1 test/sidecar.test.mjs && node --test --test-concurrency=1 test/demo.test.mjs"
   },
